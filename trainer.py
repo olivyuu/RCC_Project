@@ -384,5 +384,4 @@ if __name__ == "__main__":
     set_seed(config.seed, config.deterministic, config.benchmark_cudnn)
     
     trainer = nnUNetTrainer(config)
-    dataset_path = Path(__file__).parent / "kits23" / "dataset"
-    trainer.train(str(dataset_path))
+    trainer.train(config.data_dir)

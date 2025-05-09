@@ -14,7 +14,7 @@ def load_model(checkpoint_path):
     model.load_state_dict(checkpoint['model_state_dict'])
     return model.cuda() if torch.cuda.is_available() else model
 
-def test_gradcam(config_path='config.py', checkpoint_path='checkpoints/best_model_dice_0.8334.pth', num_samples=5):
+def test_gradcam(checkpoint_path='checkpoints/best_model_dice_0.8334.pth', num_samples=5):
     """Test Grad-CAM on validation cases"""
     # Load configuration
     config = nnUNetConfig()
