@@ -1,0 +1,11 @@
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.24.0
+matplotlib>=3.7.0
+scipy>=1.10.0
+tqdm>=4.65.0
+nibabel>=5.0.0  # For reading medical imaging files (.nii.gz)
+scikit-image>=0.21.0  # For image processing
+pandas>=2.0.0  # For data handling
+pillow>=10.0.0  # For image processing
+tensorboard>=2.13.0  # For logging during training

@@ -5,7 +5,7 @@ from pathlib import Path
 @dataclass
 class nnUNetConfig:
     # Data parameters
-    data_dir: str = "kits23/dataset"
+    data_dir: str = "/workspace/kits23/data"
     preprocessed_dir: str = "preprocessed_patches"
     # Model parameters
     in_channels: int = 1
