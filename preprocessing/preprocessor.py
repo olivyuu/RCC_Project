@@ -30,8 +30,31 @@ class KiTS23Preprocessor:
         Includes estimated memory check based on header info, attempts float32 conversion early.
         """
         print(f"\nLoading case: {case_path.name}")
-        img_path = case_path / "imaging.nii.gz"
-        mask_path = case_path / "segmentation.nii.gz"
+        img_path = case_path / "raw_data" / "imaging.nii.gz"
+        if not img_path.exists():
+            img_path = case_path / "imaging.nii.gz"  # Try fallback path
+        
+        mask_path = case_path / "raw_data" / "segmentation.nii.gz"
+        if not mask_path.exists():
+            mask_path = case_path / "segmentation.nii.gz"  # Try fallback path
+            
+        if not img_path.exists() or not mask_path.exists():
+            print(f"Could not find imaging or segmentation files for {case_path.name}")
+            print(f"Expected paths:")
+            print(f"  {img_path} or {case_path}/imaging.nii.gz")
+            print(f"  {mask_path} or {case_path}/segmentation.nii.gz")
+            print("\nData preparation required:")
+            print("1. Clone the KiTS23 repository:")
+            print("   git clone https://github.com/neheller/kits23.git")
+            print("2. Change to the repository directory:")
+            print("   cd kits23")
+            print("3. Run the data preparation script:")
+            print("   python3 get_imaging.py")
+            print("\nThis will download and prepare the imaging files in the correct format.")
+            print("After preparation, the files should be available at:")
+            print(f"  - {img_path}")
+            print(f"  - {mask_path}")
+            return [], []
         img_obj = None # Initialize to ensure cleanup in finally block
         mask_obj = None
 
