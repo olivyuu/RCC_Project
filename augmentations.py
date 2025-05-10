@@ -13,9 +13,10 @@ class KiTS23Augmenter:
         print(f"Augmentation device: {self.device}")
         
     def __call__(self, image: torch.Tensor, mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Keep data on GPU when possible
-        image = image.to(self.device)
-        mask = mask.to(self.device)
+        # Only move to GPU during processing if CUDA is available
+        if torch.cuda.is_available():
+            image = image.to(self.device)
+            mask = mask.to(self.device)
         
         # Random rotation
         if torch.rand(1).item() < 0.8:  # Using torch.rand instead of np.random
@@ -42,8 +43,12 @@ class KiTS23Augmenter:
         # Ensure mask remains binary
         mask = (mask > 0.5).float()
 
-        # Move tensors back to CPU before returning for DataLoader pin_memory
-        return image.cpu(), mask.cpu()
+        # Ensure tensors are on CPU before returning
+        if image.device.type == 'cuda':
+            image = image.cpu()
+        if mask.device.type == 'cuda':
+            mask = mask.cpu()
+        return image, mask
     
     def _rotate_3d(self, volume: torch.Tensor, angle: float, is_mask: bool = False) -> torch.Tensor:
         """Rotate 3D volume around z-axis using torch operations."""

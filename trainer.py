@@ -1,3 +1,4 @@
+import multiprocessing as mp
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
@@ -166,7 +167,7 @@ class nnUNetTrainer:
 
     def train(self, dataset_path: str):
         # Create dataset
-        dataset = KiTS23Dataset(dataset_path, self.config)
+        dataset = KiTS23Dataset(dataset_path, self.config, preprocess=self.config.preprocess)
         
         # Split dataset
         val_size = int(len(dataset) * self.config.validation_split)
@@ -372,11 +373,16 @@ class nnUNetTrainer:
         return (2. * intersection + 1e-5) / (union + 1e-5)
 
 if __name__ == "__main__":
+    # Set multiprocessing start method to 'spawn' for CUDA compatibility
+    mp.set_start_method('spawn')
+    
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--resume', action='store_true', help='Resume training from checkpoint')
     parser.add_argument('--batch_size', type=int, help='Batch size for training')
     parser.add_argument('--epochs', type=int, help='Number of epochs to train')
+    parser.add_argument('--preprocess', type=str, choices=['true', 'false'],
+                       help='Whether to preprocess data (true) or use existing preprocessed files (false)')
     args = parser.parse_args()
     
     config = nnUNetConfig()
@@ -387,6 +393,8 @@ if __name__ == "__main__":
         config.batch_size = args.batch_size
     if args.epochs is not None:
         config.num_epochs = args.epochs
+    # Store preprocess flag in config (default to True if not specified)
+    config.preprocess = True if args.preprocess is None else args.preprocess.lower() == 'true'
     
     # Set seed for reproducibility before initializing anything else
     set_seed(config.seed, config.deterministic, config.benchmark_cudnn)
