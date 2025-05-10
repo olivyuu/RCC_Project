@@ -43,48 +43,36 @@ class KiTS23Preprocessor:
             print(f"Expected paths:")
             print(f"  {img_path} or {case_path}/imaging.nii.gz")
             print(f"  {mask_path} or {case_path}/segmentation.nii.gz")
-            print("\nData preparation required:")
-            print("1. Clone the KiTS23 repository:")
-            print("   git clone https://github.com/neheller/kits23.git")
-            print("2. Change to the repository directory:")
+            print("\nData installation required:")
+            print("1. Install the KiTS23 package:")
+            print("   git clone https://github.com/neheller/kits23")
             print("   cd kits23")
-            print("3. Run the data preparation script:")
-            print("   python3 get_imaging.py")
-            print("\nThis will download and prepare the imaging files in the correct format.")
-            print("After preparation, the files should be available at:")
+            print("   pip3 install -e .")
+            print("\n2. Download the dataset:")
+            print("   kits23_download_data")
+            print("\nThis will place the data in the dataset/ folder.")
+            print("Expected files for each case:")
             print(f"  - {img_path}")
             print(f"  - {mask_path}")
+            print("\nFor more information, visit:")
+            print("https://github.com/neheller/kits23#installation")
             return [], []
         img_obj = None # Initialize to ensure cleanup in finally block
         mask_obj = None
 
         try:
-            # 1. Initial File Size Check (Quick Filter)
+            # Log image size for monitoring
             img_size_mb = img_path.stat().st_size / (1024 * 1024)
-            if img_size_mb > self.config.max_image_size_mb:
-                print(f"Skipping {case_path.name}: File size ({img_size_mb:.1f}MB) exceeds limit {self.config.max_image_size_mb}MB")
-                return [], []
+            print(f"Loading case {case_path.name} ({img_size_mb:.1f} MB)")
 
             # 2. Load Headers (Minimal Memory)
             img_obj = nib.load(str(img_path))
             mask_obj = nib.load(str(mask_path))
 
-            # 3. Estimated Memory Check (Based on target processing dtype)
+            # Get shape and data info for logging
             shape = img_obj.shape
             original_dtype = img_obj.header.get_data_dtype()
-            original_dtype_itemsize = original_dtype.itemsize
-            
-            # Estimate memory based on the dtype we *want* to process with (float32)
-            estimated_processing_mb = np.prod(shape) * self.processing_dtype_itemsize / (1024 * 1024)
-            # Also estimate original size for comparison/logging
-            estimated_original_mb = np.prod(shape) * original_dtype_itemsize / (1024 * 1024)
-
-            print(f"Image shape: {shape}, Original dtype: {original_dtype}, Original Est. Size: {estimated_original_mb:.1f}MB")
-            print(f"Target processing dtype: {self.processing_dtype}, Processing Est. Size: {estimated_processing_mb:.1f}MB")
-
-            if estimated_processing_mb > self.max_estimated_memory_mb:
-                 print(f"Skipping {case_path.name}: Estimated processing memory ({estimated_processing_mb:.1f}MB) exceeds limit {self.max_estimated_memory_mb:.1f}MB")
-                 return [], [] # Cleanup happens in finally
+            print(f"Image shape: {shape}, Original dtype: {original_dtype}")
 
             # 4. Dimension Check & Optional Downsampling
             needs_downsampling = any(s > m for s, m in zip(shape, self.config.max_image_dimensions))
