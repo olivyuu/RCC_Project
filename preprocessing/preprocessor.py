@@ -1,6 +1,5 @@
 import nibabel as nib
 import numpy as np
-import numpy._core._exceptions
 from pathlib import Path
 from typing import Tuple, List
 import torch
@@ -195,7 +194,7 @@ class KiTS23Preprocessor:
                     image_chunks.append(img_chunk_normalized)
                     mask_chunks.append(mask_chunk) # Append mask chunk (already padded)
 
-                except (MemoryError, np.core._exceptions._ArrayMemoryError, numpy._core._exceptions._ArrayMemoryError) as e: # Catch specific memory errors
+                except (MemoryError, RuntimeError) as e:  # RuntimeError can occur for numpy memory issues
                     print(f"Memory error loading/processing chunk {i} for {case_path.name}, indices [{start_idx}:{end_idx}], shape {chunk_shape}. Skipping chunk: {e}")
                     # Explicitly clear potentially large variables from the failed try block
                     del img_chunk
@@ -305,7 +304,7 @@ class KiTS23Preprocessor:
                                 patches.append((img_patch_tensor, mask_patch_tensor))
                                 pbar.update(1)
 
-                            except (MemoryError, np.core._exceptions._ArrayMemoryError, numpy._core._exceptions._ArrayMemoryError) as e:
+                            except MemoryError as e:
                                 print(f"\nMemory error converting patch to tensor: {e}")
                                 print(f"Patch shapes - Image: {img_patch_view.shape if img_patch_view is not None else 'N/A'}, Mask: {mask_patch_view.shape if mask_patch_view is not None else 'N/A'}")
                                 # Explicit cleanup within exception handler
