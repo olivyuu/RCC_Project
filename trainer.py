@@ -375,10 +375,18 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--resume', action='store_true', help='Resume training from checkpoint')
+    parser.add_argument('--batch_size', type=int, help='Batch size for training')
+    parser.add_argument('--epochs', type=int, help='Number of epochs to train')
     args = parser.parse_args()
     
     config = nnUNetConfig()
     config.resume_training = args.resume
+    
+    # Override config values with command line arguments if provided
+    if args.batch_size is not None:
+        config.batch_size = args.batch_size
+    if args.epochs is not None:
+        config.num_epochs = args.epochs
     
     # Set seed for reproducibility before initializing anything else
     set_seed(config.seed, config.deterministic, config.benchmark_cudnn)
