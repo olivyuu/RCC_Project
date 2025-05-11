@@ -7,9 +7,7 @@ import os
 import scipy.ndimage as ndimage
 
 def get_tumor_regions(output, threshold=0.5):
-    """
-    Find slices that contain tumor predictions
-    """
+    """Find slices that contain tumor predictions"""
     tumor_probs = torch.softmax(output, dim=1)[0, 1]  # Get tumor class probabilities
     tumor_mask = tumor_probs > threshold
     
@@ -49,9 +47,7 @@ def get_tumor_regions(output, threshold=0.5):
     return regions
 
 def generate_gradcam(model, input_tensor, target_class=1):
-    """
-    Generate Grad-CAM visualization
-    """
+    """Generate Grad-CAM visualization"""
     model.eval()
     
     # Forward pass
@@ -93,9 +89,7 @@ def generate_gradcam(model, input_tensor, target_class=1):
     return cam.detach().cpu().numpy(), output.detach().cpu()
 
 def visualize_full_scan(image, cam, prediction, alpha=0.5, save_path=None):
-    """
-    Visualize Grad-CAM results for the full 3D scan
-    """
+    """Visualize Grad-CAM results for patches"""
     # Ensure prediction is detached
     prediction = prediction.detach()
     
@@ -105,42 +99,37 @@ def visualize_full_scan(image, cam, prediction, alpha=0.5, save_path=None):
     # Create threshold mask
     thresh_mask = tumor_probs > 0.5
     
-    # Get center of mass of tumor region
-    if np.any(thresh_mask):
-        center = ndimage.center_of_mass(thresh_mask)
-    else:
-        center = (image.shape[0]//2, image.shape[1]//2, image.shape[2]//2)
-    
     # Create figure with multiple views
-    fig = plt.figure(figsize=(20, 15))
+    fig = plt.figure(figsize=(20, 10))
     gs = GridSpec(2, 3, figure=fig)
+    
+    # Central slice for each view
+    d, h, w = image.shape
+    d_mid, h_mid, w_mid = d//2, h//2, w//2
     
     # Axial view (top-down)
     ax1 = fig.add_subplot(gs[0, 0])
-    slice_idx = int(center[0])
-    ax1.imshow(image[slice_idx], cmap='gray')
-    ax1.imshow(cam[slice_idx], cmap='jet', alpha=alpha)
-    ax1.set_title(f'Axial View (Slice {slice_idx})')
+    ax1.imshow(image[d_mid], cmap='gray')
+    ax1.imshow(cam[d_mid], cmap='jet', alpha=alpha)
+    ax1.set_title(f'Axial View (Slice {d_mid})')
     ax1.axis('off')
     
     # Sagittal view (side)
     ax2 = fig.add_subplot(gs[0, 1])
-    slice_idx = int(center[2])
-    sagittal_img = image[:, :, slice_idx]
-    sagittal_cam = cam[:, :, slice_idx]
+    sagittal_img = image[:, :, w_mid]
+    sagittal_cam = cam[:, :, w_mid]
     ax2.imshow(sagittal_img, cmap='gray')
     ax2.imshow(sagittal_cam, cmap='jet', alpha=alpha)
-    ax2.set_title(f'Sagittal View (Slice {slice_idx})')
+    ax2.set_title(f'Sagittal View (Central Slice)')
     ax2.axis('off')
     
     # Coronal view (front)
     ax3 = fig.add_subplot(gs[0, 2])
-    slice_idx = int(center[1])
-    coronal_img = image[:, slice_idx, :]
-    coronal_cam = cam[:, slice_idx, :]
+    coronal_img = image[:, h_mid, :]
+    coronal_cam = cam[:, h_mid, :]
     ax3.imshow(coronal_img, cmap='gray')
     ax3.imshow(coronal_cam, cmap='jet', alpha=alpha)
-    ax3.set_title(f'Coronal View (Slice {slice_idx})')
+    ax3.set_title(f'Coronal View (Central Slice)')
     ax3.axis('off')
     
     # 3D visualization of tumor regions
@@ -168,8 +157,8 @@ def visualize_full_scan(image, cam, prediction, alpha=0.5, save_path=None):
         f"Tumor Statistics:\n\n"
         f"Volume: {np.sum(thresh_mask)} voxels\n"
         f"Max Probability: {np.max(tumor_probs):.3f}\n"
-        f"Mean Probability: {np.mean(tumor_probs[thresh_mask]):.3f}\n"
-        f"Location: {center}\n"
+        f"Mean Probability: {np.mean(tumor_probs):.3f}\n"
+        f"Patch Size: {image.shape}\n"
     )
     ax6.text(0.1, 0.5, stats_text, fontsize=12, transform=ax6.transAxes)
     
@@ -182,113 +171,84 @@ def visualize_full_scan(image, cam, prediction, alpha=0.5, save_path=None):
         plt.show()
 
 def visualize_gradcam(image, cam, prediction, slice_indices=None, alpha=0.5, save_path=None):
-    """
-    Visualize Grad-CAM results
-    """
+    """Visualize Grad-CAM results"""
     # Ensure prediction is detached
     prediction = prediction.detach()
     
-    # Create full scan visualization
+    # First create the full scan visualization
     if save_path:
         base, ext = os.path.splitext(save_path)
-        full_scan_path = f"{base}_full_scan{ext}"
+        full_scan_path = f"{base}_full{ext}"
     else:
         full_scan_path = None
     
     visualize_full_scan(image, cam, prediction, alpha, full_scan_path)
     
-    # Get tumor regions
-    regions = get_tumor_regions(prediction)
+    # Get tumor probabilities
+    tumor_probs = torch.softmax(prediction, dim=1)[0, 1].cpu().numpy()
     
-    if not regions:
-        print("No tumor detected in any scan.")
-        return
+    # Create detailed view of central slice
+    d_mid = image.shape[0] // 2
     
-    # Create detailed views for each region
-    for region_idx, region in enumerate(regions):
-        slice_idx = region['slice']
-        min_y, max_y, min_x, max_x = region['bbox']
-        confidence = region['confidence']
-        
-        # Create figure with gridspec
-        fig = plt.figure(figsize=(20, 10))
-        gs = GridSpec(2, 3, figure=fig, width_ratios=[1, 1, 1])
-        
-        # Full slice view with tumor region highlighted
-        ax1 = fig.add_subplot(gs[0, 0])
-        ax1.imshow(image[slice_idx], cmap='gray')
-        rect = Rectangle((min_x, min_y), max_x-min_x, max_y-min_y,
-                        fill=False, edgecolor='red', linewidth=2)
-        ax1.add_patch(rect)
-        ax1.set_title(f'Full Slice View - Slice {slice_idx}')
-        ax1.axis('off')
-        
-        # Zoomed original image
-        ax2 = fig.add_subplot(gs[0, 1])
-        ax2.imshow(image[slice_idx, min_y:max_y, min_x:max_x], cmap='gray')
-        ax2.set_title('Zoomed Region - Original')
-        ax2.axis('off')
-        
-        # Zoomed Grad-CAM overlay
-        ax3 = fig.add_subplot(gs[0, 2])
-        ax3.imshow(image[slice_idx, min_y:max_y, min_x:max_x], cmap='gray')
-        heatmap = ax3.imshow(cam[slice_idx, min_y:max_y, min_x:max_x],
-                            cmap='jet', alpha=alpha)
-        ax3.set_title(f'Zoomed Region - Heatmap\nConfidence: {confidence:.2%}')
-        ax3.axis('off')
-        
-        # Get tumor probabilities for current slice
-        tumor_probs = torch.softmax(prediction, dim=1)[0, 1]  # [D, H, W]
-        tumor_probs = tumor_probs.cpu().numpy()
-        
-        # Bottom row: Detailed analysis
-        # Probability map
-        ax4 = fig.add_subplot(gs[1, 0])
-        prob_map = ax4.imshow(tumor_probs[slice_idx], cmap='RdYlBu_r')
-        ax4.set_title('Tumor Probability Map')
-        ax4.axis('off')
-        plt.colorbar(prob_map, ax=ax4, label='Tumor Probability')
-        
-        # Thresholded region
-        ax5 = fig.add_subplot(gs[1, 1])
-        thresh_map = (tumor_probs[slice_idx] > 0.5)
-        ax5.imshow(image[slice_idx], cmap='gray')
-        ax5.imshow(thresh_map, cmap='RdYlBu_r', alpha=0.5)
-        ax5.set_title('Thresholded Tumor Region')
-        ax5.axis('off')
-        
-        # Combined visualization
-        ax6 = fig.add_subplot(gs[1, 2])
-        ax6.imshow(image[slice_idx], cmap='gray')
-        
-        # Create focused attention map
-        overlay = np.zeros_like(cam[slice_idx])
-        h, w = overlay.shape
-        
-        # Ensure bounds are within image dimensions
-        min_y = max(0, min_y)
-        max_y = min(h, max_y)
-        min_x = max(0, min_x)
-        max_x = min(w, max_x)
-        
-        # Extract region from threshold map and CAM
-        region_thresh = thresh_map[min_y:max_y, min_x:max_x]
-        region_cam = cam[slice_idx, min_y:max_y, min_x:max_x]
-        
-        # Only apply overlay in the region where threshold is True
-        overlay[min_y:max_y, min_x:max_x] = np.where(region_thresh, region_cam, 0)
-        heatmap = ax6.imshow(overlay, cmap='jet', alpha=alpha)
-        ax6.set_title('Focused Attention Map')
-        ax6.axis('off')
-        plt.colorbar(heatmap, ax=ax6, label='Model Attention')
-        
-        plt.tight_layout()
-        
-        if save_path:
-            # For multiple regions, save with different names
-            base, ext = os.path.splitext(save_path)
-            current_save_path = f"{base}_region{region_idx+1}{ext}"
-            plt.savefig(current_save_path, bbox_inches='tight', dpi=300)
-            plt.close()
-        else:
-            plt.show()
+    # Create figure with gridspec
+    fig = plt.figure(figsize=(20, 10))
+    gs = GridSpec(2, 3, figure=fig, width_ratios=[1, 1, 1])
+    
+    # Full slice view
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax1.imshow(image[d_mid], cmap='gray')
+    ax1.set_title(f'Central Slice (Slice {d_mid})')
+    ax1.axis('off')
+    
+    # Grad-CAM overlay
+    ax2 = fig.add_subplot(gs[0, 1])
+    ax2.imshow(image[d_mid], cmap='gray')
+    heatmap = ax2.imshow(cam[d_mid], cmap='jet', alpha=alpha)
+    ax2.set_title('Grad-CAM Heatmap')
+    ax2.axis('off')
+    
+    # Probability map
+    ax3 = fig.add_subplot(gs[0, 2])
+    prob_map = ax3.imshow(tumor_probs[d_mid], cmap='RdYlBu_r')
+    ax3.set_title('Tumor Probability Map')
+    ax3.axis('off')
+    plt.colorbar(prob_map, ax=ax3, label='Tumor Probability')
+    
+    # Thresholded region
+    ax4 = fig.add_subplot(gs[1, 0])
+    thresh_map = tumor_probs[d_mid] > 0.5
+    ax4.imshow(image[d_mid], cmap='gray')
+    ax4.imshow(thresh_map, cmap='RdYlBu_r', alpha=0.5)
+    ax4.set_title('Thresholded Tumor Region')
+    ax4.axis('off')
+    
+    # Combined visualization
+    ax5 = fig.add_subplot(gs[1, 1])
+    ax5.imshow(image[d_mid], cmap='gray')
+    overlay = np.where(thresh_map, cam[d_mid], 0)
+    heatmap = ax5.imshow(overlay, cmap='jet', alpha=alpha)
+    ax5.set_title('Focused Attention Map')
+    ax5.axis('off')
+    plt.colorbar(heatmap, ax=ax5, label='Model Attention')
+    
+    # Summary
+    ax6 = fig.add_subplot(gs[1, 2])
+    ax6.axis('off')
+    stats_text = (
+        f"Slice Statistics:\n\n"
+        f"Active Voxels: {np.sum(thresh_map)}\n"
+        f"Max Probability: {np.max(tumor_probs[d_mid]):.3f}\n"
+        f"Mean Probability: {np.mean(tumor_probs[d_mid]):.3f}\n"
+        f"Patch Size: {image.shape}\n"
+    )
+    ax6.text(0.1, 0.5, stats_text, fontsize=12, transform=ax6.transAxes)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        base, ext = os.path.splitext(save_path)
+        detail_path = f"{base}_detail{ext}"
+        plt.savefig(detail_path, bbox_inches='tight', dpi=300)
+        plt.close()
+    else:
+        plt.show()
