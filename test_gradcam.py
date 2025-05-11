@@ -6,18 +6,38 @@ from model import nnUNetv2
 from visualization import generate_gradcam, visualize_gradcam
 from config import nnUNetConfig
 import random
+import os
+
+def check_gpu_usage():
+    """Check if GPU is being heavily used"""
+    if torch.cuda.is_available():
+        # Get memory usage in GB
+        memory_allocated = torch.cuda.memory_allocated() / (1024**3)
+        memory_total = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        memory_usage = memory_allocated / memory_total
+        
+        # If more than 50% GPU memory is used, return True
+        return memory_usage > 0.5
+    return False
 
 def load_model(checkpoint_path):
     """Load the trained model from checkpoint"""
+    # Check GPU usage and decide device
+    if check_gpu_usage():
+        device = 'cpu'
+        print("GPU is busy, using CPU instead")
+    else:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
     config = nnUNetConfig()
     model = nnUNetv2(
         in_channels=config.in_channels,
         out_channels=config.out_channels,
         features=config.features
     )
-    checkpoint = torch.load(checkpoint_path, map_location='cuda' if torch.cuda.is_available() else 'cpu')
+    checkpoint = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
-    return model.cuda() if torch.cuda.is_available() else model
+    return model.to(device), device
 
 def test_gradcam(checkpoint_path='checkpoints/latest.pth', num_samples=5):
     """Test Grad-CAM on validation cases"""
@@ -32,10 +52,12 @@ def test_gradcam(checkpoint_path='checkpoints/latest.pth', num_samples=5):
         preprocess=False  # Use existing preprocessed files
     )
     
-    # Load model
+    # Load model and get device being used
     print(f"Loading model from {checkpoint_path}...")
-    model = load_model(checkpoint_path)
+    model, device = load_model(checkpoint_path)
     model.eval()
+    
+    print(f"Using device: {device}")
     
     # Set the target layer for Grad-CAM (using the bottleneck layer)
     model.set_target_layer('bottleneck')
@@ -55,9 +77,7 @@ def test_gradcam(checkpoint_path='checkpoints/latest.pth', num_samples=5):
         # Get the sample
         image, mask = dataset[idx]
         image = image.unsqueeze(0)  # Add batch dimension
-        
-        if torch.cuda.is_available():
-            image = image.cuda()
+        image = image.to(device)
         
         try:
             # Generate Grad-CAM
@@ -81,6 +101,10 @@ def test_gradcam(checkpoint_path='checkpoints/latest.pth', num_samples=5):
             )
             
             print(f"Saved visualizations for sample {idx}")
+            
+            # Clear GPU memory if using CUDA
+            if device == 'cuda':
+                torch.cuda.empty_cache()
             
         except Exception as e:
             print(f"Error processing sample {idx}: {str(e)}")
