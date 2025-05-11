@@ -9,12 +9,17 @@ import random
 
 def load_model(checkpoint_path):
     """Load the trained model from checkpoint"""
-    model = nnUNetv2()
+    config = nnUNetConfig()
+    model = nnUNetv2(
+        in_channels=config.in_channels,
+        out_channels=config.out_channels,
+        features=config.features
+    )
     checkpoint = torch.load(checkpoint_path, map_location='cuda' if torch.cuda.is_available() else 'cpu')
     model.load_state_dict(checkpoint['model_state_dict'])
     return model.cuda() if torch.cuda.is_available() else model
 
-def test_gradcam(checkpoint_path='checkpoints/best_model_dice_0.8334.pth', num_samples=5):
+def test_gradcam(checkpoint_path='checkpoints/latest.pth', num_samples=5):
     """Test Grad-CAM on validation cases"""
     # Load configuration
     config = nnUNetConfig()
@@ -28,7 +33,9 @@ def test_gradcam(checkpoint_path='checkpoints/best_model_dice_0.8334.pth', num_s
     )
     
     # Load model
+    print(f"Loading model from {checkpoint_path}...")
     model = load_model(checkpoint_path)
+    model.eval()
     
     # Set the target layer for Grad-CAM (using the bottleneck layer)
     model.set_target_layer('bottleneck')
@@ -41,8 +48,9 @@ def test_gradcam(checkpoint_path='checkpoints/best_model_dice_0.8334.pth', num_s
     total_samples = len(dataset)
     indices = random.sample(range(total_samples), min(num_samples, total_samples))
     
+    print(f"\nProcessing {len(indices)} samples...")
     for idx in indices:
-        print(f"\nProcessing sample {idx}...")
+        print(f"\nAnalyzing sample {idx}...")
         
         # Get the sample
         image, mask = dataset[idx]
@@ -51,24 +59,45 @@ def test_gradcam(checkpoint_path='checkpoints/best_model_dice_0.8334.pth', num_s
         if torch.cuda.is_available():
             image = image.cuda()
         
-        # Generate Grad-CAM
-        cam, prediction = generate_gradcam(model, image)
-        
-        # Get the original image and model outputs
-        original_image = image.squeeze().detach().cpu().numpy()
-        
-        # Create visualization
-        print(f"Generating visualization for sample {idx}...")
-        save_path = output_dir / f'gradcam_sample_{idx}.png'
-        visualize_gradcam(
-            image=original_image,
-            cam=cam,
-            prediction=prediction,  # Pass model prediction for tumor probabilities
-            slice_indices=None,  # Will automatically find slices with tumors
-            save_path=save_path
-        )
-        
-        print(f"Saved visualization to {save_path}")
+        try:
+            # Generate Grad-CAM
+            print("Generating Grad-CAM visualization...")
+            cam, prediction = generate_gradcam(model, image)
+            
+            # Get the original image
+            original_image = image.squeeze().cpu().numpy()
+            
+            # Create visualization paths
+            base_path = output_dir / f'sample_{idx}'
+            full_scan_path = base_path.with_suffix('.png')
+            
+            print("Creating visualizations...")
+            # This will create both full scan and detailed region visualizations
+            visualize_gradcam(
+                image=original_image,
+                cam=cam,
+                prediction=prediction,
+                save_path=full_scan_path
+            )
+            
+            print(f"Saved visualizations for sample {idx}")
+            
+        except Exception as e:
+            print(f"Error processing sample {idx}: {str(e)}")
+            continue
 
 if __name__ == '__main__':
-    test_gradcam()
+    import argparse
+    parser = argparse.ArgumentParser(description='Generate Grad-CAM visualizations for model predictions')
+    parser.add_argument('--checkpoint', type=str, default='checkpoints/latest.pth',
+                      help='Path to model checkpoint')
+    parser.add_argument('--samples', type=int, default=5,
+                      help='Number of samples to process')
+    
+    args = parser.parse_args()
+    print("\nStarting Grad-CAM visualization generation...")
+    print(f"Using checkpoint: {args.checkpoint}")
+    print(f"Processing {args.samples} samples")
+    
+    test_gradcam(args.checkpoint, args.samples)
+    print("\nVisualization generation complete!")

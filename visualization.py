@@ -5,6 +5,7 @@ from matplotlib.gridspec import GridSpec
 from matplotlib.patches import Rectangle
 import os
 import scipy.ndimage as ndimage
+from mpl_toolkits.mplot3d import Axes3D
 
 def get_tumor_regions(output, threshold=0.5):
     """
@@ -111,6 +112,98 @@ def generate_gradcam(model, input_tensor, target_class=1):
     
     return cam.detach().cpu().numpy(), output.detach().cpu()
 
+def visualize_full_scan(image, cam, prediction, alpha=0.5, save_path=None):
+    """
+    Visualize Grad-CAM results for the full 3D scan with multi-planar reconstructions
+    
+    Args:
+        image: Original 3D image [D, H, W]
+        cam: Grad-CAM heatmap [D, H, W]
+        prediction: Model prediction tensor
+        alpha: Transparency of the heatmap
+        save_path: Path to save the visualization
+    """
+    # Get tumor probabilities
+    tumor_probs = torch.softmax(prediction, dim=1)[0, 1].cpu().numpy()
+    
+    # Create threshold mask
+    thresh_mask = tumor_probs > 0.5
+    
+    # Get center of mass of tumor region
+    if np.any(thresh_mask):
+        center = ndimage.center_of_mass(thresh_mask)
+    else:
+        center = (image.shape[0]//2, image.shape[1]//2, image.shape[2]//2)
+    
+    # Create figure with multiple views
+    fig = plt.figure(figsize=(20, 15))
+    gs = GridSpec(2, 3, figure=fig)
+    
+    # Axial view (top-down)
+    ax1 = fig.add_subplot(gs[0, 0])
+    slice_idx = int(center[0])
+    ax1.imshow(image[slice_idx], cmap='gray')
+    ax1.imshow(cam[slice_idx], cmap='jet', alpha=alpha)
+    ax1.set_title(f'Axial View (Slice {slice_idx})')
+    ax1.axis('off')
+    
+    # Sagittal view (side)
+    ax2 = fig.add_subplot(gs[0, 1])
+    slice_idx = int(center[2])
+    sagittal_img = image[:, :, slice_idx]
+    sagittal_cam = cam[:, :, slice_idx]
+    ax2.imshow(sagittal_img, cmap='gray')
+    ax2.imshow(sagittal_cam, cmap='jet', alpha=alpha)
+    ax2.set_title(f'Sagittal View (Slice {slice_idx})')
+    ax2.axis('off')
+    
+    # Coronal view (front)
+    ax3 = fig.add_subplot(gs[0, 2])
+    slice_idx = int(center[1])
+    coronal_img = image[:, slice_idx, :]
+    coronal_cam = cam[:, slice_idx, :]
+    ax3.imshow(coronal_img, cmap='gray')
+    ax3.imshow(coronal_cam, cmap='jet', alpha=alpha)
+    ax3.set_title(f'Coronal View (Slice {slice_idx})')
+    ax3.axis('off')
+    
+    # 3D visualization of tumor regions
+    ax4 = fig.add_subplot(gs[1, 0], projection='3d')
+    x, y, z = np.where(thresh_mask)
+    if len(x) > 0:
+        scatter = ax4.scatter(x, y, z, c=tumor_probs[x, y, z],
+                            cmap='jet', alpha=0.6)
+        plt.colorbar(scatter, ax=ax4, label='Tumor Probability')
+    ax4.set_title('3D Tumor Visualization')
+    
+    # Probability distribution
+    ax5 = fig.add_subplot(gs[1, 1])
+    prob_hist = ax5.hist(tumor_probs[thresh_mask].flatten(), bins=50,
+                        range=(0, 1), density=True)
+    ax5.set_title('Tumor Probability Distribution')
+    ax5.set_xlabel('Probability')
+    ax5.set_ylabel('Density')
+    
+    # Summary statistics
+    ax6 = fig.add_subplot(gs[1, 2])
+    ax6.axis('off')
+    stats_text = (
+        f"Tumor Statistics:\n\n"
+        f"Volume: {np.sum(thresh_mask)} voxels\n"
+        f"Max Probability: {np.max(tumor_probs):.3f}\n"
+        f"Mean Probability: {np.mean(tumor_probs[thresh_mask]):.3f}\n"
+        f"Location: {center}\n"
+    )
+    ax6.text(0.1, 0.5, stats_text, fontsize=12, transform=ax6.transAxes)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, bbox_inches='tight', dpi=300)
+        plt.close()
+    else:
+        plt.show()
+
 def visualize_gradcam(image, cam, prediction, slice_indices=None, alpha=0.5, save_path=None):
     """
     Visualize Grad-CAM results in a clinically relevant format
@@ -127,15 +220,23 @@ def visualize_gradcam(image, cam, prediction, slice_indices=None, alpha=0.5, sav
     if len(cam.shape) == 2 or (len(cam.shape) == 3 and cam.shape[0] == 1):
         cam = np.repeat(cam.reshape(1, *cam.shape[-2:]), image.shape[0], axis=0)
     
-    # Get tumor probabilities and regions
-    tumor_probs = torch.softmax(prediction, dim=1)[0, 1]  # [D, H, W]
+    # Get tumor regions
     regions = get_tumor_regions(prediction)
-    figures = []  # Initialize figures list
     
     if not regions:
-        print("No tumor detected in any slice.")
+        print("No tumor detected in any scan.")
         return
+        
+    # First create the full scan visualization
+    if save_path:
+        base, ext = os.path.splitext(save_path)
+        full_scan_path = f"{base}_full_scan{ext}"
+    else:
+        full_scan_path = None
+        
+    visualize_full_scan(image, cam, prediction, alpha, full_scan_path)
     
+    # Then create detailed views for each region
     for region_idx, region in enumerate(regions):
         slice_idx = region['slice']
         min_y, max_y, min_x, max_x = region['bbox']
@@ -167,6 +268,9 @@ def visualize_gradcam(image, cam, prediction, slice_indices=None, alpha=0.5, sav
                             cmap='jet', alpha=alpha)
         ax3.set_title(f'Zoomed Region - Heatmap\nConfidence: {confidence:.2%}')
         ax3.axis('off')
+        
+        # Get tumor probabilities for current slice
+        tumor_probs = torch.softmax(prediction, dim=1)[0, 1]  # [D, H, W]
         
         # Bottom row: Detailed analysis
         # Probability map
@@ -210,21 +314,12 @@ def visualize_gradcam(image, cam, prediction, slice_indices=None, alpha=0.5, sav
         plt.colorbar(heatmap, ax=ax6, label='Model Attention')
         
         plt.tight_layout()
-        figures.append(fig)
         
         if save_path:
-            # For multiple figures, save with different names
-            if len(regions) > 1:
-                base, ext = os.path.splitext(save_path)
-                current_save_path = f"{base}_region{region_idx+1}{ext}"
-            else:
-                current_save_path = save_path
+            # For multiple regions, save with different names
+            base, ext = os.path.splitext(save_path)
+            current_save_path = f"{base}_region{region_idx+1}{ext}"
             plt.savefig(current_save_path, bbox_inches='tight', dpi=300)
             plt.close()
-    
-    plt.tight_layout()
-    if save_path:
-        plt.savefig(save_path)
-        plt.close()
-    else:
-        plt.show()
+        else:
+            plt.show()
