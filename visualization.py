@@ -25,6 +25,33 @@ def print_tensor_info(name, tensor):
         print(f"  Range: [{tensor.min():.3f}, {tensor.max():.3f}]")
         print(f"  Mean: {tensor.mean():.3f}")
 
+def get_center_indices(shape):
+    """Get central indices for each dimension"""
+    centers = [dim // 2 for dim in shape]
+    print(f"\nCalculating center indices for shape {shape}:")
+    print(f"Center indices: {centers}")
+    return centers
+
+def get_prediction_center_indices(shape, prediction_shape):
+    """
+    Get central indices accounting for different input and prediction sizes
+    """
+    d, h, w = [dim // 2 for dim in shape]
+    
+    d_scale = prediction_shape[0] / shape[0]
+    h_scale = prediction_shape[1] / shape[1]
+    w_scale = prediction_shape[2] / shape[2]
+    
+    d_mid = min(int(d * d_scale), prediction_shape[0] - 1)
+    h_mid = min(int(h * h_scale), prediction_shape[1] - 1)
+    w_mid = min(int(w * w_scale), prediction_shape[2] - 1)
+    
+    print(f"\nScaling center indices:")
+    print(f"Input shape: {shape}, centers: [{d}, {h}, {w}]")
+    print(f"Prediction shape: {prediction_shape}, scaled centers: [{d_mid}, {h_mid}, {w_mid}]")
+    
+    return d_mid, h_mid, w_mid
+
 def generate_gradcam(model, input_tensor, target_class=1):
     """Generate Grad-CAM visualization"""
     try:
@@ -106,13 +133,6 @@ def generate_gradcam(model, input_tensor, target_class=1):
         traceback.print_exc()
         raise
 
-def get_center_indices(shape):
-    """Get central indices for each dimension"""
-    centers = [dim // 2 for dim in shape]
-    print(f"\nCalculating center indices for shape {shape}:")
-    print(f"Center indices: {centers}")
-    return centers
-
 def visualize_full_scan(image, cam, prediction, alpha=0.5, save_path=None):
     """Visualize Grad-CAM results for patches"""
     try:
@@ -121,10 +141,8 @@ def visualize_full_scan(image, cam, prediction, alpha=0.5, save_path=None):
         print_tensor_info("CAM", cam)
         print_tensor_info("Prediction", prediction)
         
-        # Ensure prediction is detached
-        prediction = prediction.detach()
-        
         # Get tumor probabilities
+        prediction = prediction.detach()
         tumor_probs = torch.softmax(prediction, dim=1)[0, 1].cpu().numpy()
         print_tensor_info("Tumor probabilities", tumor_probs)
         
@@ -136,36 +154,32 @@ def visualize_full_scan(image, cam, prediction, alpha=0.5, save_path=None):
         fig = plt.figure(figsize=(20, 10))
         gs = GridSpec(2, 3, figure=fig)
         
-        # Get central indices for each dimension
-        d_mid, h_mid, w_mid = get_center_indices(image.shape)
-        print(f"Using central slices: d={d_mid}, h={h_mid}, w={w_mid}")
+        # Get scaled center indices
+        d_mid, h_mid, w_mid = get_prediction_center_indices(image.shape, tumor_probs.shape)
+        print(f"Using scaled central slices: d={d_mid}, h={h_mid}, w={w_mid}")
         
         # Axial view (top-down)
         print("Creating axial view...")
         ax1 = fig.add_subplot(gs[0, 0])
-        ax1.imshow(image[d_mid], cmap='gray')
-        ax1.imshow(cam[d_mid], cmap='jet', alpha=alpha)
-        ax1.set_title(f'Axial View (Slice {d_mid})')
+        ax1.imshow(image[d_mid*2], cmap='gray')
+        ax1.imshow(cam[d_mid*2], cmap='jet', alpha=alpha)
+        ax1.set_title(f'Axial View (Slice {d_mid*2})')
         ax1.axis('off')
         
         # Sagittal view (side)
         print("Creating sagittal view...")
         ax2 = fig.add_subplot(gs[0, 1])
-        sagittal_img = image[:, :, w_mid]
-        sagittal_cam = cam[:, :, w_mid]
-        ax2.imshow(sagittal_img, cmap='gray')
-        ax2.imshow(sagittal_cam, cmap='jet', alpha=alpha)
-        ax2.set_title(f'Sagittal View (Central Slice)')
+        ax2.imshow(image[:, :, w_mid*2], cmap='gray')
+        ax2.imshow(cam[:, :, w_mid*2], cmap='jet', alpha=alpha)
+        ax2.set_title(f'Sagittal View (Slice {w_mid*2})')
         ax2.axis('off')
         
         # Coronal view (front)
         print("Creating coronal view...")
         ax3 = fig.add_subplot(gs[0, 2])
-        coronal_img = image[:, h_mid, :]
-        coronal_cam = cam[:, h_mid, :]
-        ax3.imshow(coronal_img, cmap='gray')
-        ax3.imshow(coronal_cam, cmap='jet', alpha=alpha)
-        ax3.set_title(f'Coronal View (Central Slice)')
+        ax3.imshow(image[:, h_mid*2, :], cmap='gray')
+        ax3.imshow(cam[:, h_mid*2, :], cmap='jet', alpha=alpha)
+        ax3.set_title(f'Coronal View (Slice {h_mid*2})')
         ax3.axis('off')
         
         # 3D visualization of tumor regions
@@ -197,7 +211,8 @@ def visualize_full_scan(image, cam, prediction, alpha=0.5, save_path=None):
             f"Volume: {np.sum(thresh_mask)} voxels\n"
             f"Max Probability: {np.max(tumor_probs):.3f}\n"
             f"Mean Probability: {np.mean(tumor_probs):.3f}\n"
-            f"Patch Size: {image.shape}\n"
+            f"Input Size: {image.shape}\n"
+            f"Prediction Size: {tumor_probs.shape}\n"
         )
         ax6.text(0.1, 0.5, stats_text, fontsize=12, transform=ax6.transAxes)
         
@@ -227,9 +242,6 @@ def visualize_gradcam(image, cam, prediction, slice_indices=None, alpha=0.5, sav
         print_tensor_info("CAM", cam)
         print_tensor_info("Prediction", prediction)
         
-        # Ensure prediction is detached
-        prediction = prediction.detach()
-        
         # First create the full scan visualization
         if save_path:
             base, ext = os.path.splitext(save_path)
@@ -242,12 +254,13 @@ def visualize_gradcam(image, cam, prediction, slice_indices=None, alpha=0.5, sav
         visualize_full_scan(image, cam, prediction, alpha, full_scan_path)
         
         # Get tumor probabilities
+        prediction = prediction.detach()
         tumor_probs = torch.softmax(prediction, dim=1)[0, 1].cpu().numpy()
         print_tensor_info("\nTumor probabilities for detailed view", tumor_probs)
         
-        # Get central indices
-        d_mid, h_mid, w_mid = get_center_indices(image.shape)
-        print(f"\nUsing central slice {d_mid} for detailed view")
+        # Get scaled center indices
+        d_mid, h_mid, w_mid = get_prediction_center_indices(image.shape, tumor_probs.shape)
+        print(f"\nUsing scaled central slice {d_mid} for detailed view")
         
         # Create figure with gridspec
         fig = plt.figure(figsize=(20, 10))
@@ -256,15 +269,15 @@ def visualize_gradcam(image, cam, prediction, slice_indices=None, alpha=0.5, sav
         # Full slice view
         print("Creating full slice view...")
         ax1 = fig.add_subplot(gs[0, 0])
-        ax1.imshow(image[d_mid], cmap='gray')
-        ax1.set_title(f'Central Slice (Slice {d_mid})')
+        ax1.imshow(image[d_mid*2], cmap='gray')
+        ax1.set_title(f'Central Slice (Slice {d_mid*2})')
         ax1.axis('off')
         
         # Grad-CAM overlay
         print("Creating Grad-CAM overlay...")
         ax2 = fig.add_subplot(gs[0, 1])
-        ax2.imshow(image[d_mid], cmap='gray')
-        heatmap = ax2.imshow(cam[d_mid], cmap='jet', alpha=alpha)
+        ax2.imshow(image[d_mid*2], cmap='gray')
+        heatmap = ax2.imshow(cam[d_mid*2], cmap='jet', alpha=alpha)
         ax2.set_title('Grad-CAM Heatmap')
         ax2.axis('off')
         
@@ -280,7 +293,7 @@ def visualize_gradcam(image, cam, prediction, slice_indices=None, alpha=0.5, sav
         print("Creating thresholded region view...")
         ax4 = fig.add_subplot(gs[1, 0])
         thresh_map = tumor_probs[d_mid] > 0.5
-        ax4.imshow(image[d_mid], cmap='gray')
+        ax4.imshow(image[d_mid*2], cmap='gray')
         ax4.imshow(thresh_map, cmap='RdYlBu_r', alpha=0.5)
         ax4.set_title('Thresholded Tumor Region')
         ax4.axis('off')
@@ -288,8 +301,8 @@ def visualize_gradcam(image, cam, prediction, slice_indices=None, alpha=0.5, sav
         # Combined visualization
         print("Creating combined visualization...")
         ax5 = fig.add_subplot(gs[1, 1])
-        ax5.imshow(image[d_mid], cmap='gray')
-        overlay = np.where(thresh_map, cam[d_mid], 0)
+        ax5.imshow(image[d_mid*2], cmap='gray')
+        overlay = np.where(thresh_map, cam[d_mid*2], 0)
         heatmap = ax5.imshow(overlay, cmap='jet', alpha=alpha)
         ax5.set_title('Focused Attention Map')
         ax5.axis('off')
@@ -304,7 +317,8 @@ def visualize_gradcam(image, cam, prediction, slice_indices=None, alpha=0.5, sav
             f"Active Voxels: {np.sum(thresh_map)}\n"
             f"Max Probability: {np.max(tumor_probs[d_mid]):.3f}\n"
             f"Mean Probability: {np.mean(tumor_probs[d_mid]):.3f}\n"
-            f"Patch Size: {image.shape}\n"
+            f"Input Size: {image.shape}\n"
+            f"Prediction Size: {tumor_probs.shape}\n"
         )
         ax6.text(0.1, 0.5, stats_text, fontsize=12, transform=ax6.transAxes)
         
