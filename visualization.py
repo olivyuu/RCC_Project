@@ -5,29 +5,20 @@ from matplotlib.gridspec import GridSpec
 from matplotlib.patches import Rectangle
 import os
 import scipy.ndimage as ndimage
-from mpl_toolkits.mplot3d import Axes3D
 
 def get_tumor_regions(output, threshold=0.5):
     """
     Find slices that contain tumor predictions
-    
-    Args:
-        output: Model output tensor [1, 2, D, H, W]
-        threshold: Probability threshold for tumor prediction
-        
-    Returns:
-        list of slice indices with tumor predictions
     """
     tumor_probs = torch.softmax(output, dim=1)[0, 1]  # Get tumor class probabilities
     tumor_mask = tumor_probs > threshold
-    tumor_slices = []
     
     # Find regions with tumor predictions
     regions = []
     for slice_idx in range(tumor_mask.shape[0]):
         if tumor_mask[slice_idx].any():
             # Get connected components in this slice
-            labeled, num_components = ndimage.label(tumor_mask[slice_idx].cpu().numpy())
+            labeled, num_components = ndimage.label(tumor_mask[slice_idx].cpu().detach().numpy())
             
             for component in range(1, num_components + 1):
                 component_mask = labeled == component
@@ -52,25 +43,15 @@ def get_tumor_regions(output, threshold=0.5):
                     regions.append({
                         'slice': slice_idx,
                         'bbox': (min_y, max_y, min_x, max_x),
-                        'confidence': float(torch.mean(tumor_probs[slice_idx, min_y:max_y, min_x:max_x]))
+                        'confidence': float(torch.mean(tumor_probs[slice_idx, min_y:max_y, min_x:max_x]).detach())
                     })
     
     return regions
 
 def generate_gradcam(model, input_tensor, target_class=1):
     """
-    Generate Grad-CAM visualization for the model's predictions
-    
-    Args:
-        model: The neural network model
-        input_tensor: Input image tensor [1, 1, D, H, W]
-        target_class: Index of the target class (default: 1 for tumor)
-    
-    Returns:
-        cam: Grad-CAM heatmap
-        pred: Model prediction
+    Generate Grad-CAM visualization
     """
-    # Ensure model is in eval mode
     model.eval()
     
     # Forward pass
@@ -86,7 +67,6 @@ def generate_gradcam(model, input_tensor, target_class=1):
     else:
         target_score = output[target_class]
     
-    # Convert to scalar by taking mean over spatial dimensions
     target_score = target_score.mean()
     
     # Backward pass
@@ -114,15 +94,11 @@ def generate_gradcam(model, input_tensor, target_class=1):
 
 def visualize_full_scan(image, cam, prediction, alpha=0.5, save_path=None):
     """
-    Visualize Grad-CAM results for the full 3D scan with multi-planar reconstructions
-    
-    Args:
-        image: Original 3D image [D, H, W]
-        cam: Grad-CAM heatmap [D, H, W]
-        prediction: Model prediction tensor
-        alpha: Transparency of the heatmap
-        save_path: Path to save the visualization
+    Visualize Grad-CAM results for the full 3D scan
     """
+    # Ensure prediction is detached
+    prediction = prediction.detach()
+    
     # Get tumor probabilities
     tumor_probs = torch.softmax(prediction, dim=1)[0, 1].cpu().numpy()
     
@@ -178,8 +154,9 @@ def visualize_full_scan(image, cam, prediction, alpha=0.5, save_path=None):
     
     # Probability distribution
     ax5 = fig.add_subplot(gs[1, 1])
-    prob_hist = ax5.hist(tumor_probs[thresh_mask].flatten(), bins=50,
-                        range=(0, 1), density=True)
+    if np.any(thresh_mask):
+        prob_hist = ax5.hist(tumor_probs[thresh_mask].flatten(), bins=50,
+                            range=(0, 1), density=True)
     ax5.set_title('Tumor Probability Distribution')
     ax5.set_xlabel('Probability')
     ax5.set_ylabel('Density')
@@ -206,19 +183,19 @@ def visualize_full_scan(image, cam, prediction, alpha=0.5, save_path=None):
 
 def visualize_gradcam(image, cam, prediction, slice_indices=None, alpha=0.5, save_path=None):
     """
-    Visualize Grad-CAM results in a clinically relevant format
-    
-    Args:
-        image: Original 3D image [D, H, W]
-        cam: Grad-CAM heatmap [1, H, W] or [D, H, W]
-        prediction: Model prediction tensor
-        slice_indices: List of slice indices to visualize (if None, shows all slices with tumors)
-        alpha: Transparency of the heatmap
-        save_path: Path to save the visualization (optional)
+    Visualize Grad-CAM results
     """
-    # Handle case where CAM is single slice
-    if len(cam.shape) == 2 or (len(cam.shape) == 3 and cam.shape[0] == 1):
-        cam = np.repeat(cam.reshape(1, *cam.shape[-2:]), image.shape[0], axis=0)
+    # Ensure prediction is detached
+    prediction = prediction.detach()
+    
+    # Create full scan visualization
+    if save_path:
+        base, ext = os.path.splitext(save_path)
+        full_scan_path = f"{base}_full_scan{ext}"
+    else:
+        full_scan_path = None
+    
+    visualize_full_scan(image, cam, prediction, alpha, full_scan_path)
     
     # Get tumor regions
     regions = get_tumor_regions(prediction)
@@ -226,17 +203,8 @@ def visualize_gradcam(image, cam, prediction, slice_indices=None, alpha=0.5, sav
     if not regions:
         print("No tumor detected in any scan.")
         return
-        
-    # First create the full scan visualization
-    if save_path:
-        base, ext = os.path.splitext(save_path)
-        full_scan_path = f"{base}_full_scan{ext}"
-    else:
-        full_scan_path = None
-        
-    visualize_full_scan(image, cam, prediction, alpha, full_scan_path)
     
-    # Then create detailed views for each region
+    # Create detailed views for each region
     for region_idx, region in enumerate(regions):
         slice_idx = region['slice']
         min_y, max_y, min_x, max_x = region['bbox']
@@ -271,18 +239,19 @@ def visualize_gradcam(image, cam, prediction, slice_indices=None, alpha=0.5, sav
         
         # Get tumor probabilities for current slice
         tumor_probs = torch.softmax(prediction, dim=1)[0, 1]  # [D, H, W]
+        tumor_probs = tumor_probs.cpu().numpy()
         
         # Bottom row: Detailed analysis
         # Probability map
         ax4 = fig.add_subplot(gs[1, 0])
-        prob_map = ax4.imshow(tumor_probs[slice_idx].cpu().numpy(), cmap='RdYlBu_r')
+        prob_map = ax4.imshow(tumor_probs[slice_idx], cmap='RdYlBu_r')
         ax4.set_title('Tumor Probability Map')
         ax4.axis('off')
         plt.colorbar(prob_map, ax=ax4, label='Tumor Probability')
         
         # Thresholded region
         ax5 = fig.add_subplot(gs[1, 1])
-        thresh_map = (tumor_probs[slice_idx] > 0.5).float().cpu().numpy()
+        thresh_map = (tumor_probs[slice_idx] > 0.5)
         ax5.imshow(image[slice_idx], cmap='gray')
         ax5.imshow(thresh_map, cmap='RdYlBu_r', alpha=0.5)
         ax5.set_title('Thresholded Tumor Region')
