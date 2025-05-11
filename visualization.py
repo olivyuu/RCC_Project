@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
@@ -85,6 +86,18 @@ def generate_gradcam(model, input_tensor, target_class=1):
     cam = torch.relu(cam)
     cam = cam - cam.min()
     cam = cam / (cam.max() + 1e-8)
+    
+    # Upsample CAM to match input size
+    cam = cam.unsqueeze(0).unsqueeze(0)  # Add batch and channel dims
+    cam = F.interpolate(
+        cam, 
+        size=input_tensor.shape[2:],  # Match D, H, W of input
+        mode='trilinear',
+        align_corners=False
+    )
+    cam = cam.squeeze()  # Remove batch and channel dims
+    
+    print(f"CAM shape after upsampling: {cam.shape}")  # Debug print
     
     return cam.detach().cpu().numpy(), output.detach().cpu()
 
