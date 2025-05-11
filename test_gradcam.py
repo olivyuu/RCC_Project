@@ -79,14 +79,15 @@ def test_gradcam(checkpoint_path='checkpoints/latest.pth', num_samples=5):
             image, mask = dataset[idx]
             image = image.unsqueeze(0)  # Add batch dimension
             image = image.to(device)
+            image.requires_grad = True  # Enable gradients for Grad-CAM
             
             # Generate Grad-CAM
             print("Generating Grad-CAM visualization...")
-            with torch.no_grad():  # Prevent gradient computation
-                cam, prediction = generate_gradcam(model, image)
+            cam, prediction = generate_gradcam(model, image)
             
-            # Get the original image
-            original_image = image.squeeze().detach().cpu().numpy()
+            # Get the original image (no gradients needed for visualization)
+            with torch.no_grad():
+                original_image = image.squeeze().cpu().numpy()
             
             # Create visualization paths
             base_path = output_dir / f'sample_{idx}'
