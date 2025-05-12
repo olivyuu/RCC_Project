@@ -1,4 +1,4 @@
-import torch
+import torch, cv2
 import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
@@ -302,7 +302,27 @@ def visualize_gradcam(image, cam, prediction, slice_indices=None, alpha=0.5, sav
         print("Creating combined visualization...")
         ax5 = fig.add_subplot(gs[1, 1])
         ax5.imshow(image[d_mid*2], cmap='gray')
-        overlay = np.where(thresh_map, cam[d_mid*2], 0)
+        # Debug shapes before resizing
+        print("\nResizing debug info:")
+        print(f"thresh_map shape: {thresh_map.shape}")
+        print(f"thresh_map dtype: {thresh_map.dtype}")
+        print(f"thresh_map range: [{thresh_map.min():.3f}, {thresh_map.max():.3f}]")
+        print(f"target CAM shape: {cam[d_mid*2].shape}")
+        print(f"target CAM range: [{cam[d_mid*2].min():.3f}, {cam[d_mid*2].max():.3f}]")
+        
+        # Resize thresh_map to match CAM dimensions
+        thresh_map_resized = cv2.resize(
+            thresh_map.astype(np.float32),
+            (cam[d_mid*2].shape[1], cam[d_mid*2].shape[0]),
+            interpolation=cv2.INTER_NEAREST)
+        
+        # Debug shapes after resizing
+        print(f"Resized thresh_map shape: {thresh_map_resized.shape}")
+        print(f"Resized thresh_map range: [{thresh_map_resized.min():.3f}, {thresh_map_resized.max():.3f}]")
+        
+        overlay = np.where(thresh_map_resized, cam[d_mid*2], 0)
+        print(f"Final overlay shape: {overlay.shape}")
+        print(f"Final overlay range: [{overlay.min():.3f}, {overlay.max():.3f}]\n")
         heatmap = ax5.imshow(overlay, cmap='jet', alpha=alpha)
         ax5.set_title('Focused Attention Map')
         ax5.axis('off')
