@@ -4,10 +4,19 @@ Script to document the transition from patch-based to full volume training.
 import argparse
 from pathlib import Path
 import yaml
-from datetime import datetime
 import json
+import datetime
 import torch
-import sys
+
+def convert_tensor_to_python(obj):
+    """Convert PyTorch tensors to Python native types."""
+    if torch.is_tensor(obj):
+        return float(obj.item()) if obj.numel() == 1 else obj.cpu().numpy().tolist()
+    elif isinstance(obj, dict):
+        return {key: convert_tensor_to_python(value) for key, value in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [convert_tensor_to_python(item) for item in obj]
+    return obj
 
 def load_patch_model_info(exp_dir: Path) -> dict:
     """Load information about the patch-trained model."""
@@ -38,13 +47,13 @@ def load_patch_model_info(exp_dir: Path) -> dict:
     
     return {
         "checkpoint_path": str(best_checkpoint),
-        "validation_dice": float(str(best_checkpoint).split("dice_")[-1].replace(".pth", "")),
-        "training_date": datetime.fromtimestamp(best_checkpoint.stat().st_mtime).strftime("%Y-%m-%d"),
+        "validation_dice": convert_tensor_to_python(checkpoint.get('best_val_dice')),
+        "training_date": datetime.datetime.fromtimestamp(best_checkpoint.stat().st_mtime).strftime("%Y-%m-%d"),
         "config": config,
-        "epochs_trained": checkpoint.get('epoch', 'unknown'),
+        "epochs_trained": convert_tensor_to_python(checkpoint.get('epoch')),
         "model_state": {
-            "best_val_dice": checkpoint.get('best_val_dice', 'unknown'),
-            "final_metrics": checkpoint.get('metrics', {})
+            "best_val_dice": convert_tensor_to_python(checkpoint.get('best_val_dice')),
+            "final_metrics": convert_tensor_to_python(checkpoint.get('metrics', {}))
         }
     }
 
@@ -76,10 +85,10 @@ def load_volume_training_info(exp_dir: Path) -> dict:
         "checkpoint_path": str(best_checkpoint),
         "validation_dice": float(str(best_checkpoint).split("dice_")[-1].replace(".pth", "")),
         "config": config,
-        "epochs_trained": checkpoint.get('epoch', 'unknown'),
+        "epochs_trained": convert_tensor_to_python(checkpoint.get('epoch')),
         "model_state": {
-            "best_val_dice": checkpoint.get('best_val_dice', 'unknown'),
-            "final_metrics": checkpoint.get('metrics', {})
+            "best_val_dice": convert_tensor_to_python(checkpoint.get('best_val_dice')),
+            "final_metrics": convert_tensor_to_python(checkpoint.get('metrics', {}))
         }
     }
 
@@ -101,7 +110,7 @@ def document_transition(patch_exp: str, volume_exp: str, base_path: str = "exper
     # Create transition document
     transition_doc = {
         "metadata": {
-            "documented_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "documented_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "patch_experiment": patch_exp,
             "volume_experiment": volume_exp
         },
@@ -121,19 +130,19 @@ def document_transition(patch_exp: str, volume_exp: str, base_path: str = "exper
     transitions_dir = base_dir / "transitions"
     transitions_dir.mkdir(exist_ok=True)
     
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     doc_path = transitions_dir / f"transition_{patch_exp}_to_{volume_exp}_{timestamp}.yaml"
     
     with open(doc_path, 'w') as f:
-        yaml.safe_dump(transition_doc, f, default_flow_style=False)
+        yaml.safe_dump(convert_tensor_to_python(transition_doc), f, default_flow_style=False)
     
     print(f"Transition documentation saved to: {doc_path}")
     
     # Print summary
     print("\nTransition Summary:")
     print(f"Patch Training Best Dice: {patch_info.get('validation_dice', 'unknown')}")
-    print(f"Volume Training Best Dice: {volume_info.get('validation_dice', 'unknown')}")
-    if all(x is not None for x in [patch_info.get('validation_dice'), volume_info.get('validation_dice')]):
+    if 'validation_dice' in volume_info:
+        print(f"Volume Training Best Dice: {volume_info['validation_dice']}")
         print(f"Dice Improvement: {transition_doc['transition_metrics']['dice_improvement']:.4f}")
 
 def main():
