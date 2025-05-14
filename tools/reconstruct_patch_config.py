@@ -139,13 +139,20 @@ def reconstruct_patch_config(exp_dir: str):
     
     # 2. Checkpoint configuration
     try:
-        checkpoints = list(exp_path.glob("best_model_dice_*.pth"))
+        # Look in both experiment dir and checkpoints subdir
+        checkpoints = list(exp_path.glob("best_model_dice_*.pth")) + \
+                     list((exp_path / "checkpoints").glob("best_model_dice_*.pth"))
         if checkpoints:
             best_cp = max(
                 checkpoints,
                 key=lambda p: float(str(p).split("dice_")[-1].replace(".pth", ""))
             )
-            checkpoint_config = extract_config_from_checkpoint(best_cp)
+            print(f"Found best model: {best_cp}")
+            try:
+                checkpoint_config = extract_config_from_checkpoint(best_cp)
+            except Exception as e:
+                print(f"Warning: Could not extract all data from checkpoint: {e}")
+                checkpoint_config = {'training_state': {'best_val_dice': float(str(best_cp).split("dice_")[-1].replace(".pth", ""))}}
             reconstructed_config['configuration'].update(checkpoint_config)
             reconstructed_config['metadata']['best_model'] = best_cp.name
             reconstructed_config['sources'].append(f"checkpoint: {best_cp.name}")
