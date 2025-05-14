@@ -47,6 +47,10 @@ def main():
                       help='Resume training from checkpoint')
     parser.add_argument('--preprocess', type=str, choices=['true', 'false'],
                       help='Whether to preprocess data or use existing preprocessed files')
+    parser.add_argument('--debug', action='store_true',
+                      help='Enable debug mode with additional logging')
+    parser.add_argument('--memory_check', action='store_true',
+                      help='Enable memory usage tracking')
     args = parser.parse_args()
     
     # Initialize config with volume training settings
