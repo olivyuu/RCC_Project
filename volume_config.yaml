@@ -1,0 +1,37 @@
+# Volume training configuration
+training_mode: "full_volume"
+experiment_name: "volume_ft_001"
+
+# Data parameters
+data_dir: "/workspace/kits23/dataset"
+preprocessed_dir: "preprocessed_volumes"
+
+# Model parameters
+in_channels: 1
+out_channels: 2
+features: [32, 64, 128, 256, 320]
+
+# Volume training parameters
+vol_batch_size: 1
+vol_gradient_accumulation_steps: 4
+vol_max_dim: [128, 256, 256]
+validation_split: 0.2
+
+# Training parameters
+initial_lr: 1e-4
+weight_decay: 2e-5
+num_epochs: 50
+early_stopping_patience: 15
+save_frequency: 1
+
+# Transfer learning parameters
+transfer_learning: true
+patch_weights: "experiments/patch_001/best_model_dice_0.8591.pth"
+freeze_layers: true
+freeze_epochs: 2
+
+# Memory management
+use_amp: true
+benchmark_cudnn: true
+deterministic: false
+seed: 42
