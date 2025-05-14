@@ -15,7 +15,7 @@ import sys
 import logging
 import psutil
 from typing import Optional, Dict, Any
-from tools.debug_utils import DebugLogger
+from debug_utils import DebugLogger  # Use relative import since we're in the tools directory
 
 def setup_logging(debug: bool = False) -> DebugLogger:
     """Setup debug logging."""
