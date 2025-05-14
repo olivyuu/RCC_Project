@@ -12,9 +12,9 @@ import sys
 def load_patch_model_info(exp_dir: Path) -> dict:
     """Load information about the patch-trained model."""
     # Find best model checkpoint
-    checkpoints = list(exp_dir.glob("checkpoints/best_model_dice_*.pth"))
+    checkpoints = list(exp_dir.glob("best_model_dice_*.pth"))
     if not checkpoints:
-        print(f"Error: No best model found in {exp_dir}/checkpoints/")
+        print(f"Error: No best model found in {exp_dir}")
         sys.exit(1)
     
     # Sort by dice score in filename
