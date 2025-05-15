@@ -30,7 +30,7 @@ class KiTS23VolumeDataset(Dataset):
         self.augmenter = KiTS23Augmenter(config) if train else None
         
         # Define path for preprocessed volumes
-        self.preprocessed_dir = Path(config.preprocessed_dir)
+        self.preprocessed_dir = Path(config.preprocessed_volumes_dir)
         self.preprocessed_dir.mkdir(exist_ok=True)
         
         # Setup debug logging if requested
@@ -81,8 +81,14 @@ class KiTS23VolumeDataset(Dataset):
         
         else:  # Load existing preprocessed volumes
             print(f"Loading preprocessed volumes from {self.preprocessed_dir}")
+            # If no preprocessed files exist, preprocess anyway
             all_volume_files = sorted(self.preprocessed_dir.glob("case_*_volume.pt"))
-            self.case_paths = [Path(str(f).replace('_volume.pt', '')) for f in all_volume_files]
+            if not all_volume_files:
+                print("No preprocessed volumes found, forcing preprocessing")
+                self.case_paths = sorted([d for d in self.root_dir.iterdir() if d.is_dir() and d.name.startswith('case_')])
+                preprocess = True
+            else:
+                self.case_paths = [Path(str(f).replace('_volume.pt', '')) for f in all_volume_files]
     
     def __len__(self) -> int:
         return len(self.case_paths)
