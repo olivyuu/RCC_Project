@@ -21,25 +21,9 @@ class DC_and_CE_loss(nn.Module):
         net_output: (batch_size, num_classes, ...)
         target: (batch_size, ...)
         """
-        print("\nDebug DC_and_CE_loss:")
-        print(f"Input shapes - net_output: {net_output.shape}, target: {target.shape}")
-        
-        # Calculate dice loss
-        print("\nCalculating Dice loss...")
         dc_loss = self.dc(net_output, target) if self.weight_dice != 0 else 0
-        if isinstance(dc_loss, torch.Tensor):
-            print(f"Dice loss value: {dc_loss.item()}")
-        
-        # Calculate cross entropy loss
-        print("\nCalculating Cross Entropy loss...")
         ce_loss = self.ce(net_output, target) if self.weight_ce != 0 else 0
-        if isinstance(ce_loss, torch.Tensor):
-            print(f"CE loss value: {ce_loss.item()}")
-        
-        # Combine losses
         result = self.weight_ce * ce_loss + self.weight_dice * dc_loss
-        print(f"\nFinal combined loss: {result.item()}")
-        print("-" * 50)
         return result
 
 class RobustCrossEntropyLoss(nn.Module):
@@ -52,44 +36,31 @@ class RobustCrossEntropyLoss(nn.Module):
         input: (batch_size, num_classes, ...)
         target: (batch_size, ...)
         """
-        print("\nDebug RobustCrossEntropyLoss:")
-        print(f"Input shape: {input.shape}")
-        print(f"Target shape: {target.shape}")
-        
         # Ensure inputs have the same spatial dimensions
         if input.shape[-3:] != target.shape[-3:]:
-            print(f"Resizing input from {input.shape[-3:]} to {target.shape[-3:]}")
             input = F.interpolate(
                 input,
                 size=target.shape[-3:],
                 mode='trilinear',
                 align_corners=False
             )
-            print(f"After resize: {input.shape}")
         
         # Convert target to long and handle dimensions
         target = target.long()
-        print(f"Target shape before adjustments: {target.shape}")
-        
         if len(target.shape) == len(input.shape) - 1:
             target = target.unsqueeze(1)
-            print(f"After unsqueeze: {target.shape}")
         elif len(target.shape) < len(input.shape) - 1:
             for _ in range(len(input.shape) - len(target.shape) - 1):
                 target = target.unsqueeze(1)
-            print(f"After multiple unsqueeze: {target.shape}")
         
         # Create one hot target with correct shape
         target_one_hot = torch.zeros_like(input)
         target_one_hot.scatter_(1, target, 1)
-        print(f"One-hot target shape: {target_one_hot.shape}")
         
         # Compute cross entropy loss
         log_softmax = F.log_softmax(input, dim=1)
         loss = -(target_one_hot * log_softmax).sum(dim=1)
-        print(f"Loss tensor shape: {loss.shape}")
         
-        # Always reduce to scalar for backprop
         if self.reduction == 'mean':
             return loss.mean()
         elif self.reduction == 'sum':
@@ -104,40 +75,25 @@ class SoftDiceLoss(nn.Module):
         self.do_bg = do_bg
         
     def forward(self, net_output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Forward pass with detailed debugging."""
-        print(f"\nDebug SoftDiceLoss - Input shapes:")
-        print(f"net_output: {net_output.shape}")
-        print(f"target: {target.shape}")
-        
         # Ensure net_output and target have the same spatial dimensions
         if net_output.shape[-3:] != target.shape[-3:]:
-            print(f"Resizing net_output from {net_output.shape[-3:]} to {target.shape[-3:]}")
             net_output = F.interpolate(
                 net_output,
                 size=target.shape[-3:],
                 mode='trilinear',
                 align_corners=False
             )
-            print(f"After resize: {net_output.shape}")
             
         shp_x = net_output.shape
         target = target.long()
         
-        # Ensure target has the right shape for one-hot encoding
-        if len(target.shape) == len(net_output.shape) - 1:
-            target = target.unsqueeze(1)
-        
         # Create tensor for one-hot encoding with same shape as net_output
         target_one_hot = torch.zeros_like(net_output)
-        print(f"Created one-hot tensor: {target_one_hot.shape}")
         
-        # Debug target dimensions
-        print(f"Target shape before adjustments: {target.shape}")
         # Ensure all tensors have the same dimensions before scatter
         target_indices = target.long()
         if len(target_indices.shape) < len(target_one_hot.shape):
             target_indices = target_indices.unsqueeze(1)
-            print(f"Adjusted target indices shape: {target_indices.shape}")
             
         target_one_hot.scatter_(1, target_indices, 1)
         
@@ -149,34 +105,20 @@ class SoftDiceLoss(nn.Module):
             pc = pc[:, 1:, ...]
         
         if self.batch_dice:
-            print("\nDebug flattening process:")
-            print(f"Original shapes - PC: {pc.shape}, Target: {target_one_hot.shape}")
-            
             # Handle 3D volume dimensions by properly flattening
             if len(pc.shape) > 3:  # For 3D volumes
-                print(f"Spatial dimensions to flatten: {pc.shape[2:]}")
-                # Flatten all spatial dimensions
                 pc = pc.flatten(start_dim=2)
                 target_one_hot = target_one_hot.flatten(start_dim=2)
-                print(f"After flatten - PC: {pc.shape}, Target: {target_one_hot.shape}")
             else:
-                # Original behavior for 2D
                 pc = pc.reshape(shp_x[0], shp_x[1], -1)
                 target_one_hot = target_one_hot.reshape(shp_x[0], shp_x[1], -1)
-                print(f"After reshape - PC: {pc.shape}, Target: {target_one_hot.shape}")
             
-            # Debug dice coefficient calculation
-            print("\nDebug dice calculation:")
             tp = (pc * target_one_hot).sum(-1)
             fp = pc.sum(-1) - tp
             fn = target_one_hot.sum(-1) - tp
-            print(f"TP shape: {tp.shape}, FP shape: {fp.shape}, FN shape: {fn.shape}")
             
             dice = (2 * tp + self.smooth) / (2 * tp + fp + fn + self.smooth)
-            print(f"Dice coefficients: {dice}")
-            # Ensure scalar output
             loss = (1 - dice).mean()
-            print(f"Final loss value: {loss.item()}")
         else:
             raise NotImplementedError("Only batch dice supported")
             
