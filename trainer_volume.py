@@ -14,8 +14,15 @@ from losses import DC_and_CE_loss
 
 class nnUNetVolumeTrainer:
     def __init__(self, config, debug_logger=None):
+        print("\nDebug: Initializing trainer...")
         self.config = config
         self.debug_logger = debug_logger
+
+        # Initialize preprocessor early
+        print("Debug: Creating preprocessor instance")
+        from preprocessing.preprocessor import KiTS23Preprocessor
+        self.preprocessor = KiTS23Preprocessor(config)
+        print(f"Debug: Preprocessor methods: {[m for m in dir(self.preprocessor) if not m.startswith('__')]}")
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
         
@@ -87,12 +94,24 @@ class nnUNetVolumeTrainer:
         self.frozen_layers = False
     
     def train(self, dataset_path: str):
+        print("\nDebug: Initializing training...")
+        print(f"Dataset path: {dataset_path}")
+        if hasattr(self, 'preprocessor'):
+            print("Debug: Preprocessor found in trainer")
+            print(f"Preprocessor methods: {[m for m in dir(self.preprocessor) if not m.startswith('__')]}")
+            print(f"Has preprocess_volume: {hasattr(self.preprocessor, 'preprocess_volume')}")
+        else:
+            print("Debug: No preprocessor found in trainer")
+        
         # Create dataset
+        print("\nDebug: Creating dataset...")
         dataset = KiTS23VolumeDataset(
-            dataset_path, 
+            dataset_path,
             self.config,
+            preprocessor=self.preprocessor,  # Pass the preprocessor
             train=True,
-            preprocess=self.config.preprocess
+            preprocess=self.config.preprocess,
+            debug=self.config.debug
         )
         
         # Split for validation

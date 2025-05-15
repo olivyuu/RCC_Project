@@ -9,7 +9,11 @@ from nibabel.processing import resample_from_to  # Changed from resample_img
 
 class KiTS23Preprocessor:
     def __init__(self, config):
-        print("Debug: Initializing KiTS23Preprocessor")
+        print("\nDebug: Initializing KiTS23Preprocessor")
+        print("Debug: Initial setup")
+        # Print class attributes and methods
+        methods = [m for m in dir(self.__class__) if not m.startswith('__')]
+        print(f"Debug: Available class methods: {methods}")
         self.config = config
         self.patch_size = config.patch_size
         self.stride = config.patch_stride
