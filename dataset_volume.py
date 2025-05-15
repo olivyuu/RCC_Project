@@ -30,7 +30,7 @@ class KiTS23VolumeDataset(Dataset):
         self.augmenter = KiTS23Augmenter(config) if train else None
         
         # Define path for preprocessed volumes
-        self.preprocessed_dir = Path(config.preprocessed_volumes_dir)
+        self.preprocessed_dir = Path(config.preprocessed_dir)
         self.preprocessed_dir.mkdir(exist_ok=True)
         
         # Setup debug logging if requested

@@ -57,6 +57,7 @@ def main():
     config = nnUNetConfig()
     config.training_mode = "full_volume"
     config.data_dir = args.data_dir
+    config.preprocessed_dir = "preprocessed_volumes"  # Set volume preprocessing directory
     config.vol_batch_size = args.batch_size
     config.vol_gradient_accumulation_steps = args.accumulation_steps
     config.num_epochs = args.epochs
