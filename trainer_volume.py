@@ -268,6 +268,16 @@ class nnUNetVolumeTrainer:
     
     def _calculate_dice(self, outputs, targets):
         """Calculate Dice score."""
+        # Ensure outputs and targets have same size
+        if outputs.shape != targets.shape:
+            print(f"Shape mismatch - Outputs: {outputs.shape}, Targets: {targets.shape}")
+            # Resize targets to match output size
+            targets = torch.nn.functional.interpolate(
+                targets,
+                size=outputs.shape[-3:],
+                mode='nearest'
+            )
+            
         preds = torch.argmax(outputs, dim=1)
         if len(targets.shape) == len(preds.shape) + 1:
             targets = targets.squeeze(1)
