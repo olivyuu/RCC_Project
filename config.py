@@ -4,17 +4,26 @@ from pathlib import Path
 
 @dataclass
 class nnUNetConfig:
+    # Training mode
+    training_mode: str = "patch"  # Options: "patch", "full_volume"
+    
     # Data parameters
     data_dir: str = "/workspace/kits23/dataset"
     preprocessed_dir: str = "preprocessed_patches"
+    preprocessed_volumes_dir: str = "preprocessed_volumes"  # For full volume training
     # Model parameters
     in_channels: int = 1
     out_channels: int = 2  # Binary segmentation (background, tumor)
     features: Tuple[int, ...] = (32, 64, 128, 256, 320)
     
     # Training parameters
-    batch_size: int = 4  # Optimized for RTX 3070
+    batch_size: int = 4  # Will be adjusted based on training_mode
     validation_split: float = 0.2
+    
+    # Full volume parameters
+    vol_batch_size: int = 1  # Smaller batch size for full volumes
+    vol_gradient_accumulation_steps: int = 4  # Accumulate gradients for effective batch size
+    vol_max_dim: Tuple[int, int, int] = (128, 256, 256)  # Max dimensions for full volume training
     
     # Patch parameters - Optimized for KiTS23 dimensions
     patch_size: Tuple[int, int, int] = (32, 96, 96)  # D, H, W - More memory efficient while maintaining detail
@@ -66,10 +75,19 @@ class nnUNetConfig:
     use_amp: bool = True
     benchmark_cudnn: bool = True
     deterministic: bool = False
+    debug: bool = False  # Enable debug logging
+    memory_check: bool = False  # Enable memory usage tracking
+    preprocess: bool = True  # Whether to preprocess data
     
     # Size thresholds for preprocessing
     max_image_size_mb: int = 1024  # Skip images larger than 1GB
     max_image_dimensions: Tuple[int, int, int] = (512, 512, 512)  # Max dimensions based on research showing no performance gain beyond 512x512
     downsample_large_images: bool = True  # Downsample images larger than max dimensions
     downsample_factor: int = 2  # Factor by which to downsample large images (to reach target size)
-max_estimated_memory_mb: int = 1536 # Skip images estimated > 1.5GB uncompressed
+    max_estimated_memory_mb: int = 1536  # Skip images estimated > 1.5GB uncompressed
+    
+    # Transfer learning parameters
+    transfer_learning: bool = False  # Whether to load patch-trained weights
+    patch_weights_path: str = ""  # Path to patch-trained weights for transfer
+    freeze_layers: bool = False  # Whether to freeze early layers during transfer
+    freeze_epochs: int = 2  # Number of epochs to keep layers frozen
