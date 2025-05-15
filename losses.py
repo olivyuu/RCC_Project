@@ -110,9 +110,16 @@ class SoftDiceLoss(nn.Module):
             pc = pc[:, 1:, ...]
         
         if self.batch_dice:
-            # Flatten spatial dimensions
-            pc = pc.reshape(shp_x[0], shp_x[1], -1)
-            target_one_hot = target_one_hot.reshape(shp_x[0], shp_x[1], -1)
+            # Handle 3D volume dimensions by properly flattening
+            if len(pc.shape) > 3:  # For 3D volumes
+                # Reshape keeping batch and class dims, flattening spatial dims
+                spatial_size = int(torch.prod(torch.tensor(pc.shape[2:])))
+                pc = pc.view(shp_x[0], shp_x[1], spatial_size)
+                target_one_hot = target_one_hot.view(shp_x[0], shp_x[1], spatial_size)
+            else:
+                # Original behavior for 2D
+                pc = pc.reshape(shp_x[0], shp_x[1], -1)
+                target_one_hot = target_one_hot.reshape(shp_x[0], shp_x[1], -1)
             
             tp = (pc * target_one_hot).sum(-1)
             fp = pc.sum(-1) - tp
