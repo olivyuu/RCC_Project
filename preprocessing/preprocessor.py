@@ -16,6 +16,7 @@ class KiTS23Preprocessor:
         # Use float32 for calculations
         self.processing_dtype = np.float32
         self.processing_dtype_itemsize = np.dtype(self.processing_dtype).itemsize
+        self.volume_max_dim = getattr(config, 'vol_max_dim', (128, 256, 256))
         # Default max estimated memory based on config file size limit * 1.5, assuming float32 processing
         # We might need to adjust this based on observed resampling behavior
         self.max_estimated_memory_mb = getattr(config, 'max_estimated_memory_mb', config.max_image_size_mb * 1.5)
@@ -353,6 +354,58 @@ class KiTS23Preprocessor:
         print(f"Valid patches extracted: {len(patches)}")
 
         return patches
+        
+        def preprocess_volume(self, case_path: Path) -> Tuple[torch.Tensor, torch.Tensor]:
+            """
+            Preprocess a case as a full volume without patch extraction.
+            
+            Args:
+                case_path: Path to the case directory
+                
+            Returns:
+                Tuple of (image_tensor, mask_tensor) or (None, None) if processing fails
+            """
+            image_chunks, mask_chunks = self.load_case(case_path)
+            
+            if not image_chunks:
+                print(f"Failed to load case {case_path.name}")
+                return None, None
+                
+            try:
+                # Concatenate chunks along depth dimension
+                img_volume = np.concatenate(image_chunks, axis=0)
+                mask_volume = np.concatenate(mask_chunks, axis=0)
+                
+                # Convert to tensors
+                img_tensor = torch.from_numpy(img_volume).float().unsqueeze(0)  # Add channel dimension
+                mask_tensor = torch.from_numpy(mask_volume).float().unsqueeze(0)
+                
+                # Resize if needed
+                if any(s > m for s, m in zip(img_tensor.shape[-3:], self.volume_max_dim)):
+                    print(f"Resizing volume from {img_tensor.shape[-3:]} to {self.volume_max_dim}")
+                    img_tensor = torch.nn.functional.interpolate(
+                        img_tensor.unsqueeze(0),  # Add batch dimension
+                        size=self.volume_max_dim,
+                        mode='trilinear',
+                        align_corners=False
+                    ).squeeze(0)  # Remove batch dimension
+                    
+                    mask_tensor = torch.nn.functional.interpolate(
+                        mask_tensor.unsqueeze(0),
+                        size=self.volume_max_dim,
+                        mode='nearest'
+                    ).squeeze(0)
+                
+                # Clear intermediate data
+                del image_chunks
+                del mask_chunks
+                gc.collect()
+                
+                return img_tensor, mask_tensor
+                
+            except Exception as e:
+                print(f"Error preprocessing volume {case_path.name}: {e}")
+                return None, None
 
     # --- preprocess_case method ---
     # (Ensure it calls the updated load_case and extract_patches)
