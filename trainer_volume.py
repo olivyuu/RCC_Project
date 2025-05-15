@@ -270,8 +270,7 @@ class nnUNetVolumeTrainer:
         """Calculate Dice score."""
         # Ensure outputs and targets have same size
         if outputs.shape != targets.shape:
-            print(f"Shape mismatch - Outputs: {outputs.shape}, Targets: {targets.shape}")
-            # Resize targets to match output size
+            # Resize targets to match output size, shape difference is expected
             targets = torch.nn.functional.interpolate(
                 targets,
                 size=outputs.shape[-3:],
