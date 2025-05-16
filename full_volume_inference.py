@@ -165,7 +165,7 @@ class FullVolumeInference:
                             activations = self.activations[0]  # First item in batch [C, D, H, W]
                             gradients = self.gradients[0]      # First item in batch [C, D, H, W]
                             
-                            if debug and z == 0 and y == 0 and x == 0:
+                            if self.debug and z == 0 and y == 0 and x == 0:
                                 print(f"Debug - Activations shape: {activations.shape}")
                                 print(f"Debug - Gradients shape: {gradients.shape}")
                             
