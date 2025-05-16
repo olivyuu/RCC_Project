@@ -166,20 +166,24 @@ def visualize_full_scan(image, cam, prediction, alpha=0.5, save_path=None):
         ax1.set_title(f'Axial View (Slice {d_mid*2})')
         ax1.axis('off')
         
-        # Sagittal view (side)
-        print("Creating sagittal view...")
+        # Sagittal view - maximum intensity projection
+        print("Creating sagittal view (MIP)...")
         ax2 = fig.add_subplot(gs[0, 1])
-        ax2.imshow(image[:, :, w_mid*2], cmap='gray')
-        ax2.imshow(cam[:, :, w_mid*2], cmap='jet', alpha=alpha)
-        ax2.set_title(f'Sagittal View (Slice {w_mid*2})')
+        sagittal_img = np.max(image, axis=2)  # Max along width
+        sagittal_cam = np.max(cam, axis=2)    # Max along width
+        ax2.imshow(sagittal_img, cmap='gray')
+        ax2.imshow(sagittal_cam, cmap='jet', alpha=alpha)
+        ax2.set_title('Sagittal View (Maximum Intensity Projection)')
         ax2.axis('off')
         
-        # Coronal view (front)
-        print("Creating coronal view...")
+        # Coronal view - maximum intensity projection
+        print("Creating coronal view (MIP)...")
         ax3 = fig.add_subplot(gs[0, 2])
-        ax3.imshow(image[:, h_mid*2, :], cmap='gray')
-        ax3.imshow(cam[:, h_mid*2, :], cmap='jet', alpha=alpha)
-        ax3.set_title(f'Coronal View (Slice {h_mid*2})')
+        coronal_img = np.max(image, axis=1)  # Max along height
+        coronal_cam = np.max(cam, axis=1)    # Max along height
+        ax3.imshow(coronal_img, cmap='gray')
+        ax3.imshow(coronal_cam, cmap='jet', alpha=alpha)
+        ax3.set_title('Coronal View (Maximum Intensity Projection)')
         ax3.axis('off')
         
         # 3D visualization of tumor regions
