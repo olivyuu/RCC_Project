@@ -88,41 +88,56 @@ class FullVolumeInference:
         
     def _forward_pass(self, window_tensor):
         """Perform forward pass through the model"""
+        if self.debug:
+            print(f"\nInput tensor shape: {window_tensor.shape}")
+            
         window_tensor.requires_grad = True
         output = self.model(window_tensor)
+        
         if isinstance(output, list):
+            if self.debug:
+                print(f"Model output is a list of {len(output)} tensors")
+                for i, out in enumerate(output):
+                    print(f"Output[{i}] shape: {out.shape}")
             output = output[0]
+        
+        if self.debug:
+            print(f"Final output shape: {output.shape}")
+            
         return output
         
     def _compute_predictions(self, output, window_shape):
         """Compute prediction probabilities"""
-        # Get softmax probabilities first
+        # Apply softmax first
         probs = F.softmax(output, dim=1)
         
-        # Get current spatial dimensions
-        _, _, d, h, w = probs.shape
-        target_d, target_h, target_w = window_shape
+        # Get output shape
+        batch, channels, d, h, w = probs.shape
         
-        # Calculate intermediate sizes for progressive upsampling
-        mid_d = d * 4
-        mid_h = h * 8
-        mid_w = w * 8
-        
-        # Progressive upsampling in steps
-        pred_mid = F.interpolate(
-            probs,
-            size=(mid_d, mid_h, mid_w),
-            mode='trilinear',
-            align_corners=False
-        )
-        
-        pred_full = F.interpolate(
-            pred_mid,
-            size=window_shape,
-            mode='trilinear',
-            align_corners=False
-        )
-        
+        # Convert to tuple if not already
+        if isinstance(window_shape, (list, tuple)):
+            target_shape = tuple(window_shape)
+        else:
+            target_shape = tuple([window_shape] * 3)
+            
+        if self.debug:
+            print(f"Input shape: {(d,h,w)}")
+            print(f"Target shape: {target_shape}")
+            
+        # Interpolate to target size
+        try:
+            pred_full = F.interpolate(
+                probs,
+                size=target_shape,
+                mode='trilinear',
+                align_corners=False
+            )
+        except RuntimeError as e:
+            if self.debug:
+                print(f"Interpolation error: {str(e)}")
+                print(f"Shapes - Input: {probs.shape}, Target: {target_shape}")
+            raise
+            
         return pred_full[0].cpu().numpy()
         
     def _compute_gradcam(self, acts, grads, target_size):
