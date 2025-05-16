@@ -114,30 +114,30 @@ class FullVolumeInference:
         # Get output shape
         batch, channels, d, h, w = probs.shape
         
-        # Convert to tuple if not already
-        if isinstance(window_shape, (list, tuple)):
-            target_shape = tuple(window_shape)
-        else:
-            target_shape = tuple([window_shape] * 3)
-            
+        # Get target shape
+        target_d, target_h, target_w = window_shape
+        
         if self.debug:
-            print(f"Input shape: {(d,h,w)}")
-            print(f"Target shape: {target_shape}")
+            print(f"Prediction shapes - Input: {(d,h,w)}, Target: {(target_d,target_h,target_w)}")
             
-        # Interpolate to target size
-        try:
-            pred_full = F.interpolate(
-                probs,
-                size=target_shape,
+        # Interpolate each channel independently to preserve dimensionality
+        pred_full = []
+        for c in range(channels):
+            # Add extra dimensions for batch and channel
+            channel_data = probs[:,c:c+1]
+            
+            # Upsample to target size
+            upsampled = F.interpolate(
+                channel_data,
+                size=(target_d, target_h, target_w),
                 mode='trilinear',
                 align_corners=False
             )
-        except RuntimeError as e:
-            if self.debug:
-                print(f"Interpolation error: {str(e)}")
-                print(f"Shapes - Input: {probs.shape}, Target: {target_shape}")
-            raise
+            pred_full.append(upsampled)
             
+        # Stack channels back together
+        pred_full = torch.cat(pred_full, dim=1)
+        
         return pred_full[0].cpu().numpy()
         
     def _compute_gradcam(self, acts, grads, target_size):
@@ -152,6 +152,13 @@ class FullVolumeInference:
                 print(f"Channel dimension mismatch - acts: {acts.shape[1]}, grads: {grads.shape[1]}")
             return None
             
+        # Get current shape
+        _, _, d, h, w = acts.shape
+        target_d, target_h, target_w = target_size
+        
+        if self.debug:
+            print(f"GradCAM shapes - Input: {(d,h,w)}, Target: {(target_d,target_h,target_w)}")
+            
         # Compute channel-wise weights and weighted sum
         weights = grads.mean(dim=(2, 3, 4)).view(-1, acts.shape[1], 1, 1, 1)
         cam = (weights * acts).sum(dim=1)
@@ -160,11 +167,16 @@ class FullVolumeInference:
         if torch.isnan(cam).any():
             return None
             
-        # Normalize and resize
+        # Normalize
         cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+        
+        # Add dimensions for batch and channel
+        cam = cam.unsqueeze(0).unsqueeze(0)
+        
+        # Upsample to target size
         cam_full = F.interpolate(
-            cam.unsqueeze(0).unsqueeze(0),
-            size=target_size,
+            cam,
+            size=(target_d, target_h, target_w),
             mode='trilinear',
             align_corners=False
         )
