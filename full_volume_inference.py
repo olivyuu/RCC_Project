@@ -25,24 +25,30 @@ class FullVolumeInference:
         self.activations = []
         self.gradients = []
         
-        # Set up Grad-CAM hooks
+        # Set up Grad-CAM hooks to handle 3D data
         def save_gradient(module, grad_input, grad_output):
-            self.gradients = [grad_output[0].detach()]  # Store as single-item list
+            if self.debug:
+                print(f"Gradient hook called - shape: {grad_output[0].shape}")
+            self.gradients = [grad_output[0].detach()]
             
         def save_output(module, input, output):
-            self.activations = [output.detach()]  # Store as single-item list
+            if self.debug:
+                print(f"Activation hook called - shape: {output.shape}")
+            self.activations = [output.detach()]
             
-        # Find and register hooks for bottleneck layer
+        # Search for appropriate layer to hook
         target_found = False
         for name, module in self.model.named_modules():
-            if 'bottleneck' in name:
+            if any(x in name.lower() for x in ['bottleneck', 'encoder.3', 'backbone.3']):
                 module.register_forward_hook(save_output)
                 module.register_full_backward_hook(save_gradient)
                 target_found = True
                 if self.debug:
-                    print(f"Registered Grad-CAM hooks on {name}")
+                    print(f"\nRegistered hooks on layer: {name}")
+                    print("Layer properties:")
                     for param_name, param in module.named_parameters():
-                        print(f"- Parameter {param_name}: {param.shape}")
+                        print(f"- {param_name}: {list(param.shape)}")
+                    print(f"- Input size: {[p.shape for p in next(iter(module.parameters()))][0]}")
                 break
         
         if not target_found:
@@ -206,9 +212,19 @@ class FullVolumeInference:
                                     print(f"Warning: Channel dimension mismatch - acts: {acts.shape[1]}, grads: {grads.shape[1]}")
                                     continue
                                     
-                                # Compute weights and CAM
-                                weights = grads.mean(dim=(2, 3))  # Average over spatial dims [B, C]
-                                cam = (weights.view(weights.size(0), weights.size(1), 1, 1) * acts).sum(dim=1)  # [B, H, W]
+                                # Debug shapes
+                                if self.debug and z == 0 and y == 0 and x == 0:
+                                    print(f"Activation tensor: {acts.shape}")
+                                    print(f"Gradient tensor: {grads.shape}")
+
+                                # Compute channel-wise weights
+                                weights = grads.mean(dim=(2, 3, 4))  # Average over D,H,W dims -> [B, C]
+                                
+                                # Reshape weights for multiplication
+                                weights = weights.view(-1, acts.shape[1], 1, 1, 1)  # [B, C, 1, 1, 1]
+                                
+                                # Compute weighted sum
+                                cam = (weights * acts).sum(dim=1)  # Sum over channels -> [B, D, H, W]
                                 cam = F.relu(cam)  # Keep only positive contributions
                                 
                                 if not torch.isnan(cam).any():
