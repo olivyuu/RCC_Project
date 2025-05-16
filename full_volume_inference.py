@@ -21,16 +21,16 @@ class FullVolumeInference:
         self.window_size = (64, 128, 128)  # Size that our volume model expects
         self.overlap = 0.25  # 25% overlap for full volumes
         
-        # Initialize Grad-CAM storage
-        self.activations = None
-        self.gradients = None
+        # Initialize Grad-CAM storage as lists
+        self.activations = []
+        self.gradients = []
         
         # Set up Grad-CAM hooks
         def save_gradient(module, grad_input, grad_output):
-            self.gradients = grad_output[0].detach()
+            self.gradients = [grad_output[0].detach()]  # Store as single-item list
             
         def save_output(module, input, output):
-            self.activations = output.detach()
+            self.activations = [output.detach()]  # Store as single-item list
             
         # Find and register hooks for bottleneck layer
         for name, module in self.model.named_modules():
@@ -176,17 +176,20 @@ class FullVolumeInference:
                                 continue
                             
                             # Debug info for hooks
-                            if self.debug and z == 0 and y == 0 and x == 0 and self.activations is not None and self.gradients is not None:
+                            if self.debug and z == 0 and y == 0 and x == 0 and len(self.activations) > 0 and len(self.gradients) > 0:
                                 print(f"Activations shape: {self.activations[0].shape}")
                                 print(f"Activations range: [{self.activations[0].min().item():.2f}, {self.activations[0].max().item():.2f}]")
                                 print(f"Gradients shape: {self.gradients[0].shape}")
                                 print(f"Gradients range: [{self.gradients[0].min().item():.2f}, {self.gradients[0].max().item():.2f}]")
                             
                             # Compute CAM from hooks
-                            if self.activations is not None and self.gradients is not None:
+                            if len(self.activations) > 0 and len(self.gradients) > 0:
+                                acts = self.activations[0]  # Get stored activation
+                                grads = self.gradients[0]   # Get stored gradient
+                                
                                 # Get activation and gradient weights
-                                weights = self.gradients[0].mean(dim=(1, 2, 3))  # Average over spatial dims
-                                cam = (weights.view(-1, 1, 1, 1) * self.activations[0]).sum(0)  # Weighted sum
+                                weights = grads.mean(dim=(1, 2, 3))  # Average over spatial dims
+                                cam = (weights.view(-1, 1, 1, 1) * acts).sum(0)  # Weighted sum
                                 cam = F.relu(cam)  # Keep only positive contributions
                                 
                                 if not torch.isnan(cam).any():
@@ -211,8 +214,8 @@ class FullVolumeInference:
                                 del cam
                             
                             # Clear hook storage
-                            self.activations = None
-                            self.gradients = None
+                            self.activations = []  # Reset to empty list
+                            self.gradients = []    # Reset to empty list
                             
                             # Clear other tensors
                             del window_tensor, output
