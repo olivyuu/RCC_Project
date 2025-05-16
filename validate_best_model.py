@@ -13,6 +13,14 @@ from config import nnUNetConfig
 def calculate_dice(output, target):
     """Calculate Dice score for a single case."""
     with torch.no_grad():
+        # Ensure outputs and targets have same size
+        if output.shape != target.shape:
+            target = torch.nn.functional.interpolate(
+                target,
+                size=output.shape[-3:],
+                mode='nearest'
+            )
+
         pred = torch.argmax(output, dim=1)
         if len(target.shape) == len(pred.shape) + 1:
             target = target.squeeze(1)
@@ -23,6 +31,10 @@ def calculate_dice(output, target):
         return (2. * intersection + 1e-5) / (union + 1e-5)
 
 def main():
+    # Set multiprocessing start method to 'spawn'
+    import multiprocessing
+    multiprocessing.set_start_method('spawn', force=True)
+    
     parser = argparse.ArgumentParser()
     parser.add_argument('--checkpoint', type=str, required=True,
                       help='Path to best model checkpoint')
@@ -60,11 +72,12 @@ def main():
         generator=torch.Generator().manual_seed(config.seed)
     )
     
+    # Use fewer workers to avoid CUDA issues
     val_loader = DataLoader(
         val_dataset,
         batch_size=1,  # Process one volume at a time
         shuffle=False,
-        num_workers=config.num_workers,
+        num_workers=0,  # Set to 0 to avoid multiprocessing issues
         pin_memory=True,
         collate_fn=KiTS23VolumeDataset.collate_fn
     )
@@ -73,17 +86,25 @@ def main():
     dice_scores = []
     
     print(f"\nEvaluating on {len(val_loader)} validation cases...")
-    for images, targets in tqdm(val_loader):
-        images = images.to(device)
-        targets = targets.to(device)
-        
-        with torch.no_grad(), autocast(enabled=config.use_amp):
-            outputs = model(images)
-            if isinstance(outputs, list):
-                outputs = outputs[0]
+    for i, (images, targets) in enumerate(tqdm(val_loader)):
+        try:
+            images = images.to(device)
+            targets = targets.to(device)
             
-            dice = calculate_dice(outputs, targets)
-            dice_scores.append(dice)
+            with torch.no_grad(), autocast(enabled=config.use_amp):
+                outputs = model(images)
+                if isinstance(outputs, list):
+                    outputs = outputs[0]
+                
+                dice = calculate_dice(outputs, targets)
+                dice_scores.append(dice)
+                
+            # Clear GPU memory after each case
+            torch.cuda.empty_cache()
+            
+        except Exception as e:
+            print(f"Error processing case {i}: {str(e)}")
+            continue
             
     # Calculate statistics
     dice_array = np.array(dice_scores)
