@@ -141,50 +141,39 @@ class FullVolumeInference:
                             if isinstance(output, list):
                                 output = output[0]
                                 
-                            # Calculate initial probabilities
+                            # Get raw predictions first
                             with torch.no_grad():
-                                probs = F.softmax(output, dim=1)[0, 1]  # Get tumor probabilities
-                                avg_prob = probs.mean().item()
+                                probs = F.softmax(output, dim=1)[0, 1]  # [32, 64, 64]
                                 max_prob = probs.max().item()
-                                connected_volume = (probs > 0.5).sum().item() / probs.numel()
                                 
                                 if self.debug and z == 0 and y == 0 and x == 0:
                                     print(f"\nWindow at ({z},{y},{x}):")
                                     print(f"Output shape: {output.shape}")
-                                    print(f"Average tumor probability: {avg_prob:.3f}")
-                                    print(f"Max tumor probability: {max_prob:.3f}")
-                                    print(f"Connected volume ratio: {connected_volume:.3f}")
+                                    print(f"Max probability: {max_prob:.3f}")
                                 
-                                # Skip if probabilities don't meet criteria
-                                if max_prob < 0.7 or avg_prob < 0.2 or connected_volume < 0.1:
+                                # Skip low probability regions
+                                if max_prob < 0.5:
                                     continue
-                            
-                            # Generate Grad-CAM for significant tumor regions
-                            tumor_logits = output[0, 1]
-                            
-                            # Use average of top-k logits instead of just maximum
-                            k = 5
-                            top_k_vals, _ = tumor_logits.view(-1).topk(k)
-                            target_score = top_k_vals.mean()
-                            
+                                    
+                                # Store predictions
+                                pred_full = F.interpolate(
+                                    F.softmax(output, dim=1),
+                                    size=window_tensor.shape[2:],
+                                    mode='trilinear',
+                                    align_corners=False
+                                )
+                                predictions[:, z:z + self.window_size[0],
+                                         y:y + self.window_size[1],
+                                         x:x + self.window_size[2]] += pred_full[0].cpu().numpy()
+
+                            # Compute Grad-CAM
                             self.model.zero_grad()
-                            target_score.backward(retain_graph=True)
+                            output[0, 1].max().backward(retain_graph=True)
                             
-                            if z == 0 and y == 0 and x == 0:  # More debug info
-                                if self.activations is not None:
-                                    print(f"Activations shape: {self.activations.shape}")
-                                    print(f"Activations range: [{self.activations.min().item():.2f}, {self.activations.max().item():.2f}]")
-                                if self.gradients is not None:
-                                    print(f"Gradients shape: {self.gradients.shape}")
-                                    print(f"Gradients range: [{self.gradients.min().item():.2f}, {self.gradients.max().item():.2f}]")
-                            
-                            # Check if we have activations and gradients
                             if self.activations is None or self.gradients is None:
-                                print("Warning: No activations or gradients captured")
+                                if self.debug:
+                                    print("Warning: Missing activations or gradients")
                                 continue
-                                
-                            activations = self.activations[0]  # First item in batch [C, D, H, W]
-                            gradients = self.gradients[0]      # First item in batch [C, D, H, W]
                             
                             if self.debug and z == 0 and y == 0 and x == 0:
                                 print(f"Debug - Activations shape: {activations.shape}")
@@ -200,50 +189,35 @@ class FullVolumeInference:
                             self.activations = None
                             self.gradients = None
                             
-                            # Get raw predictions first
-                            with torch.no_grad():
-                                # Apply softmax at original resolution
-                                softmax_output = F.softmax(output, dim=1)
-                                # Interpolate after softmax
-                                softmax_full = F.interpolate(
-                                    softmax_output,
+                            # Compute CAM
+                            weights = self.gradients[0].mean(dim=(1, 2, 3))  # Average over spatial dims
+                            cam = (weights.view(-1, 1, 1, 1) * self.activations[0]).sum(0)  # Weighted sum
+                            cam = F.relu(cam)  # Keep only positive contributions
+
+                            # Process and store CAM
+                            if not torch.isnan(cam).any():
+                                # Normalize CAM before interpolation
+                                cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+                                
+                                # Interpolate normalized CAM
+                                cam_full = F.interpolate(
+                                    cam.unsqueeze(0).unsqueeze(0),
                                     size=window_tensor.shape[2:],
                                     mode='trilinear',
                                     align_corners=False
-                                )
-                                # Store predictions
-                                predictions[:, z:z + self.window_size[0],
-                                          y:y + self.window_size[1],
-                                          x:x + self.window_size[2]] += softmax_full[0].cpu().numpy()
+                                ).squeeze()
                                 
-                                # Check if this window has high tumor probability
-                                max_tumor_prob = softmax_output[0, 1].max().item()
-                                if max_tumor_prob < 0.5:  # Skip CAM for low probability regions
-                                    continue
-
-                            # Process CAM
-                            cam = F.relu(cam)  # Apply ReLU to focus on positive contributions
-                            
-                            # Interpolate CAM
-                            cam = F.interpolate(
-                                cam.unsqueeze(0).unsqueeze(0),
-                                size=window_tensor.shape[2:],
-                                mode='trilinear',
-                                align_corners=False
-                            ).squeeze()
-                            
-                            # Normalize CAM
-                            if not torch.isnan(cam).any():
-                                cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
                                 attention_maps[z:z + self.window_size[0],
-                                          y:y + self.window_size[1],
-                                          x:x + self.window_size[2]] += cam.cpu().numpy()
+                                           y:y + self.window_size[1],
+                                           x:x + self.window_size[2]] += cam_full.cpu().numpy()
                                 count_map[z:z + self.window_size[0],
-                                          y:y + self.window_size[1],
-                                          x:x + self.window_size[2]] += 1
-                                
-                            # Clear GPU memory
-                            del window_tensor, output, cam
+                                           y:y + self.window_size[1],
+                                           x:x + self.window_size[2]] += 1
+                            
+                            # Clear memory
+                            del window_tensor, output, cam, cam_full
+                            self.activations = None
+                            self.gradients = None
                             torch.cuda.empty_cache()
                             
                         except Exception as e:
