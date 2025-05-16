@@ -7,252 +7,201 @@ from tqdm import tqdm
 
 class FullVolumeInference:
     def __init__(self, model, config, debug=False):
-        """
-        Initialize full volume inference handler
-        
-        Args:
-            model: The trained model
-            config: Configuration object
-        """
+        """Initialize full volume inference handler"""
         self.model = model
         self.config = config
-        self.debug = debug  # Store debug flag
+        self.debug = debug
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.window_size = (64, 128, 128)  # Size that our volume model expects
-        self.overlap = 0.25  # 25% overlap for full volumes
+        self.window_size = (64, 128, 128)
+        self.overlap = 0.25
         
-        # Initialize Grad-CAM storage as lists
+        # Set up target layer for Grad-CAM
+        self.target_layer = self._setup_target_layer()
         self.activations = []
         self.gradients = []
         
-        # Set up Grad-CAM hooks to handle 3D data
-        def save_gradient(module, grad_input, grad_output):
-            if self.debug:
-                print(f"Gradient hook called - shape: {grad_output[0].shape}")
-            self.gradients = [grad_output[0].detach()]
-            
-        def save_output(module, input, output):
-            if self.debug:
-                print(f"Activation hook called - shape: {output.shape}")
-            self.activations = [output.detach()]
-            
-        # Search for appropriate layer to hook
-        target_found = False
-        for name, module in self.model.named_modules():
-            if any(x in name.lower() for x in ['bottleneck', 'encoder.3', 'backbone.3']):
-                module.register_forward_hook(save_output)
-                module.register_full_backward_hook(save_gradient)
-                target_found = True
-                if self.debug:
-                    print(f"\nRegistered hooks on layer: {name}")
-                    print("Layer properties:")
-                    for param_name, param in module.named_parameters():
-                        print(f"- {param_name}: {list(param.shape)}")
-                    print(f"- Input size: {[p.shape for p in next(iter(module.parameters()))][0]}")
-                break
+    def _setup_target_layer(self):
+        """Set up the target layer for Grad-CAM and register hooks"""
+        target_layer = None
         
-        if not target_found:
-            print("Warning: Could not find bottleneck layer!")
-            print("Available layers:")
-            for name, _ in self.model.named_modules():
-                print(f"- {name}")
+        # Look for encoder[3] first, then bottleneck as fallback
+        if hasattr(self.model, 'encoder') and len(self.model.encoder) > 3:
+            target_layer = self.model.encoder[3]
+        else:
+            # Search for bottleneck
+            for name, module in self.model.named_modules():
+                if 'bottleneck' in name.lower():
+                    target_layer = module
+                    break
+        
+        if target_layer is None:
+            raise ValueError("Could not find suitable target layer for Grad-CAM")
+            
+        # Register hooks
+        target_layer.register_forward_hook(self._save_activation)
+        target_layer.register_full_backward_hook(self._save_gradient)
+        
+        if self.debug:
+            print(f"Registered Grad-CAM hooks on layer: {target_layer}")
+            
+        return target_layer
+        
+    def _save_activation(self, module, input, output):
+        """Hook to save layer activations"""
+        self.activations = [output.detach()]
+        
+    def _save_gradient(self, module, grad_input, grad_output):
+        """Hook to save layer gradients"""
+        self.gradients = [grad_output[0].detach()]
         
     def _compute_stride(self):
         """Compute stride based on window size and overlap"""
         return [int(ws * (1 - self.overlap)) for ws in self.window_size]
         
+    def _preprocess_window(self, window):
+        """Prepare a window tensor for model input"""
+        window_tensor = torch.from_numpy(window).float()
+        window_tensor = window_tensor.unsqueeze(0).unsqueeze(0)
+        return window_tensor.to(self.device)
+        
     def preprocess_volume(self, volume):
-        """
-        Preprocess the input volume
-        
-        Args:
-            volume: Input numpy array [D, H, W]
-            
-        Returns:
-            Preprocessed volume
-        """
-        # Convert to float32
+        """Preprocess the input volume"""
         volume = volume.astype(np.float32)
-        
-        # Clip to training data range
         volume = np.clip(volume, -1024, 3071)
-        
-        # Normalize to [0, 1]
         volume = (volume - (-1024)) / (3071 - (-1024))
-        
-        # Scale to [-1, 1]
         volume = volume * 2 - 1
-            
         return volume
         
     def _pad_volume(self, volume):
-        """
-        Pad volume to handle window extraction
-        """
-        # Get original size
+        """Pad volume to handle window extraction"""
         d, h, w = volume.shape
         
-        # Calculate required padding
         pad_d = (self.window_size[0] - d % self.window_size[0]) % self.window_size[0]
         pad_h = (self.window_size[1] - h % self.window_size[1]) % self.window_size[1]
         pad_w = (self.window_size[2] - w % self.window_size[2]) % self.window_size[2]
         
-        # Pad the volume
         padded = np.pad(volume,
                        ((0, pad_d), (0, pad_h), (0, pad_w)),
                        mode='constant')
         
         return padded, (pad_d, pad_h, pad_w)
         
-    def sliding_window_inference(self, volume):
-        """
-        Perform sliding window inference on the full volume with Grad-CAM
+    def _forward_pass(self, window_tensor):
+        """Perform forward pass through the model"""
+        window_tensor.requires_grad = True
+        output = self.model(window_tensor)
+        if isinstance(output, list):
+            output = output[0]
+        return output
         
-        Args:
-            volume: Input numpy array [D, H, W]
+    def _compute_predictions(self, output, window_shape):
+        """Compute prediction probabilities"""
+        pred_full = F.interpolate(
+            F.softmax(output, dim=1),
+            size=window_shape,
+            mode='trilinear',
+            align_corners=False
+        )
+        return pred_full[0].cpu().numpy()
+        
+    def _compute_gradcam(self, acts, grads, target_size):
+        """Compute Grad-CAM attention map"""
+        if acts is None or grads is None or len(acts) == 0 or len(grads) == 0:
+            return None
             
-        Returns:
-            predictions: Full volume predictions
-            attention_maps: Full volume attention maps
-        """
-        print("\nStarting sliding window inference with Grad-CAM...")
-        # Preprocess volume using training pipeline
-        volume = self.preprocess_volume(volume)
+        acts, grads = acts[0], grads[0]
         
-        # Pad if needed
+        if acts.shape[1] != grads.shape[1]:
+            if self.debug:
+                print(f"Channel dimension mismatch - acts: {acts.shape[1]}, grads: {grads.shape[1]}")
+            return None
+            
+        # Compute channel-wise weights and weighted sum
+        weights = grads.mean(dim=(2, 3, 4)).view(-1, acts.shape[1], 1, 1, 1)
+        cam = (weights * acts).sum(dim=1)
+        cam = F.relu(cam)
+        
+        if torch.isnan(cam).any():
+            return None
+            
+        # Normalize and resize
+        cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+        cam_full = F.interpolate(
+            cam.unsqueeze(0).unsqueeze(0),
+            size=target_size,
+            mode='trilinear',
+            align_corners=False
+        )
+        
+        return cam_full.squeeze().cpu().numpy()
+        
+    def sliding_window_inference(self, volume):
+        """Perform sliding window inference with Grad-CAM"""
+        print("\nStarting sliding window inference with Grad-CAM...")
+        
+        # Preprocessing
+        volume = self.preprocess_volume(volume)
         padded_volume, padding = self._pad_volume(volume)
         d, h, w = padded_volume.shape
-        
-        # Calculate stride
         stride = self._compute_stride()
         
-        # Initialize output tensors with channels first for predictions
-        predictions = np.zeros((2,) + padded_volume.shape, dtype=np.float32)  # [C, D, H, W]
+        # Initialize output arrays
+        predictions = np.zeros((2,) + padded_volume.shape, dtype=np.float32)
         attention_maps = np.zeros_like(padded_volume)
-        count_map = np.zeros_like(padded_volume)  # Track overlapping regions
+        count_map = np.zeros_like(padded_volume)
         
-        # No need to register hooks again - already done in __init__
-        
-        # Sliding window inference with progress bar
-        with tqdm(total=(d//stride[0] + 1) * (h//stride[1] + 1) * (w//stride[2] + 1)) as pbar:
+        # Sliding window inference
+        total_windows = ((d-1)//stride[0] + 1) * ((h-1)//stride[1] + 1) * ((w-1)//stride[2] + 1)
+        with tqdm(total=total_windows) as pbar:
             for z in range(0, d - self.window_size[0] + 1, stride[0]):
                 for y in range(0, h - self.window_size[1] + 1, stride[1]):
                     for x in range(0, w - self.window_size[2] + 1, stride[2]):
                         try:
-                            # Extract window
+                            # Extract and process window
                             window = padded_volume[
                                 z:z + self.window_size[0],
                                 y:y + self.window_size[1],
                                 x:x + self.window_size[2]
                             ]
+                            window_tensor = self._preprocess_window(window)
                             
-                            # Prepare input
-                            window_tensor = torch.from_numpy(window).float()
-                            window_tensor = window_tensor.unsqueeze(0).unsqueeze(0)  # Add batch and channel dims
-                            window_tensor = window_tensor.to(self.device)
+                            # Forward pass and predictions
+                            output = self._forward_pass(window_tensor)
                             
-                            # Forward pass with gradient computation
-                            window_tensor.requires_grad = True
-                            output = self.model(window_tensor)
-                            if isinstance(output, list):
-                                output = output[0]
-                                
-                            # Get raw predictions first
+                            # Get probabilities
                             with torch.no_grad():
-                                probs = F.softmax(output, dim=1)[0, 1]  # [32, 64, 64]
-                                max_prob = probs.max().item()
-                                
-                                if self.debug and z == 0 and y == 0 and x == 0:
-                                    print(f"\nWindow at ({z},{y},{x}):")
-                                    print(f"Output shape: {output.shape}")
-                                    print(f"Max probability: {max_prob:.3f}")
-                                
-                                # Skip low probability regions
-                                if max_prob < 0.5:
+                                probs = F.softmax(output, dim=1)[0, 1]
+                                if probs.max().item() < 0.5:
                                     continue
                                     
                                 # Store predictions
-                                pred_full = F.interpolate(
-                                    F.softmax(output, dim=1),
-                                    size=window_tensor.shape[2:],
-                                    mode='trilinear',
-                                    align_corners=False
-                                )
+                                pred_window = self._compute_predictions(output, self.window_size)
                                 predictions[:, z:z + self.window_size[0],
-                                         y:y + self.window_size[1],
-                                         x:x + self.window_size[2]] += pred_full[0].cpu().numpy()
-
+                                             y:y + self.window_size[1],
+                                             x:x + self.window_size[2]] += pred_window
+                                             
                             # Compute Grad-CAM
                             self.model.zero_grad()
                             output[0, 1].max().backward(retain_graph=True)
                             
-                            if self.activations is None or self.gradients is None:
-                                if self.debug:
-                                    print("Warning: Missing activations or gradients")
-                                continue
+                            # Generate attention map
+                            attention = self._compute_gradcam(
+                                self.activations,
+                                self.gradients,
+                                window_tensor.shape[2:]
+                            )
                             
-                            # Debug info for hooks
-                            if self.debug and z == 0 and y == 0 and x == 0 and len(self.activations) > 0 and len(self.gradients) > 0:
-                                print(f"Activations shape: {self.activations[0].shape}")
-                                print(f"Activations range: [{self.activations[0].min().item():.2f}, {self.activations[0].max().item():.2f}]")
-                                print(f"Gradients shape: {self.gradients[0].shape}")
-                                print(f"Gradients range: [{self.gradients[0].min().item():.2f}, {self.gradients[0].max().item():.2f}]")
-                            
-                            # Compute CAM from hooks
-                            if len(self.activations) > 0 and len(self.gradients) > 0:
-                                acts = self.activations[0]  # Get stored activation [B, C, H, W]
-                                grads = self.gradients[0]   # Get stored gradient [B, C, H, W]
-                                
-                                if self.debug and z == 0 and y == 0 and x == 0:
-                                    print(f"Computing CAM:")
-                                    print(f"- Activation shape: {acts.shape}")
-                                    print(f"- Gradient shape: {grads.shape}")
-                                
-                                if acts.shape[1] != grads.shape[1]:  # Check channel dimensions match
-                                    print(f"Warning: Channel dimension mismatch - acts: {acts.shape[1]}, grads: {grads.shape[1]}")
-                                    continue
-                                    
-                                # Debug shapes
-                                if self.debug and z == 0 and y == 0 and x == 0:
-                                    print(f"Activation tensor: {acts.shape}")
-                                    print(f"Gradient tensor: {grads.shape}")
-
-                                # Compute channel-wise weights
-                                weights = grads.mean(dim=(2, 3, 4))  # Average over D,H,W dims -> [B, C]
-                                
-                                # Reshape weights for multiplication
-                                weights = weights.view(-1, acts.shape[1], 1, 1, 1)  # [B, C, 1, 1, 1]
-                                
-                                # Compute weighted sum
-                                cam = (weights * acts).sum(dim=1)  # Sum over channels -> [B, D, H, W]
-                                cam = F.relu(cam)  # Keep only positive contributions
-                                
-                                if not torch.isnan(cam).any():
-                                    # Normalize and interpolate
-                                    cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
-                                    cam_full = F.interpolate(
-                                        cam.unsqueeze(0).unsqueeze(0),
-                                        size=window_tensor.shape[2:],
-                                        mode='trilinear',
-                                        align_corners=False
-                                    ).squeeze()
-                                    
-                                    # Store attention map
-                                    attention_maps[z:z + self.window_size[0],
-                                                y:y + self.window_size[1],
-                                                x:x + self.window_size[2]] += cam_full.cpu().numpy()
-                                    count_map[z:z + self.window_size[0],
+                            if attention is not None:
+                                attention_maps[z:z + self.window_size[0],
                                             y:y + self.window_size[1],
-                                            x:x + self.window_size[2]] += 1
-                                    
-                                    del cam_full
-                                del cam
-                            
-                            # Clear hook storage
-                            self.activations = []  # Reset to empty list
-                            self.gradients = []    # Reset to empty list
-                            
-                            # Clear other tensors
+                                            x:x + self.window_size[2]] += attention
+                                count_map[z:z + self.window_size[0],
+                                        y:y + self.window_size[1],
+                                        x:x + self.window_size[2]] += 1
+                                        
+                            # Clear cache
+                            self.activations = []
+                            self.gradients = []
                             del window_tensor, output
                             torch.cuda.empty_cache()
                             
@@ -261,8 +210,8 @@ class FullVolumeInference:
                             continue
                             
                         pbar.update(1)
-                                
-        # Average overlapping regions
+        
+        # Post-process results
         predictions = predictions / np.maximum(count_map, 1)
         attention_maps = attention_maps / np.maximum(count_map, 1)
         
@@ -279,16 +228,7 @@ class FullVolumeInference:
         return predictions, attention_maps
         
     def process_case(self, case_path):
-        """
-        Process a full case from the dataset
-        
-        Args:
-            case_path: Path to the case directory
-            
-        Returns:
-            Original volume, predictions, and attention maps
-        """
-        # Load the image
+        """Process a full case from the dataset"""
         img_path = case_path / "imaging.nii.gz"
         if not img_path.exists():
             img_path = case_path / "raw_data" / "imaging.nii.gz"
@@ -296,7 +236,6 @@ class FullVolumeInference:
         img_obj = nib.load(str(img_path))
         volume = img_obj.get_fdata()
         
-        # Run inference
         predictions, attention_maps = self.sliding_window_inference(volume)
         
         return volume, predictions, attention_maps
