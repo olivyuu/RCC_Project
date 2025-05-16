@@ -1,33 +1,31 @@
 import torch
-from pathlib import Path
 import matplotlib.pyplot as plt
-from dataset import KiTS23Dataset
+from pathlib import Path
 from model import nnUNetv2
-from visualization import generate_gradcam, visualize_gradcam
+from full_volume_inference import FullVolumeInference
 from config import nnUNetConfig
 import random
 import os
+import numpy as np
+import nibabel as nib
+import argparse
+from tqdm import tqdm
+from skimage.feature import peak_local_max
+from mpl_toolkits.axes_grid1.anchored_artists import AnchoredSizeBar
+import matplotlib.font_manager as fm
 
-def check_gpu_usage():
-    """Check if GPU is being heavily used"""
-    if torch.cuda.is_available():
-        # Get memory usage in GB
-        memory_allocated = torch.cuda.memory_allocated() / (1024**3)
-        memory_total = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-        memory_usage = memory_allocated / memory_total
-        
-        # If more than 50% GPU memory is used, return True
-        return memory_usage > 0.5
-    return False
+# Set up matplotlib for high quality medical visualization
+plt.style.use('dark_background')
+plt.rcParams['figure.dpi'] = 300
+plt.rcParams['figure.figsize'] = [15, 15]
 
-def load_model(checkpoint_path):
+def load_model(checkpoint_path, debug=False):
     """Load the trained model from checkpoint"""
-    # Check GPU usage and decide device
-    if check_gpu_usage():
-        device = 'cpu'
-        print("GPU is busy, using CPU instead")
-    else:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+    if debug:
+        print(f"\nLoading model from: {checkpoint_path}")
+        print(f"Using device: {device}")
     
     config = nnUNetConfig()
     model = nnUNetv2(
@@ -35,99 +33,325 @@ def load_model(checkpoint_path):
         out_channels=config.out_channels,
         features=config.features
     )
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            model.load_state_dict(checkpoint)
+        if debug:
+            print("Model loaded successfully")
+    except Exception as e:
+        print(f"Error loading model: {str(e)}")
+        raise
+        
     return model.to(device), device
 
-def test_gradcam(checkpoint_path='checkpoints/latest.pth', num_samples=5):
-    """Test Grad-CAM on validation cases"""
-    # Load configuration
-    config = nnUNetConfig()
+def visualize_results(img_slice, pred_slice, attn_slice, name, save_path, save_raw=False, spacing=(1.0, 1.0)):
+    """
+    Create and save clinically-relevant visualization of results
     
-    # Initialize dataset in validation mode
-    dataset = KiTS23Dataset(
-        root_dir=config.data_dir,
-        config=config,
-        train=False,
-        preprocess=False  # Use existing preprocessed files
-    )
-    
-    # Load model and get device being used
-    print(f"Loading model from {checkpoint_path}...")
-    model, device = load_model(checkpoint_path)
-    model.eval()
-    
-    print(f"Using device: {device}")
-    
-    # Set the target layer for Grad-CAM (using the bottleneck layer)
-    model.set_target_layer('bottleneck')
-    
-    # Create output directory for visualizations
-    output_dir = Path('gradcam_results')
-    output_dir.mkdir(exist_ok=True)
-    
-    # Randomly select samples
-    total_samples = len(dataset)
-    indices = random.sample(range(total_samples), min(num_samples, total_samples))
-    
-    print(f"\nProcessing {len(indices)} samples...")
-    for idx in indices:
-        print(f"\nAnalyzing sample {idx}...")
+    Args:
+        img_slice: Original CT scan slice
+        pred_slice: Prediction probabilities [0,1]
+        attn_slice: Attention map from Grad-CAM
+        name: Description of the slice
+        save_path: Output directory
+        save_raw: Whether to save raw numpy arrays
+        spacing: Pixel spacing in mm for the current view
+    """
+    try:
+        if debug:
+            print(f"\nInput shapes:")
+            print(f"Image: {img_slice.shape}, Range: [{img_slice.min():.2f}, {img_slice.max():.2f}]")
+            print(f"Predictions: {pred_slice.shape}, Range: [{pred_slice.min():.2f}, {pred_slice.max():.2f}]")
+            print(f"Attention: {attn_slice.shape}, Range: [{attn_slice.min():.2f}, {attn_slice.max():.2f}]")
+            print(f"Spacing: {spacing}")
+            
+        # Create figure with two side-by-side panels
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 10))
+        fig.suptitle(f'Tumor Detection Analysis\n{name}', fontsize=16, y=0.95)
         
+        # Left panel: Original CT scan
+        ax1.imshow(img_slice, cmap='gray')
+        ax1.set_title('Original CT Scan', fontsize=14)
+        ax1.axis('off')
+        
+        # Add scale bar
+        scalebar = AnchoredSizeBar(ax1.transData,
+                                 100/spacing[0],  # 10mm in pixels
+                                 '10 mm',
+                                 'lower right',
+                                 pad=0.5,
+                                 color='white',
+                                 frameon=False,
+                                 size_vertical=1)
+        ax1.add_artist(scalebar)
+        
+        # Right panel: Tumor detection visualization
+        ax2.imshow(img_slice, cmap='gray')
+        
+        # Normalize attention map to [0,1]
+        attn_norm = (attn_slice - attn_slice.min()) / (attn_slice.max() - attn_slice.min() + 1e-8)
+        
+        # Create weighted heatmap combining attention and probability
+        combined_heatmap = attn_norm * pred_slice
+        combined_heatmap = np.clip(combined_heatmap, 0, 1)
+        
+        # Display heatmap
+        heatmap = ax2.imshow(combined_heatmap, 
+                           cmap='RdYlBu_r',
+                           alpha=0.7)
+        ax2.set_title('Tumor Detection Heatmap', fontsize=14)
+        ax2.axis('off')
+        
+        # Add colorbar with probability scale
+        cbar = plt.colorbar(heatmap, ax=ax2)
+        cbar.set_label('Tumor Probability Score', fontsize=12)
+        
+        # Add probability annotations for high confidence predictions
         try:
-            # Get the sample
-            image, mask = dataset[idx]
-            print(f"Sample shape: {image.shape}")  # Debug print
+            high_prob_threshold = 0.75
+            if debug:
+                print("\nFinding peaks:")
+                print(f"Combined heatmap range: [{combined_heatmap.min():.2f}, {combined_heatmap.max():.2f}]")
             
-            image = image.unsqueeze(0)  # Add batch dimension
-            image = image.to(device)
-            image.requires_grad = True  # Enable gradients for Grad-CAM
+            peak_coords = peak_local_max(combined_heatmap,
+                                       min_distance=10,
+                                       threshold_rel=0.5)
             
-            # Generate Grad-CAM
-            print("Generating Grad-CAM visualization...")
-            cam, prediction = generate_gradcam(model, image)
-            print(f"CAM shape: {cam.shape}")  # Debug print
-            
-            # Get the original image (no gradients needed for visualization)
-            with torch.no_grad():
-                original_image = image.squeeze().cpu().numpy()
-            print(f"Original image shape: {original_image.shape}")  # Debug print
-            
-            # Create visualization paths
-            base_path = output_dir / f'sample_{idx}'
-            full_scan_path = base_path.with_suffix('.png')
-            
-            print("Creating visualizations...")
-            # This will create both full scan and detailed region visualizations
-            visualize_gradcam(
-                image=original_image,
-                cam=cam,
-                prediction=prediction,
-                save_path=full_scan_path
-            )
-            
-            print(f"Saved visualizations for sample {idx}")
-            
-            # Clear GPU memory if using CUDA
-            if device == 'cuda':
-                torch.cuda.empty_cache()
-            
+            if debug:
+                print(f"Found {len(peak_coords)} peaks above threshold {high_prob_threshold}")
         except Exception as e:
-            print(f"Error processing sample {idx}: {str(e)}")
-            continue
+            print(f"Warning: Peak detection failed: {str(e)}")
+            peak_coords = []
+        
+        for y, x in peak_coords:
+            if pred_slice[y, x] > high_prob_threshold:
+                ax2.text(x, y, f'{pred_slice[y, x]:.2f}',
+                        color='white', fontsize=8,
+                        ha='center', va='center',
+                        bbox=dict(facecolor='black', alpha=0.5, pad=1))
+        
+        # Save visualization
+        plt.tight_layout()
+        plt.savefig(save_path / 'analysis.png', bbox_inches='tight', dpi=300)
+        plt.close()
+        
+        # Save raw data if requested
+        if save_raw:
+            save_path.mkdir(exist_ok=True, parents=True)
+            np.save(save_path / 'scan.npy', img_slice)
+            np.save(save_path / 'probabilities.npy', pred_slice)
+            np.save(save_path / 'heatmap.npy', combined_heatmap)
+            
+    except Exception as e:
+        print(f"Error in visualization: {str(e)}")
+        raise
 
-if __name__ == '__main__':
-    import argparse
-    parser = argparse.ArgumentParser(description='Generate Grad-CAM visualizations for model predictions')
-    parser.add_argument('--checkpoint', type=str, default='checkpoints/latest.pth',
+def process_full_volume(model, device, config, case_path, output_dir, debug=False, save_raw=False):
+    """Process a full volume with Grad-CAM"""
+    print(f"\nProcessing case: {case_path.name}")
+    
+    try:
+        # Check available GPU memory
+        if torch.cuda.is_available() and debug:
+            print(f"\nInitial GPU memory: {torch.cuda.memory_allocated()/1e9:.2f}GB")
+            
+        # Initialize inference handler
+        if debug:
+            print("Initializing FullVolumeInference...")
+        full_volume_handler = FullVolumeInference(model, config)
+        
+        # Load and process the case
+        if debug:
+            print("Loading volume data...")
+            
+        # Load image with spacing information
+        img_path = case_path / "imaging.nii.gz"
+        if not img_path.exists():
+            img_path = case_path / "raw_data" / "imaging.nii.gz"
+        
+        if not img_path.exists():
+            raise FileNotFoundError(f"No imaging file found in {case_path}")
+            
+        try:
+            img_obj = nib.load(str(img_path))
+            volume = img_obj.get_fdata()
+            if debug:
+                print(f"Loaded volume shape: {volume.shape}")
+                print(f"Volume range: [{volume.min():.2f}, {volume.max():.2f}]")
+        except Exception as e:
+            print(f"Error loading NIFTI file: {str(e)}")
+            raise
+        
+        # Get voxel spacing
+        try:
+            spacing = img_obj.header.get_zooms()
+            if debug:
+                print(f"Voxel spacing (mm): {spacing}")
+        except:
+            spacing = (1.0, 1.0, 1.0)
+            
+        # Run inference
+        if debug:
+            print("Running inference...")
+        predictions, attention_maps = full_volume_handler.sliding_window_inference(volume)
+        
+        if debug:
+            print(f"Volume shape: {volume.shape}")
+            print(f"Predictions shape: {predictions.shape}")
+            print(f"Attention maps shape: {attention_maps.shape}")
+        
+        # Create output directory
+        volume_dir = output_dir / case_path.name / 'full_volume'
+        volume_dir.mkdir(exist_ok=True, parents=True)
+        
+        # Process multiple slices for each view
+        slice_indices = {
+            'Axial': [volume.shape[0]//4, volume.shape[0]//2, 3*volume.shape[0]//4],
+            'Sagittal': [volume.shape[1]//4, volume.shape[1]//2, 3*volume.shape[1]//4],
+            'Coronal': [volume.shape[2]//4, volume.shape[2]//2, 3*volume.shape[2]//4]
+        }
+        
+        # Create visualizations for each view
+        for axis, name in enumerate(['Axial', 'Sagittal', 'Coronal']):
+            if debug:
+                print(f"\nProcessing {name} view slices...")
+                
+            for slice_idx in slice_indices[name]:
+                try:
+                    # Extract appropriate slices and verify shapes match
+                    if axis == 0:  # Axial
+                        img_slice = volume[slice_idx, :, :]
+                        pred_slice = predictions[1, slice_idx, :, :]
+                        attn_slice = attention_maps[slice_idx, :, :]
+                        current_spacing = spacing[1:]
+                    elif axis == 1:  # Sagittal
+                        img_slice = volume[:, slice_idx, :]
+                        pred_slice = predictions[1, :, slice_idx, :]
+                        attn_slice = attention_maps[:, slice_idx, :]
+                        current_spacing = (spacing[0], spacing[2])
+                    else:  # Coronal
+                        img_slice = volume[:, :, slice_idx]
+                        pred_slice = predictions[1, :, :, slice_idx]
+                        attn_slice = attention_maps[:, :, slice_idx]
+                        current_spacing = spacing[:2]
+                        
+                    if debug:
+                        print(f"\nSlice shapes for {name} view, slice {slice_idx}:")
+                        print(f"Image: {img_slice.shape}")
+                        print(f"Prediction: {pred_slice.shape}")
+                        print(f"Attention: {attn_slice.shape}")
+                        
+                    # Verify shapes match
+                    if img_slice.shape != pred_slice.shape or img_slice.shape != attn_slice.shape:
+                        raise ValueError(f"Shape mismatch - Image: {img_slice.shape}, "
+                                      f"Prediction: {pred_slice.shape}, "
+                                      f"Attention: {attn_slice.shape}")
+                                      
+                except Exception as e:
+                    print(f"Error extracting slices: {str(e)}")
+                    raise
+                
+                # Create slice-specific directory
+                slice_dir = volume_dir / f'{name.lower()}_slice_{slice_idx}'
+                slice_dir.mkdir(exist_ok=True, parents=True)
+                
+                # Generate visualization
+                visualize_results(
+                    img_slice, pred_slice, attn_slice,
+                    f'{name} View - Slice {slice_idx}',
+                    slice_dir, save_raw,
+                    spacing=current_spacing
+                )
+                
+        if debug:
+            print("Processing complete")
+            
+    except Exception as e:
+        print(f"Error processing case {case_path.name}: {str(e)}")
+        raise
+
+def main():
+    parser = argparse.ArgumentParser(description='Generate full-volume Grad-CAM visualizations')
+    parser.add_argument('--checkpoint', type=str, required=True,
                       help='Path to model checkpoint')
-    parser.add_argument('--samples', type=int, default=5,
-                      help='Number of samples to process')
+    parser.add_argument('--cases', type=int, default=1,
+                      help='Number of cases to process')
+    parser.add_argument('--save_raw', action='store_true',
+                      help='Save raw numpy arrays for further analysis')
+    parser.add_argument('--output_dir', type=str, default='gradcam_results',
+                      help='Directory to save results')
+    parser.add_argument('--debug', action='store_true',
+                      help='Enable debug output')
     
     args = parser.parse_args()
-    print("\nStarting Grad-CAM visualization generation...")
-    print(f"Using checkpoint: {args.checkpoint}")
-    print(f"Processing {args.samples} samples")
     
-    test_gradcam(args.checkpoint, args.samples)
-    print("\nVisualization generation complete!")
+    try:
+        # Load model
+        print("\nInitializing...")
+        model, device = load_model(args.checkpoint, args.debug)
+        model.eval()
+        
+        if args.debug:
+            # Test with dummy input
+            dummy_input = torch.randn(1, 1, 64, 128, 128).to(device)
+            debug_model_output(model, dummy_input)
+        
+        # Create output directory
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(exist_ok=True, parents=True)
+        
+        # Get case list and verify data
+        config = nnUNetConfig()
+        data_dir = Path(config.data_dir)
+        
+        if not data_dir.exists():
+            raise ValueError(f"Data directory not found: {data_dir}")
+            
+        all_cases = sorted([d for d in data_dir.iterdir()
+                          if d.is_dir() and d.name.startswith('case_')])
+        
+        if not all_cases:
+            raise ValueError(f"No cases found in {data_dir}")
+            
+        if args.debug:
+            print(f"\nData directory: {data_dir}")
+            print(f"Total cases found: {len(all_cases)}")
+            
+        # Verify selected cases exist and have required files
+        selected_cases = random.sample(all_cases, min(args.cases, len(all_cases)))
+        for case in selected_cases:
+            if not (case / "imaging.nii.gz").exists() and \
+               not (case / "raw_data" / "imaging.nii.gz").exists():
+                raise ValueError(f"Required files missing for case: {case.name}")
+        
+        if args.debug:
+            print(f"\nSelected cases: {[case.name for case in selected_cases]}")
+            print(f"Running with {'debug enabled' if args.debug else 'debug disabled'}")
+            
+        # Process each case
+        for i, case_path in enumerate(selected_cases, 1):
+            print(f"\nProcessing case {i}/{len(selected_cases)}: {case_path.name}")
+            try:
+                process_full_volume(
+                    model, device, config, case_path, output_dir,
+                    debug=args.debug, save_raw=args.save_raw
+                )
+                torch.cuda.empty_cache()
+            except Exception as e:
+                print(f"Error processing case {case_path.name}: {str(e)}")
+                if args.debug:
+                    raise
+                continue
+                
+        print("\nProcessing complete!")
+        
+    except Exception as e:
+        print(f"\nError in main execution: {str(e)}")
+        raise
+
+if __name__ == '__main__':
+    main()
