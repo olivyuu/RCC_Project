@@ -163,29 +163,48 @@ class FullVolumeInference:
                                 continue
 
                             # Get activations and gradients
-                            activations = self.activations[0]  # First item in batch
-                            gradients = self.gradients[0]      # First item in batch
-                            
-                            # Calculate attention weights
-                            alphas = torch.mean(gradients, dim=(1, 2, 3))  # Global average pooling
-                            
-                            # Weighted combination of activation maps
-                            cam = torch.zeros_like(activations[0])
-                            for idx, alpha in enumerate(alphas):
-                                cam += alpha * activations[idx]
+                            if self.activations is None or self.gradients is None:
+                                print("Warning: No activations or gradients captured")
+                                continue
                                 
+                            activations = self.activations[0]  # First item in batch [C, D, H, W]
+                            gradients = self.gradients[0]      # First item in batch [C, D, H, W]
+                            
+                            if debug and z == 0 and y == 0 and x == 0:
+                                print(f"Debug - Activations shape: {activations.shape}")
+                                print(f"Debug - Gradients shape: {gradients.shape}")
+                            
+                            # Calculate attention weights (channel-wise importance)
+                            weights = gradients.mean(dim=(1, 2, 3))  # [C]
+                            
+                            # Weighted combination of feature maps
+                            cam = (weights.view(-1, 1, 1, 1) * activations).sum(0)  # [D, H, W]
+                            
                             # Clear for next iteration
                             self.activations = None
                             self.gradients = None
                             
                             # Process CAM
                             cam = F.relu(cam)  # Apply ReLU to focus on positive contributions
+                            
+                            # Add missing dimensions for proper interpolation
+                            cam = cam.unsqueeze(0).unsqueeze(0)  # [1, 1, D, H, W]
+                            
+                            # Interpolate to match window size
                             cam = F.interpolate(
-                                cam.unsqueeze(1),  # [B, 1, D, H, W]
-                                size=window_tensor.shape[2:],  # Original window size
+                                cam,
+                                size=(2, 4, 4),  # Match bottleneck spatial dims
                                 mode='trilinear',
                                 align_corners=False
-                            ).squeeze()
+                            )
+                            
+                            # Final interpolation to full size
+                            cam = F.interpolate(
+                                cam,
+                                size=window_tensor.shape[2:],  # (64, 128, 128)
+                                mode='trilinear',
+                                align_corners=False
+                            ).squeeze()  # Remove batch and channel dims
                         
                             # Normalize CAM
                             cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
