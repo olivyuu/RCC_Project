@@ -175,33 +175,23 @@ class FullVolumeInference:
                                     print("Warning: Missing activations or gradients")
                                 continue
                             
-                            if self.debug and z == 0 and y == 0 and x == 0:
-                                print(f"Debug - Activations shape: {activations.shape}")
-                                print(f"Debug - Gradients shape: {gradients.shape}")
+                            # Debug info for hooks
+                            if self.debug and z == 0 and y == 0 and x == 0 and self.activations is not None and self.gradients is not None:
+                                print(f"Activations shape: {self.activations[0].shape}")
+                                print(f"Activations range: [{self.activations[0].min().item():.2f}, {self.activations[0].max().item():.2f}]")
+                                print(f"Gradients shape: {self.gradients[0].shape}")
+                                print(f"Gradients range: [{self.gradients[0].min().item():.2f}, {self.gradients[0].max().item():.2f}]")
                             
-                            # Calculate attention weights (channel-wise importance)
-                            weights = gradients.mean(dim=(1, 2, 3))  # [C]
-                            
-                            # Weighted combination of feature maps
-                            cam = (weights.view(-1, 1, 1, 1) * activations).sum(0)  # [D, H, W]
-                            
-                            # Clear for next iteration
-                            self.activations = None
-                            self.gradients = None
-                            
-                            # Compute CAM
+                            # Compute CAM from hooks
                             if self.activations is not None and self.gradients is not None:
-                                # Compute attention weights
+                                # Get activation and gradient weights
                                 weights = self.gradients[0].mean(dim=(1, 2, 3))  # Average over spatial dims
                                 cam = (weights.view(-1, 1, 1, 1) * self.activations[0]).sum(0)  # Weighted sum
                                 cam = F.relu(cam)  # Keep only positive contributions
                                 
-                                # Process and store CAM
                                 if not torch.isnan(cam).any():
-                                    # Normalize CAM before interpolation
+                                    # Normalize and interpolate
                                     cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
-                                    
-                                    # Interpolate normalized CAM
                                     cam_full = F.interpolate(
                                         cam.unsqueeze(0).unsqueeze(0),
                                         size=window_tensor.shape[2:],
@@ -209,46 +199,23 @@ class FullVolumeInference:
                                         align_corners=False
                                     ).squeeze()
                                     
+                                    # Store attention map
                                     attention_maps[z:z + self.window_size[0],
-                                               y:y + self.window_size[1],
-                                               x:x + self.window_size[2]] += cam_full.cpu().numpy()
+                                                y:y + self.window_size[1],
+                                                x:x + self.window_size[2]] += cam_full.cpu().numpy()
                                     count_map[z:z + self.window_size[0],
-                                               y:y + self.window_size[1],
-                                               x:x + self.window_size[2]] += 1
+                                            y:y + self.window_size[1],
+                                            x:x + self.window_size[2]] += 1
                                     
-                                    # Clear CAM variables
-                                    del cam, cam_full
+                                    del cam_full
+                                del cam
                             
-                            # Clear memory for next iteration
+                            # Clear hook storage
                             self.activations = None
                             self.gradients = None
+                            
+                            # Clear other tensors
                             del window_tensor, output
-                            torch.cuda.empty_cache()
-
-                            # Process and store CAM
-                            if not torch.isnan(cam).any():
-                                # Normalize CAM before interpolation
-                                cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
-                                
-                                # Interpolate normalized CAM
-                                cam_full = F.interpolate(
-                                    cam.unsqueeze(0).unsqueeze(0),
-                                    size=window_tensor.shape[2:],
-                                    mode='trilinear',
-                                    align_corners=False
-                                ).squeeze()
-                                
-                                attention_maps[z:z + self.window_size[0],
-                                           y:y + self.window_size[1],
-                                           x:x + self.window_size[2]] += cam_full.cpu().numpy()
-                                count_map[z:z + self.window_size[0],
-                                           y:y + self.window_size[1],
-                                           x:x + self.window_size[2]] += 1
-                            
-                            # Clear memory
-                            del window_tensor, output, cam, cam_full
-                            self.activations = None
-                            self.gradients = None
                             torch.cuda.empty_cache()
                             
                         except Exception as e:
