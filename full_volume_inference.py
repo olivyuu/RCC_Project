@@ -96,12 +96,33 @@ class FullVolumeInference:
         
     def _compute_predictions(self, output, window_shape):
         """Compute prediction probabilities"""
+        # Get softmax probabilities first
+        probs = F.softmax(output, dim=1)
+        
+        # Get current spatial dimensions
+        _, _, d, h, w = probs.shape
+        target_d, target_h, target_w = window_shape
+        
+        # Calculate intermediate sizes for progressive upsampling
+        mid_d = d * 4
+        mid_h = h * 8
+        mid_w = w * 8
+        
+        # Progressive upsampling in steps
+        pred_mid = F.interpolate(
+            probs,
+            size=(mid_d, mid_h, mid_w),
+            mode='trilinear',
+            align_corners=False
+        )
+        
         pred_full = F.interpolate(
-            F.softmax(output, dim=1),
+            pred_mid,
             size=window_shape,
             mode='trilinear',
             align_corners=False
         )
+        
         return pred_full[0].cpu().numpy()
         
     def _compute_gradcam(self, acts, grads, target_size):
