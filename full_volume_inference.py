@@ -16,9 +16,30 @@ class FullVolumeInference:
         """
         self.model = model
         self.config = config
+        self.debug = debug  # Store debug flag
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.window_size = (64, 128, 128)  # Size that our volume model expects
         self.overlap = 0.25  # 25% overlap for full volumes
+        
+        # Initialize Grad-CAM storage
+        self.activations = None
+        self.gradients = None
+        
+        # Set up Grad-CAM hooks
+        def save_gradient(module, grad_input, grad_output):
+            self.gradients = grad_output[0].detach()
+            
+        def save_output(module, input, output):
+            self.activations = output.detach()
+            
+        # Find and register hooks for bottleneck layer
+        for name, module in self.model.named_modules():
+            if 'bottleneck' in name:
+                module.register_forward_hook(save_output)
+                module.register_full_backward_hook(save_gradient)
+                if self.debug:
+                    print(f"Registered Grad-CAM hooks on {name}")
+                break
         
     def _compute_stride(self):
         """Compute stride based on window size and overlap"""
@@ -67,7 +88,7 @@ class FullVolumeInference:
         
         return padded, (pad_d, pad_h, pad_w)
         
-    def sliding_window_inference(self, volume, debug=False):
+    def sliding_window_inference(self, volume):
         """
         Perform sliding window inference on the full volume with Grad-CAM
         
@@ -94,25 +115,7 @@ class FullVolumeInference:
         attention_maps = np.zeros_like(padded_volume)
         count_map = np.zeros_like(padded_volume)  # Track overlapping regions
         
-        # Initialize Grad-CAM storage
-        self.activations = None
-        self.gradients = None
-        
-        # Set up forward and backward hooks
-        def save_gradient(module, grad_input, grad_output):
-            self.gradients = grad_output[0].detach()
-            
-        def save_output(module, input, output):
-            self.activations = output.detach()
-        
-        # Find and register hooks for bottleneck layer
-        for name, module in self.model.named_modules():
-            if 'bottleneck' in name:
-                self.target_layer = module
-                self.target_layer.register_forward_hook(save_output)
-                self.target_layer.register_full_backward_hook(save_gradient)
-                print(f"Registered Grad-CAM hooks on {name}")
-                break
+        # No need to register hooks again - already done in __init__
         
         # Sliding window inference with progress bar
         with tqdm(total=(d//stride[0] + 1) * (h//stride[1] + 1) * (w//stride[2] + 1)) as pbar:
@@ -179,37 +182,33 @@ class FullVolumeInference:
                             self.activations = None
                             self.gradients = None
                             
+                            # Store predictions first
+                            with torch.no_grad():
+                                softmax_output = F.softmax(output, dim=1)
+                                predictions[:, z:z + self.window_size[0],
+                                          y:y + self.window_size[1],
+                                          x:x + self.window_size[2]] += softmax_output[0].cpu().numpy()
+
                             # Process CAM
                             cam = F.relu(cam)  # Apply ReLU to focus on positive contributions
                             
-                            # Add missing dimensions for proper interpolation
-                            cam = cam.unsqueeze(0).unsqueeze(0)  # [1, 1, D, H, W]
-                            
-                            # Interpolate directly to window size
+                            # Interpolate CAM
                             cam = F.interpolate(
-                                cam.unsqueeze(0).unsqueeze(0),  # Add batch and channel dims
-                                size=window_tensor.shape[2:],  # (64, 128, 128)
+                                cam.unsqueeze(0).unsqueeze(0),
+                                size=window_tensor.shape[2:],
                                 mode='trilinear',
                                 align_corners=False
-                            ).squeeze()  # Remove batch and channel dims
-                        
-                            # Normalize CAM
-                            cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+                            ).squeeze()
                             
-                            # Add predictions and attention to output tensors
-                            with torch.no_grad():
-                                output = F.softmax(output, dim=1)
-                                predictions[:, z:z + self.window_size[0],
-                                            y:y + self.window_size[1],
-                                            x:x + self.window_size[2]] += output[0].cpu().numpy()
-                                
+                            # Normalize CAM
+                            if not torch.isnan(cam).any():
+                                cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
                                 attention_maps[z:z + self.window_size[0],
-                                            y:y + self.window_size[1],
-                                            x:x + self.window_size[2]] += cam.cpu().numpy()
-                                
+                                          y:y + self.window_size[1],
+                                          x:x + self.window_size[2]] += cam.cpu().numpy()
                                 count_map[z:z + self.window_size[0],
-                                        y:y + self.window_size[1],
-                                        x:x + self.window_size[2]] += 1
+                                          y:y + self.window_size[1],
+                                          x:x + self.window_size[2]] += 1
                                 
                             # Clear GPU memory
                             del window_tensor, output, cam
