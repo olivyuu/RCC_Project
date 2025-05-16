@@ -19,6 +19,42 @@ plt.style.use('dark_background')
 plt.rcParams['figure.dpi'] = 300
 plt.rcParams['figure.figsize'] = [15, 15]
 
+def debug_model_output(model, dummy_input, checkpoint_path=None):
+    """Debug model's forward pass and activation hooks"""
+    print("\nDebugging model output:")
+    try:
+        # Check model architecture
+        print("\nModel architecture:")
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"Total parameters: {total_params:,}")
+        print(f"Trainable parameters: {trainable_params:,}")
+        
+        if checkpoint_path:
+            checkpoint_size = Path(checkpoint_path).stat().st_size / (1024 * 1024)
+            print(f"Checkpoint size: {checkpoint_size:.2f}MB")
+        
+        # Test forward pass
+        print("\nTesting forward pass:")
+        print(f"Input shape: {dummy_input.shape}")
+        print(f"Input range: [{dummy_input.min():.2f}, {dummy_input.max():.2f}]")
+        
+        with torch.cuda.amp.autocast(enabled=True):
+            output = model(dummy_input)
+        
+        if isinstance(output, list):
+            print(f"Output is a list of {len(output)} tensors")
+            for i, out in enumerate(output):
+                print(f"Output[{i}] shape: {out.shape}")
+                print(f"Output[{i}] range: [{out.min().item():.2f}, {out.max().item():.2f}]")
+        else:
+            print(f"Output shape: {output.shape}")
+            print(f"Output range: [{output.min().item():.2f}, {output.max().item():.2f}]")
+            
+    except Exception as e:
+        print(f"Error in model debugging: {str(e)}")
+        raise
+
 def load_model(checkpoint_path, debug=False):
     """Load the trained model from checkpoint"""
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -48,7 +84,7 @@ def load_model(checkpoint_path, debug=False):
         
     return model.to(device), device
 
-def visualize_results(img_slice, pred_slice, attn_slice, name, save_path, save_raw=False, spacing=(1.0, 1.0)):
+def visualize_results(img_slice, pred_slice, attn_slice, name, save_path, save_raw=False, spacing=(1.0, 1.0), debug=False):
     """
     Create and save clinically-relevant visualization of results
     
@@ -117,11 +153,20 @@ def visualize_results(img_slice, pred_slice, attn_slice, name, save_path, save_r
                 print("\nFinding peaks:")
                 print(f"Combined heatmap range: [{combined_heatmap.min():.2f}, {combined_heatmap.max():.2f}]")
             
-            peak_coords = peak_local_max(combined_heatmap,
-                                       min_distance=10,
-                                       threshold_rel=0.5)
+            # Ensure input is properly formatted for peak_local_max
+            combined_heatmap = combined_heatmap.astype(np.float64)
+            # Use absolute threshold instead of relative
+            threshold_abs = high_prob_threshold * combined_heatmap.max()
+            peak_coords = peak_local_max(
+                combined_heatmap,
+                min_distance=10,
+                threshold_abs=threshold_abs,
+                exclude_border=False
+            )
             
             if debug:
+                print(f"Input range for peak detection: [{combined_heatmap.min():.3f}, {combined_heatmap.max():.3f}]")
+                print(f"Absolute threshold: {threshold_abs:.3f}")
                 print(f"Found {len(peak_coords)} peaks above threshold {high_prob_threshold}")
         except Exception as e:
             print(f"Warning: Peak detection failed: {str(e)}")
@@ -150,7 +195,7 @@ def visualize_results(img_slice, pred_slice, attn_slice, name, save_path, save_r
         print(f"Error in visualization: {str(e)}")
         raise
 
-def process_full_volume(model, device, config, case_path, output_dir, debug=False, save_raw=False):
+def process_full_volume(model, device, config, case_path, output_dir, debug=False, save_raw=False, spacing=None):
     """Process a full volume with Grad-CAM"""
     print(f"\nProcessing case: {case_path.name}")
     
@@ -264,7 +309,8 @@ def process_full_volume(model, device, config, case_path, output_dir, debug=Fals
                     img_slice, pred_slice, attn_slice,
                     f'{name} View - Slice {slice_idx}',
                     slice_dir, save_raw,
-                    spacing=current_spacing
+                    spacing=current_spacing,
+                    debug=debug
                 )
                 
         if debug:
@@ -298,7 +344,7 @@ def main():
         if args.debug:
             # Test with dummy input
             dummy_input = torch.randn(1, 1, 64, 128, 128).to(device)
-            debug_model_output(model, dummy_input)
+            debug_model_output(model, dummy_input, args.checkpoint)
         
         # Create output directory
         output_dir = Path(args.output_dir)
