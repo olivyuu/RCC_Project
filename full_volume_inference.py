@@ -182,9 +182,16 @@ class FullVolumeInference:
                             self.activations = None
                             self.gradients = None
                             
-                            # Store predictions first
+                            # Store predictions first (with interpolation)
                             with torch.no_grad():
-                                softmax_output = F.softmax(output, dim=1)
+                                # Interpolate output to match window size
+                                output_full = F.interpolate(
+                                    output,
+                                    size=window_tensor.shape[2:],  # (64, 128, 128)
+                                    mode='trilinear',
+                                    align_corners=False
+                                )
+                                softmax_output = F.softmax(output_full, dim=1)
                                 predictions[:, z:z + self.window_size[0],
                                           y:y + self.window_size[1],
                                           x:x + self.window_size[2]] += softmax_output[0].cpu().numpy()
