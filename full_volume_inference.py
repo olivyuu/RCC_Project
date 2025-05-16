@@ -190,9 +190,40 @@ class FullVolumeInference:
                             self.gradients = None
                             
                             # Compute CAM
-                            weights = self.gradients[0].mean(dim=(1, 2, 3))  # Average over spatial dims
-                            cam = (weights.view(-1, 1, 1, 1) * self.activations[0]).sum(0)  # Weighted sum
-                            cam = F.relu(cam)  # Keep only positive contributions
+                            if self.activations is not None and self.gradients is not None:
+                                # Compute attention weights
+                                weights = self.gradients[0].mean(dim=(1, 2, 3))  # Average over spatial dims
+                                cam = (weights.view(-1, 1, 1, 1) * self.activations[0]).sum(0)  # Weighted sum
+                                cam = F.relu(cam)  # Keep only positive contributions
+                                
+                                # Process and store CAM
+                                if not torch.isnan(cam).any():
+                                    # Normalize CAM before interpolation
+                                    cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+                                    
+                                    # Interpolate normalized CAM
+                                    cam_full = F.interpolate(
+                                        cam.unsqueeze(0).unsqueeze(0),
+                                        size=window_tensor.shape[2:],
+                                        mode='trilinear',
+                                        align_corners=False
+                                    ).squeeze()
+                                    
+                                    attention_maps[z:z + self.window_size[0],
+                                               y:y + self.window_size[1],
+                                               x:x + self.window_size[2]] += cam_full.cpu().numpy()
+                                    count_map[z:z + self.window_size[0],
+                                               y:y + self.window_size[1],
+                                               x:x + self.window_size[2]] += 1
+                                    
+                                    # Clear CAM variables
+                                    del cam, cam_full
+                            
+                            # Clear memory for next iteration
+                            self.activations = None
+                            self.gradients = None
+                            del window_tensor, output
+                            torch.cuda.empty_cache()
 
                             # Process and store CAM
                             if not torch.isnan(cam).any():
