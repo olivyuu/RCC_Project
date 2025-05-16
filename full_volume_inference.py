@@ -141,24 +141,34 @@ class FullVolumeInference:
                             if isinstance(output, list):
                                 output = output[0]
                                 
-                            # Check tumor probability first
+                            # Calculate initial probabilities
                             with torch.no_grad():
-                                probs = F.softmax(output, dim=1)[0, 1]  # Get tumor class probabilities
+                                probs = F.softmax(output, dim=1)[0, 1]  # Get tumor probabilities
+                                avg_prob = probs.mean().item()
                                 max_prob = probs.max().item()
+                                connected_volume = (probs > 0.5).sum().item() / probs.numel()
                                 
                                 if self.debug and z == 0 and y == 0 and x == 0:
                                     print(f"\nWindow at ({z},{y},{x}):")
                                     print(f"Output shape: {output.shape}")
+                                    print(f"Average tumor probability: {avg_prob:.3f}")
                                     print(f"Max tumor probability: {max_prob:.3f}")
+                                    print(f"Connected volume ratio: {connected_volume:.3f}")
                                 
-                                if max_prob < 0.5:  # Skip low probability regions
+                                # Skip if probabilities don't meet criteria
+                                if max_prob < 0.7 or avg_prob < 0.2 or connected_volume < 0.1:
                                     continue
                             
-                            # Generate Grad-CAM only for high probability regions
+                            # Generate Grad-CAM for significant tumor regions
                             tumor_logits = output[0, 1]
-                            max_val = tumor_logits.max()
+                            
+                            # Use average of top-k logits instead of just maximum
+                            k = 5
+                            top_k_vals, _ = tumor_logits.view(-1).topk(k)
+                            target_score = top_k_vals.mean()
+                            
                             self.model.zero_grad()
-                            max_val.backward(retain_graph=True)
+                            target_score.backward(retain_graph=True)
                             
                             if z == 0 and y == 0 and x == 0:  # More debug info
                                 if self.activations is not None:
