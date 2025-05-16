@@ -18,6 +18,40 @@ class FullVolumeInference:
         self.target_layer = self._setup_target_layer()
         self.activations = []
         self.gradients = []
+
+    def _compute_predictions(self, output, window_shape):
+        """Compute prediction probabilities"""
+        # Apply softmax first
+        probs = F.softmax(output, dim=1)
+        
+        # Get output shape
+        batch, channels, d, h, w = probs.shape
+        
+        # Get target shape
+        target_d, target_h, target_w = window_shape
+        
+        if self.debug:
+            print(f"Prediction shapes - Input: {(d,h,w)}, Target: {(target_d,target_h,target_w)}")
+            
+        # Interpolate each channel independently to preserve dimensionality
+        pred_full = []
+        for c in range(channels):
+            # Add extra dimensions for batch and channel
+            channel_data = probs[:,c:c+1]
+            
+            # Upsample to target size
+            upsampled = F.interpolate(
+                channel_data,
+                size=(target_d, target_h, target_w),
+                mode='trilinear',
+                align_corners=False
+            )
+            pred_full.append(upsampled)
+            
+        # Stack channels back together
+        pred_full = torch.cat(pred_full, dim=1)
+        
+        return pred_full[0].cpu().numpy()
         
     def _setup_target_layer(self):
         """Set up the target layer for Grad-CAM and register hooks"""
@@ -155,7 +189,7 @@ class FullVolumeInference:
             
             # Upsample to target size
             cam = F.interpolate(
-                cam.unsqueeze(0),  # Add channel dim for interpolate: (1, 1, D, H, W)
+                cam.unsqueeze(0),  # Add channel dim for interpolate
                 size=target_size,
                 mode='trilinear',
                 align_corners=False
@@ -174,7 +208,7 @@ class FullVolumeInference:
                 import traceback
                 print(traceback.format_exc())
             return None
-            
+
     def _find_high_prob_slices(self, predictions, axis, num_slices=3, prob_threshold=0.9):
         """Find slices with highest tumor probabilities along given axis"""
         tumor_probs = predictions[1]  # Get tumor probability channel
@@ -309,3 +343,16 @@ class FullVolumeInference:
                                          :-pad_w if pad_w > 0 else None]
                                          
         return predictions, attention_maps
+
+    def process_case(self, case_path):
+        """Process a full case from the dataset"""
+        img_path = case_path / "imaging.nii.gz"
+        if not img_path.exists():
+            img_path = case_path / "raw_data" / "imaging.nii.gz"
+            
+        img_obj = nib.load(str(img_path))
+        volume = img_obj.get_fdata()
+        
+        predictions, attention_maps = self.sliding_window_inference(volume)
+        
+        return volume, predictions, attention_maps
