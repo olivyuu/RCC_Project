@@ -33,13 +33,23 @@ class FullVolumeInference:
             self.activations = [output.detach()]  # Store as single-item list
             
         # Find and register hooks for bottleneck layer
+        target_found = False
         for name, module in self.model.named_modules():
             if 'bottleneck' in name:
                 module.register_forward_hook(save_output)
                 module.register_full_backward_hook(save_gradient)
+                target_found = True
                 if self.debug:
                     print(f"Registered Grad-CAM hooks on {name}")
+                    for param_name, param in module.named_parameters():
+                        print(f"- Parameter {param_name}: {param.shape}")
                 break
+        
+        if not target_found:
+            print("Warning: Could not find bottleneck layer!")
+            print("Available layers:")
+            for name, _ in self.model.named_modules():
+                print(f"- {name}")
         
     def _compute_stride(self):
         """Compute stride based on window size and overlap"""
@@ -184,12 +194,21 @@ class FullVolumeInference:
                             
                             # Compute CAM from hooks
                             if len(self.activations) > 0 and len(self.gradients) > 0:
-                                acts = self.activations[0]  # Get stored activation
-                                grads = self.gradients[0]   # Get stored gradient
+                                acts = self.activations[0]  # Get stored activation [B, C, H, W]
+                                grads = self.gradients[0]   # Get stored gradient [B, C, H, W]
                                 
-                                # Get activation and gradient weights
-                                weights = grads.mean(dim=(1, 2, 3))  # Average over spatial dims
-                                cam = (weights.view(-1, 1, 1, 1) * acts).sum(0)  # Weighted sum
+                                if self.debug and z == 0 and y == 0 and x == 0:
+                                    print(f"Computing CAM:")
+                                    print(f"- Activation shape: {acts.shape}")
+                                    print(f"- Gradient shape: {grads.shape}")
+                                
+                                if acts.shape[1] != grads.shape[1]:  # Check channel dimensions match
+                                    print(f"Warning: Channel dimension mismatch - acts: {acts.shape[1]}, grads: {grads.shape[1]}")
+                                    continue
+                                    
+                                # Compute weights and CAM
+                                weights = grads.mean(dim=(2, 3))  # Average over spatial dims [B, C]
+                                cam = (weights.view(weights.size(0), weights.size(1), 1, 1) * acts).sum(dim=1)  # [B, H, W]
                                 cam = F.relu(cam)  # Keep only positive contributions
                                 
                                 if not torch.isnan(cam).any():
