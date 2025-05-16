@@ -78,6 +78,7 @@ class FullVolumeInference:
             predictions: Full volume predictions
             attention_maps: Full volume attention maps
         """
+        print("\nStarting sliding window inference with Grad-CAM...")
         # Preprocess volume using training pipeline
         volume = self.preprocess_volume(volume)
         
@@ -93,14 +94,25 @@ class FullVolumeInference:
         attention_maps = np.zeros_like(padded_volume)
         count_map = np.zeros_like(padded_volume)  # Track overlapping regions
         
-        # Enable gradient computation for Grad-CAM
-        if not hasattr(self.model, 'target_layers'):
-            print("Setting up Grad-CAM target layers...")
-            # For UNet, we typically want the bottleneck layer
-            for name, module in self.model.named_modules():
-                if 'bottleneck' in name:
-                    self.model.target_layers = [module]
-                    break
+        # Initialize Grad-CAM storage
+        self.activations = None
+        self.gradients = None
+        
+        # Set up forward and backward hooks
+        def save_gradient(module, grad_input, grad_output):
+            self.gradients = grad_output[0].detach()
+            
+        def save_output(module, input, output):
+            self.activations = output.detach()
+        
+        # Find and register hooks for bottleneck layer
+        for name, module in self.model.named_modules():
+            if 'bottleneck' in name:
+                self.target_layer = module
+                self.target_layer.register_forward_hook(save_output)
+                self.target_layer.register_full_backward_hook(save_gradient)
+                print(f"Registered Grad-CAM hooks on {name}")
+                break
         
         # Sliding window inference with progress bar
         with tqdm(total=(d//stride[0] + 1) * (h//stride[1] + 1) * (w//stride[2] + 1)) as pbar:
@@ -127,18 +139,44 @@ class FullVolumeInference:
                                 output = output[0]
                                 
                             # Generate Grad-CAM for tumor class
-                            tumor_class_score = output[0, 1].sum()  # Sum predictions for tumor class
+                            if z == 0 and y == 0 and x == 0:  # Print debug info for first window
+                                print(f"\nGrad-CAM generation for window at ({z},{y},{x}):")
+                                print(f"Output shape: {output.shape}")
+                                print(f"Output range: [{output.min().item():.2f}, {output.max().item():.2f}]")
+                            
+                            # Compute tumor class score and gradients
+                            tumor_class_score = output[0, 1].sum()
                             self.model.zero_grad()
                             tumor_class_score.backward()
                             
-                            # Get activations from target layer
-                            target_layer = self.model.target_layers[0]
-                            activations = target_layer.activations
-                            gradients = target_layer.gradients
+                            if z == 0 and y == 0 and x == 0:  # More debug info
+                                if self.activations is not None:
+                                    print(f"Activations shape: {self.activations.shape}")
+                                    print(f"Activations range: [{self.activations.min().item():.2f}, {self.activations.max().item():.2f}]")
+                                if self.gradients is not None:
+                                    print(f"Gradients shape: {self.gradients.shape}")
+                                    print(f"Gradients range: [{self.gradients.min().item():.2f}, {self.gradients.max().item():.2f}]")
+                            
+                            # Check if we have activations and gradients
+                            if self.activations is None or self.gradients is None:
+                                print("Warning: No activations or gradients captured")
+                                continue
+
+                            # Get activations and gradients
+                            activations = self.activations[0]  # First item in batch
+                            gradients = self.gradients[0]      # First item in batch
                             
                             # Calculate attention weights
-                            weights = torch.mean(gradients, dim=(2, 3, 4), keepdim=True)
-                            cam = torch.sum(weights * activations, dim=1)
+                            alphas = torch.mean(gradients, dim=(1, 2, 3))  # Global average pooling
+                            
+                            # Weighted combination of activation maps
+                            cam = torch.zeros_like(activations[0])
+                            for idx, alpha in enumerate(alphas):
+                                cam += alpha * activations[idx]
+                                
+                            # Clear for next iteration
+                            self.activations = None
+                            self.gradients = None
                             
                             # Process CAM
                             cam = F.relu(cam)  # Apply ReLU to focus on positive contributions
