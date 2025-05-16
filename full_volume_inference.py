@@ -6,7 +6,7 @@ import nibabel as nib
 from tqdm import tqdm
 
 class FullVolumeInference:
-    def __init__(self, model, config):
+    def __init__(self, model, config, debug=False):
         """
         Initialize full volume inference handler
         
@@ -67,7 +67,7 @@ class FullVolumeInference:
         
         return padded, (pad_d, pad_h, pad_w)
         
-    def sliding_window_inference(self, volume):
+    def sliding_window_inference(self, volume, debug=False):
         """
         Perform sliding window inference on the full volume with Grad-CAM
         
@@ -147,7 +147,7 @@ class FullVolumeInference:
                             # Compute tumor class score and gradients
                             tumor_class_score = output[0, 1].sum()
                             self.model.zero_grad()
-                            tumor_class_score.backward()
+                            tumor_class_score.backward(retain_graph=True)
                             
                             if z == 0 and y == 0 and x == 0:  # More debug info
                                 if self.activations is not None:
@@ -158,11 +158,6 @@ class FullVolumeInference:
                                     print(f"Gradients range: [{self.gradients.min().item():.2f}, {self.gradients.max().item():.2f}]")
                             
                             # Check if we have activations and gradients
-                            if self.activations is None or self.gradients is None:
-                                print("Warning: No activations or gradients captured")
-                                continue
-
-                            # Get activations and gradients
                             if self.activations is None or self.gradients is None:
                                 print("Warning: No activations or gradients captured")
                                 continue
@@ -190,17 +185,9 @@ class FullVolumeInference:
                             # Add missing dimensions for proper interpolation
                             cam = cam.unsqueeze(0).unsqueeze(0)  # [1, 1, D, H, W]
                             
-                            # Interpolate to match window size
+                            # Interpolate directly to window size
                             cam = F.interpolate(
-                                cam,
-                                size=(2, 4, 4),  # Match bottleneck spatial dims
-                                mode='trilinear',
-                                align_corners=False
-                            )
-                            
-                            # Final interpolation to full size
-                            cam = F.interpolate(
-                                cam,
+                                cam.unsqueeze(0).unsqueeze(0),  # Add batch and channel dims
                                 size=window_tensor.shape[2:],  # (64, 128, 128)
                                 mode='trilinear',
                                 align_corners=False
