@@ -24,18 +24,22 @@ class FullVolumeInference:
         """Set up the target layer for Grad-CAM and register hooks"""
         target_layer = None
         
-        # Look for encoder[3] first, then bottleneck as fallback
-        if hasattr(self.model, 'encoder') and len(self.model.encoder) > 3:
-            target_layer = self.model.encoder[3]
-        else:
-            # Search for bottleneck
+        # First try to find the deepest convolutional layer in the encoder
+        if hasattr(self.model, 'encoder'):
+            for module in reversed(self.model.encoder):
+                if isinstance(module, torch.nn.Conv3d):
+                    target_layer = module
+                    break
+        
+        # If not found in encoder, look for bottleneck
+        if target_layer is None:
             for name, module in self.model.named_modules():
-                if 'bottleneck' in name.lower():
+                if 'bottleneck' in name.lower() and isinstance(module, torch.nn.Conv3d):
                     target_layer = module
                     break
         
         if target_layer is None:
-            raise ValueError("Could not find suitable target layer for Grad-CAM")
+            raise ValueError("Could not find suitable convolutional target layer for Grad-CAM")
             
         # Register hooks
         target_layer.register_forward_hook(self._save_activation)
@@ -51,12 +55,16 @@ class FullVolumeInference:
         self.activations = [output.detach()]
         if self.debug:
             print(f"Activation shape: {output.shape}")
+            print(f"Activation range: [{output.min().item():.2f}, {output.max().item():.2f}]")
         
     def _save_gradient(self, module, grad_input, grad_output):
         """Hook to save layer gradients"""
         self.gradients = [grad_output[0].detach()]
         if self.debug:
             print(f"Gradient shape: {grad_output[0].shape}")
+            print(f"Gradient range: [{grad_output[0].min().item():.2f}, {grad_output[0].max().item():.2f}]")
+            if (grad_output[0] == 0).all():
+                print("Warning: All gradients are zero!")
         
     def _compute_stride(self):
         """Compute stride based on window size and overlap"""
@@ -94,6 +102,7 @@ class FullVolumeInference:
         """Perform forward pass through the model"""
         if self.debug:
             print(f"\nInput tensor shape: {window_tensor.shape}")
+            print(f"Input range: [{window_tensor.min().item():.2f}, {window_tensor.max().item():.2f}]")
             
         window_tensor.requires_grad = True
         output = self.model(window_tensor)
@@ -103,10 +112,12 @@ class FullVolumeInference:
                 print(f"Model output is a list of {len(output)} tensors")
                 for i, out in enumerate(output):
                     print(f"Output[{i}] shape: {out.shape}")
+                    print(f"Output[{i}] range: [{out.min().item():.2f}, {out.max().item():.2f}]")
             output = output[0]
         
         if self.debug:
             print(f"Final output shape: {output.shape}")
+            print(f"Final output range: [{output.min().item():.2f}, {output.max().item():.2f}]")
             
         return output
         
@@ -154,64 +165,117 @@ class FullVolumeInference:
         acts, grads = acts[0], grads[0]
         
         if self.debug:
-            print(f"Computing GradCAM:")
+            print(f"\nComputing GradCAM:")
             print(f"Activations shape: {acts.shape}")
+            print(f"Activations range: [{acts.min().item():.2f}, {acts.max().item():.2f}]")
             print(f"Gradients shape: {grads.shape}")
+            print(f"Gradients range: [{grads.min().item():.2f}, {grads.max().item():.2f}]")
             print(f"Target size: {target_size}")
-
+        
         if acts.shape[1] != grads.shape[1]:
             if self.debug:
                 print(f"Channel dimension mismatch - acts: {acts.shape[1]}, grads: {grads.shape[1]}")
             return None
             
-        # Get current shape
-        _, _, d, h, w = acts.shape
-        target_d, target_h, target_w = target_size
-        
-        if self.debug:
-            print(f"GradCAM shapes - Input: {(d,h,w)}, Target: {(target_d,target_h,target_w)}")
-            
         try:
-            # Compute channel-wise weights and weighted sum
-            weights = grads.mean(dim=(2, 3, 4)).view(-1, acts.shape[1], 1, 1, 1)
+            # First upsample activations to match input window size
+            acts_upsampled = F.interpolate(
+                acts,
+                size=target_size,
+                mode='trilinear',
+                align_corners=False
+            )
+            
+            if self.debug:
+                print(f"Upsampled activations shape: {acts_upsampled.shape}")
+            
+            # Upsample gradients to match
+            grads_upsampled = F.interpolate(
+                grads,
+                size=target_size,
+                mode='trilinear',
+                align_corners=False
+            )
+            
+            if self.debug:
+                print(f"Upsampled gradients shape: {grads_upsampled.shape}")
+            
+            # Compute channel-wise weights
+            weights = grads_upsampled.mean(dim=(2, 3, 4)).view(-1, acts_upsampled.shape[1], 1, 1, 1)
+            
             if self.debug:
                 print(f"Weights shape: {weights.shape}")
+                print(f"Weights range: [{weights.min().item():.2f}, {weights.max().item():.2f}]")
+                
+            # Check for zero weights
+            if (weights == 0).all():
+                if self.debug:
+                    print("Warning: All weights are zero!")
+                return None
             
-            cam = (weights * acts).sum(dim=1)
+            # Compute weighted sum
+            cam = (weights * acts_upsampled).sum(dim=1)
+            
             if self.debug:
                 print(f"Initial CAM shape: {cam.shape}")
+                print(f"CAM range before ReLU: [{cam.min().item():.2f}, {cam.max().item():.2f}]")
             
+            # Apply ReLU to focus on features that have a positive influence on the class
             cam = F.relu(cam)
             
             if torch.isnan(cam).any():
                 print("Warning: NaN values in CAM")
                 return None
                 
-            # Normalize
-            cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
-            
-            # Add dimensions for batch and channel
-            cam = cam.unsqueeze(0).unsqueeze(0)
-            if self.debug:
-                print(f"Reshaped CAM shape before interpolation: {cam.shape}")
-            
-            # Upsample to target size
-            cam_full = F.interpolate(
-                cam,
-                size=(target_d, target_h, target_w),
-                mode='trilinear',
-                align_corners=False
-            )
+            # Normalize to [0, 1]
+            cam_min = cam.min()
+            cam_max = cam.max()
+            if cam_min == cam_max:
+                if self.debug:
+                    print("Warning: Constant CAM values")
+                return None
+                
+            cam = (cam - cam_min) / (cam_max - cam_min + 1e-8)
             
             if self.debug:
-                print(f"Final CAM shape: {cam_full.shape}")
+                print(f"Final CAM range: [{cam.min().item():.2f}, {cam.max().item():.2f}]")
             
-            return cam_full.squeeze().cpu().numpy()
+            return cam.cpu().numpy()
             
         except Exception as e:
             if self.debug:
                 print(f"Error in GradCAM computation: {str(e)}")
             return None
+
+    def _find_high_prob_slices(self, predictions, axis, num_slices=3, prob_threshold=0.9):
+        """Find slices with highest tumor probabilities along given axis"""
+        tumor_probs = predictions[1]  # Get tumor probability channel
+        
+        # Compute mean probability for each slice along the specified axis
+        slice_probs = np.mean(tumor_probs, axis=tuple(i for i in range(tumor_probs.ndim) if i != axis))
+        
+        # Find indices of slices with probabilities above threshold
+        high_prob_indices = np.where(slice_probs > prob_threshold)[0]
+        
+        if len(high_prob_indices) == 0:
+            # If no slices above threshold, take slices with highest probabilities
+            sorted_indices = np.argsort(slice_probs)
+            selected_indices = sorted_indices[-num_slices:]
+        else:
+            # Sort high probability indices by their probability values
+            sorted_high_prob = sorted(high_prob_indices, key=lambda i: slice_probs[i], reverse=True)
+            selected_indices = sorted_high_prob[:num_slices]
+        
+        # Sort indices for consistent visualization
+        selected_indices = sorted(selected_indices)
+        
+        if self.debug:
+            print(f"\nSlice selection for axis {axis}:")
+            print(f"Mean probabilities shape: {slice_probs.shape}")
+            print(f"Selected indices: {selected_indices}")
+            print(f"Corresponding probabilities: {[slice_probs[i] for i in selected_indices]}")
+            
+        return selected_indices
         
     def sliding_window_inference(self, volume):
         """Perform sliding window inference with Grad-CAM"""
@@ -265,23 +329,30 @@ class FullVolumeInference:
                                              
                             # Compute Grad-CAM
                             self.model.zero_grad()
-                            output[0, 1].max().backward(retain_graph=True)
                             
-                            # Generate attention map
-                            attention = self._compute_gradcam(
-                                self.activations,
-                                self.gradients,
-                                self.window_size
-                            )
+                            # Get the maximum prediction score
+                            target_score = output[0, 1].max()
                             
-                            if attention is not None:
-                                attention_maps[z:z + self.window_size[0],
+                            # Only compute GradCAM if prediction score is significant
+                            if target_score > 0.5:
+                                # Compute gradients
+                                target_score.backward(retain_graph=True)
+                                
+                                # Generate attention map
+                                attention = self._compute_gradcam(
+                                    self.activations,
+                                    self.gradients,
+                                    window_tensor.shape[2:]  # Pass input size
+                                )
+                                
+                                if attention is not None:
+                                    attention_maps[z:z + self.window_size[0],
+                                                y:y + self.window_size[1],
+                                                x:x + self.window_size[2]] += attention
+                                    count_map[z:z + self.window_size[0],
                                             y:y + self.window_size[1],
-                                            x:x + self.window_size[2]] += attention
-                                count_map[z:z + self.window_size[0],
-                                        y:y + self.window_size[1],
-                                        x:x + self.window_size[2]] += 1
-                                        
+                                            x:x + self.window_size[2]] += 1
+                                            
                             # Clear cache
                             self.activations = []
                             self.gradients = []
@@ -309,16 +380,3 @@ class FullVolumeInference:
                                          :-pad_w if pad_w > 0 else None]
                                          
         return predictions, attention_maps
-        
-    def process_case(self, case_path):
-        """Process a full case from the dataset"""
-        img_path = case_path / "imaging.nii.gz"
-        if not img_path.exists():
-            img_path = case_path / "raw_data" / "imaging.nii.gz"
-            
-        img_obj = nib.load(str(img_path))
-        volume = img_obj.get_fdata()
-        
-        predictions, attention_maps = self.sliding_window_inference(volume)
-        
-        return volume, predictions, attention_maps
