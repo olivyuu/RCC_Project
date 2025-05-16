@@ -26,7 +26,7 @@ class FullVolumeInference:
         
     def preprocess_volume(self, volume):
         """
-        Preprocess the input volume using same preprocessing as training
+        Preprocess the input volume
         
         Args:
             volume: Input numpy array [D, H, W]
@@ -34,13 +34,17 @@ class FullVolumeInference:
         Returns:
             Preprocessed volume
         """
-        from preprocessing.preprocessor import KiTS23Preprocessor
+        # Convert to float32
+        volume = volume.astype(np.float32)
         
-        # Initialize preprocessor with same config
-        preprocessor = KiTS23Preprocessor(self.config)
+        # Clip to training data range
+        volume = np.clip(volume, -1024, 3071)
         
-        # Preprocess volume using training pipeline
-        volume = preprocessor.preprocess_volume(volume)
+        # Normalize to [0, 1]
+        volume = (volume - (-1024)) / (3071 - (-1024))
+        
+        # Scale to [-1, 1]
+        volume = volume * 2 - 1
             
         return volume
         
