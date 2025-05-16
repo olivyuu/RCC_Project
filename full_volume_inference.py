@@ -49,10 +49,14 @@ class FullVolumeInference:
     def _save_activation(self, module, input, output):
         """Hook to save layer activations"""
         self.activations = [output.detach()]
+        if self.debug:
+            print(f"Activation shape: {output.shape}")
         
     def _save_gradient(self, module, grad_input, grad_output):
         """Hook to save layer gradients"""
         self.gradients = [grad_output[0].detach()]
+        if self.debug:
+            print(f"Gradient shape: {grad_output[0].shape}")
         
     def _compute_stride(self):
         """Compute stride based on window size and overlap"""
@@ -143,10 +147,18 @@ class FullVolumeInference:
     def _compute_gradcam(self, acts, grads, target_size):
         """Compute Grad-CAM attention map"""
         if acts is None or grads is None or len(acts) == 0 or len(grads) == 0:
+            if self.debug:
+                print("Missing activations or gradients")
             return None
             
         acts, grads = acts[0], grads[0]
         
+        if self.debug:
+            print(f"Computing GradCAM:")
+            print(f"Activations shape: {acts.shape}")
+            print(f"Gradients shape: {grads.shape}")
+            print(f"Target size: {target_size}")
+
         if acts.shape[1] != grads.shape[1]:
             if self.debug:
                 print(f"Channel dimension mismatch - acts: {acts.shape[1]}, grads: {grads.shape[1]}")
@@ -159,29 +171,47 @@ class FullVolumeInference:
         if self.debug:
             print(f"GradCAM shapes - Input: {(d,h,w)}, Target: {(target_d,target_h,target_w)}")
             
-        # Compute channel-wise weights and weighted sum
-        weights = grads.mean(dim=(2, 3, 4)).view(-1, acts.shape[1], 1, 1, 1)
-        cam = (weights * acts).sum(dim=1)
-        cam = F.relu(cam)
-        
-        if torch.isnan(cam).any():
-            return None
+        try:
+            # Compute channel-wise weights and weighted sum
+            weights = grads.mean(dim=(2, 3, 4)).view(-1, acts.shape[1], 1, 1, 1)
+            if self.debug:
+                print(f"Weights shape: {weights.shape}")
             
-        # Normalize
-        cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
-        
-        # Add dimensions for batch and channel
-        cam = cam.unsqueeze(0).unsqueeze(0)
-        
-        # Upsample to target size
-        cam_full = F.interpolate(
-            cam,
-            size=(target_d, target_h, target_w),
-            mode='trilinear',
-            align_corners=False
-        )
-        
-        return cam_full.squeeze().cpu().numpy()
+            cam = (weights * acts).sum(dim=1)
+            if self.debug:
+                print(f"Initial CAM shape: {cam.shape}")
+            
+            cam = F.relu(cam)
+            
+            if torch.isnan(cam).any():
+                print("Warning: NaN values in CAM")
+                return None
+                
+            # Normalize
+            cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+            
+            # Add dimensions for batch and channel
+            cam = cam.unsqueeze(0).unsqueeze(0)
+            if self.debug:
+                print(f"Reshaped CAM shape before interpolation: {cam.shape}")
+            
+            # Upsample to target size
+            cam_full = F.interpolate(
+                cam,
+                size=(target_d, target_h, target_w),
+                mode='trilinear',
+                align_corners=False
+            )
+            
+            if self.debug:
+                print(f"Final CAM shape: {cam_full.shape}")
+            
+            return cam_full.squeeze().cpu().numpy()
+            
+        except Exception as e:
+            if self.debug:
+                print(f"Error in GradCAM computation: {str(e)}")
+            return None
         
     def sliding_window_inference(self, volume):
         """Perform sliding window inference with Grad-CAM"""
@@ -213,6 +243,11 @@ class FullVolumeInference:
                             ]
                             window_tensor = self._preprocess_window(window)
                             
+                            if self.debug:
+                                print(f"\nProcessing window at ({z},{y},{x})")
+                                print(f"Window shape: {window.shape}")
+                                print(f"Window tensor shape: {window_tensor.shape}")
+                            
                             # Forward pass and predictions
                             output = self._forward_pass(window_tensor)
                             
@@ -236,7 +271,7 @@ class FullVolumeInference:
                             attention = self._compute_gradcam(
                                 self.activations,
                                 self.gradients,
-                                window_tensor.shape[2:]
+                                self.window_size
                             )
                             
                             if attention is not None:
