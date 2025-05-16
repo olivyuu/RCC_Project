@@ -7,7 +7,6 @@ from tqdm import tqdm
 
 class FullVolumeInference:
     def __init__(self, model, config, debug=False):
-        """Initialize full volume inference handler"""
         self.model = model
         self.config = config
         self.debug = debug
@@ -98,63 +97,6 @@ class FullVolumeInference:
         
         return padded, (pad_d, pad_h, pad_w)
         
-    def _forward_pass(self, window_tensor):
-        """Perform forward pass through the model"""
-        if self.debug:
-            print(f"\nInput tensor shape: {window_tensor.shape}")
-            print(f"Input range: [{window_tensor.min().item():.2f}, {window_tensor.max().item():.2f}]")
-            
-        window_tensor.requires_grad = True
-        output = self.model(window_tensor)
-        
-        if isinstance(output, list):
-            if self.debug:
-                print(f"Model output is a list of {len(output)} tensors")
-                for i, out in enumerate(output):
-                    print(f"Output[{i}] shape: {out.shape}")
-                    print(f"Output[{i}] range: [{out.min().item():.2f}, {out.max().item():.2f}]")
-            output = output[0]
-        
-        if self.debug:
-            print(f"Final output shape: {output.shape}")
-            print(f"Final output range: [{output.min().item():.2f}, {output.max().item():.2f}]")
-            
-        return output
-        
-    def _compute_predictions(self, output, window_shape):
-        """Compute prediction probabilities"""
-        # Apply softmax first
-        probs = F.softmax(output, dim=1)
-        
-        # Get output shape
-        batch, channels, d, h, w = probs.shape
-        
-        # Get target shape
-        target_d, target_h, target_w = window_shape
-        
-        if self.debug:
-            print(f"Prediction shapes - Input: {(d,h,w)}, Target: {(target_d,target_h,target_w)}")
-            
-        # Interpolate each channel independently to preserve dimensionality
-        pred_full = []
-        for c in range(channels):
-            # Add extra dimensions for batch and channel
-            channel_data = probs[:,c:c+1]
-            
-            # Upsample to target size
-            upsampled = F.interpolate(
-                channel_data,
-                size=(target_d, target_h, target_w),
-                mode='trilinear',
-                align_corners=False
-            )
-            pred_full.append(upsampled)
-            
-        # Stack channels back together
-        pred_full = torch.cat(pred_full, dim=1)
-        
-        return pred_full[0].cpu().numpy()
-        
     def _compute_gradcam(self, acts, grads, target_size):
         """Compute Grad-CAM attention map"""
         if acts is None or grads is None or len(acts) == 0 or len(grads) == 0:
@@ -172,81 +114,67 @@ class FullVolumeInference:
             print(f"Gradients range: [{grads.min().item():.2f}, {grads.max().item():.2f}]")
             print(f"Target size: {target_size}")
         
-        if acts.shape[1] != grads.shape[1]:
-            if self.debug:
-                print(f"Channel dimension mismatch - acts: {acts.shape[1]}, grads: {grads.shape[1]}")
-            return None
-            
         try:
-            # First upsample activations to match input window size
-            acts_upsampled = F.interpolate(
-                acts,
-                size=target_size,
-                mode='trilinear',
-                align_corners=False
-            )
-            
-            if self.debug:
-                print(f"Upsampled activations shape: {acts_upsampled.shape}")
-            
-            # Upsample gradients to match
-            grads_upsampled = F.interpolate(
-                grads,
-                size=target_size,
-                mode='trilinear',
-                align_corners=False
-            )
-            
-            if self.debug:
-                print(f"Upsampled gradients shape: {grads_upsampled.shape}")
-            
-            # Compute channel-wise weights
-            weights = grads_upsampled.mean(dim=(2, 3, 4)).view(-1, acts_upsampled.shape[1], 1, 1, 1)
+            # Keep batch dimension for proper broadcasting
+            weights = grads.mean(dim=(2, 3, 4), keepdim=True)  # Shape: (1, C, 1, 1, 1)
             
             if self.debug:
                 print(f"Weights shape: {weights.shape}")
                 print(f"Weights range: [{weights.min().item():.2f}, {weights.max().item():.2f}]")
-                
+            
             # Check for zero weights
             if (weights == 0).all():
                 if self.debug:
                     print("Warning: All weights are zero!")
                 return None
             
-            # Compute weighted sum
-            cam = (weights * acts_upsampled).sum(dim=1)
+            # Compute weighted activations
+            weighted_acts = weights * acts  # Shape: (1, C, D, H, W)
+            cam = weighted_acts.sum(dim=1)  # Shape: (1, D, H, W)
             
             if self.debug:
+                print(f"Weighted activations shape: {weighted_acts.shape}")
                 print(f"Initial CAM shape: {cam.shape}")
-                print(f"CAM range before ReLU: [{cam.min().item():.2f}, {cam.max().item():.2f}]")
             
-            # Apply ReLU to focus on features that have a positive influence on the class
+            # Apply ReLU
             cam = F.relu(cam)
             
             if torch.isnan(cam).any():
                 print("Warning: NaN values in CAM")
                 return None
-                
-            # Normalize to [0, 1]
+            
+            # Normalize
             cam_min = cam.min()
             cam_max = cam.max()
             if cam_min == cam_max:
                 if self.debug:
                     print("Warning: Constant CAM values")
                 return None
-                
+            
             cam = (cam - cam_min) / (cam_max - cam_min + 1e-8)
             
+            # Upsample to target size
+            cam = F.interpolate(
+                cam.unsqueeze(0),  # Add channel dim for interpolate: (1, 1, D, H, W)
+                size=target_size,
+                mode='trilinear',
+                align_corners=False
+            )
+            
             if self.debug:
+                print(f"Final CAM shape: {cam.shape}")
                 print(f"Final CAM range: [{cam.min().item():.2f}, {cam.max().item():.2f}]")
             
-            return cam.cpu().numpy()
+            # Remove extra dimensions and convert to numpy
+            return cam.squeeze().cpu().numpy()
             
         except Exception as e:
             if self.debug:
                 print(f"Error in GradCAM computation: {str(e)}")
+                import traceback
+                print(traceback.format_exc())
             return None
-
+            
     def _find_high_prob_slices(self, predictions, axis, num_slices=3, prob_threshold=0.9):
         """Find slices with highest tumor probabilities along given axis"""
         tumor_probs = predictions[1]  # Get tumor probability channel
@@ -313,7 +241,7 @@ class FullVolumeInference:
                                 print(f"Window tensor shape: {window_tensor.shape}")
                             
                             # Forward pass and predictions
-                            output = self._forward_pass(window_tensor)
+                            output = self.model(window_tensor)
                             
                             # Get probabilities
                             with torch.no_grad():
@@ -329,8 +257,6 @@ class FullVolumeInference:
                                              
                             # Compute Grad-CAM
                             self.model.zero_grad()
-                            
-                            # Get the maximum prediction score
                             target_score = output[0, 1].max()
                             
                             # Only compute GradCAM if prediction score is significant
@@ -342,7 +268,7 @@ class FullVolumeInference:
                                 attention = self._compute_gradcam(
                                     self.activations,
                                     self.gradients,
-                                    window_tensor.shape[2:]  # Pass input size
+                                    self.window_size
                                 )
                                 
                                 if attention is not None:
@@ -361,6 +287,9 @@ class FullVolumeInference:
                             
                         except Exception as e:
                             print(f"Error processing window at ({z},{y},{x}): {str(e)}")
+                            if self.debug:
+                                import traceback
+                                print(traceback.format_exc())
                             continue
                             
                         pbar.update(1)
