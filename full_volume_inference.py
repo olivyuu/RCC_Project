@@ -141,16 +141,24 @@ class FullVolumeInference:
                             if isinstance(output, list):
                                 output = output[0]
                                 
-                            # Generate Grad-CAM for tumor class
-                            if z == 0 and y == 0 and x == 0:  # Print debug info for first window
-                                print(f"\nGrad-CAM generation for window at ({z},{y},{x}):")
-                                print(f"Output shape: {output.shape}")
-                                print(f"Output range: [{output.min().item():.2f}, {output.max().item():.2f}]")
+                            # Check tumor probability first
+                            with torch.no_grad():
+                                probs = F.softmax(output, dim=1)[0, 1]  # Get tumor class probabilities
+                                max_prob = probs.max().item()
+                                
+                                if self.debug and z == 0 and y == 0 and x == 0:
+                                    print(f"\nWindow at ({z},{y},{x}):")
+                                    print(f"Output shape: {output.shape}")
+                                    print(f"Max tumor probability: {max_prob:.3f}")
+                                
+                                if max_prob < 0.5:  # Skip low probability regions
+                                    continue
                             
-                            # Compute tumor class score and gradients
-                            tumor_class_score = output[0, 1].sum()
+                            # Generate Grad-CAM only for high probability regions
+                            tumor_logits = output[0, 1]
+                            max_val = tumor_logits.max()
                             self.model.zero_grad()
-                            tumor_class_score.backward(retain_graph=True)
+                            max_val.backward(retain_graph=True)
                             
                             if z == 0 and y == 0 and x == 0:  # More debug info
                                 if self.activations is not None:
@@ -182,19 +190,26 @@ class FullVolumeInference:
                             self.activations = None
                             self.gradients = None
                             
-                            # Store predictions first (with interpolation)
+                            # Get raw predictions first
                             with torch.no_grad():
-                                # Interpolate output to match window size
-                                output_full = F.interpolate(
-                                    output,
-                                    size=window_tensor.shape[2:],  # (64, 128, 128)
+                                # Apply softmax at original resolution
+                                softmax_output = F.softmax(output, dim=1)
+                                # Interpolate after softmax
+                                softmax_full = F.interpolate(
+                                    softmax_output,
+                                    size=window_tensor.shape[2:],
                                     mode='trilinear',
                                     align_corners=False
                                 )
-                                softmax_output = F.softmax(output_full, dim=1)
+                                # Store predictions
                                 predictions[:, z:z + self.window_size[0],
                                           y:y + self.window_size[1],
-                                          x:x + self.window_size[2]] += softmax_output[0].cpu().numpy()
+                                          x:x + self.window_size[2]] += softmax_full[0].cpu().numpy()
+                                
+                                # Check if this window has high tumor probability
+                                max_tumor_prob = softmax_output[0, 1].max().item()
+                                if max_tumor_prob < 0.5:  # Skip CAM for low probability regions
+                                    continue
 
                             # Process CAM
                             cam = F.relu(cam)  # Apply ReLU to focus on positive contributions
