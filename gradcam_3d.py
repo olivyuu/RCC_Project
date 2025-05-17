@@ -4,11 +4,14 @@ from pytorch_grad_cam import GradCAMPlusPlus
 from pytorch_grad_cam.base_cam import BaseCAM
 from typing import List, Callable
 
-class GradCAMPlusPlus3D(GradCAMPlusPlus):
+class GradCAMPlusPlus3D(BaseCAM):  # Changed to inherit from BaseCAM directly
     def __init__(self, model, target_layers, use_cuda=True,
                  reshape_transform=None):
-        super().__init__(model, target_layers, use_cuda, reshape_transform)
-        
+        super(GradCAMPlusPlus3D, self).__init__(model, 
+                                               target_layers, 
+                                               use_cuda,
+                                               reshape_transform)
+
     def get_cam_weights(self,
                        input_tensor: torch.Tensor,
                        target_layer: torch.nn.Module,
@@ -99,13 +102,20 @@ class MultiScaleGradCAM:
         for module in model.modules():
             if isinstance(module, torch.nn.Conv3d):
                 encoder_layers.append(module)
-        
+                
+        if len(encoder_layers) == 0:
+            raise ValueError("No Conv3d layers found in model")
+            
         # Take the last encoder layer, middle layer, and first decoder layer
-        target_layers = [
-            encoder_layers[-1],  # Deep encoder features
-            encoder_layers[len(encoder_layers)//2],  # Middle features
-            encoder_layers[0]  # Early features
-        ]
+        if len(encoder_layers) >= 3:
+            target_layers = [
+                encoder_layers[-1],  # Deep encoder features
+                encoder_layers[len(encoder_layers)//2],  # Middle features
+                encoder_layers[0]  # Early features
+            ]
+        else:
+            # If fewer layers, just use what we have
+            target_layers = encoder_layers
         
         return target_layers
         
