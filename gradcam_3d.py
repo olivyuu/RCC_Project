@@ -13,8 +13,14 @@ def reshape_3d_transform(tensor):
     Returns:
         Reshaped tensor suitable for GradCAM
     """
-    result = tensor.transpose(2, 4).transpose(2, 3)
-    return result
+    # Check input
+    if tensor.dim() != 5:
+        raise ValueError(f"Expected 5D tensor (B,C,D,H,W), got shape {tensor.shape}")
+    
+    # For 3D, we want to keep spatial dimensions together
+    # (B, C, D, H, W) -> (B, C, H, W, D)
+    tensor = tensor.permute(0, 1, 3, 4, 2)
+    return tensor
 
 class GradCAMPlusPlus3D(BaseCAM):
     def __init__(self, model, target_layers, use_cuda=True):
@@ -82,13 +88,12 @@ class MultiScaleGradCAM:
             use_cuda: Whether to use GPU
         """
         self.model = model
+        self.use_cuda = use_cuda
         
         # Get target layers if not provided
         if target_layers is None:
             target_layers = self.get_target_layers_from_model(model)
         self.target_layers = target_layers
-        
-        self.use_cuda = use_cuda
         
         # Default to equal weights if none provided
         if weights is None:
@@ -116,6 +121,9 @@ class MultiScaleGradCAM:
         Returns:
             Combined attention map (D, H, W)
         """
+        if self.use_cuda:
+            input_tensor = input_tensor.cuda()
+            
         # Get CAM from each layer
         attention_maps = []
         for extractor, weight in zip(self.cam_extractors, self.weights):
@@ -125,6 +133,9 @@ class MultiScaleGradCAM:
                 cam = extractor(input_tensor=input_tensor,
                               targets=targets,
                               eigen_smooth=False)  # (N, D, H, W)
+                
+                # Move depth dimension back to middle
+                cam = np.moveaxis(cam, 1, -1)  # (N, H, W, D)
                 
                 # Normalize and weight
                 cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
@@ -141,7 +152,9 @@ class MultiScaleGradCAM:
         combined_cam = np.sum(attention_maps, axis=0)
         combined_cam = np.clip(combined_cam, 0, 1)
         
-        return combined_cam[0]  # Remove batch dimension
+        # Move depth back to first dimension for visualization
+        combined_cam = np.moveaxis(combined_cam, -1, 1)[0]  # (D, H, W)
+        return combined_cam
         
     @staticmethod
     def get_target_layers_from_model(model):
