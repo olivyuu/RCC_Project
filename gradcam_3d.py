@@ -27,7 +27,7 @@ class GradCAMPlusPlus3D(GradCAMPlusPlus):
         return weights.cpu().numpy()
 
 class MultiScaleGradCAM:
-    def __init__(self, model, target_layers, weights=None, use_cuda=True):
+    def __init__(self, model, target_layers=None, weights=None, use_cuda=True):
         """
         Initialize MultiScaleGradCAM with multiple target layers
         
@@ -38,7 +38,12 @@ class MultiScaleGradCAM:
             use_cuda: Whether to use GPU
         """
         self.model = model
+        
+        # Get target layers if not provided
+        if target_layers is None:
+            target_layers = self.get_target_layers_from_model(model)
         self.target_layers = target_layers
+        
         self.use_cuda = use_cuda
         
         # Default to equal weights if none provided
@@ -89,11 +94,19 @@ class MultiScaleGradCAM:
     @staticmethod
     def get_target_layers_from_model(model):
         """Helper to get common target layers from nnUNetv2"""
+        # Find the encoder blocks (last conv layer in each block)
+        encoder_layers = []
+        for module in model.modules():
+            if isinstance(module, torch.nn.Conv3d):
+                encoder_layers.append(module)
+        
+        # Take the last encoder layer, middle layer, and first decoder layer
         target_layers = [
-            model.model.encoder[-1],  # Deep encoder features
-            model.model.bottleneck,   # Bottleneck features  
-            model.model.decoder[0]    # High-level decoder features
+            encoder_layers[-1],  # Deep encoder features
+            encoder_layers[len(encoder_layers)//2],  # Middle features
+            encoder_layers[0]  # Early features
         ]
+        
         return target_layers
         
     @staticmethod
