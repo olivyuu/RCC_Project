@@ -16,6 +16,62 @@ from mpl_toolkits.axes_grid1.anchored_artists import AnchoredSizeBar
 import matplotlib.font_manager as fm
 
 # Set up matplotlib for high quality medical visualization
+def load_model(checkpoint_path, debug=False):
+    """Load the trained model from checkpoint"""
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    if debug:
+        print(f"\nLoading model from: {checkpoint_path}")
+        print(f"Using device: {device}")
+    # Initialize model
+    config = nnUNetConfig()
+    model = nnUNetv2(
+        in_channels=config.in_channels,
+        out_channels=config.out_channels,
+        features=config.features
+    )
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            model.load_state_dict(checkpoint)
+        if debug:
+            print("Model loaded successfully")
+    except Exception as e:
+        print(f"Error loading model: {str(e)}")
+        raise
+    return model.to(device), device
+def debug_model_output(model, dummy_input, checkpoint_path=None):
+    """Debug model's forward pass"""
+    print("\nDebugging model output:")
+    try:
+        # Check model architecture
+        print("\nModel architecture:")
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"Total parameters: {total_params:,}")
+        print(f"Trainable parameters: {trainable_params:,}")
+        if checkpoint_path:
+            checkpoint_size = Path(checkpoint_path).stat().st_size / (1024 * 1024)
+            print(f"Checkpoint size: {checkpoint_size:.2f}MB")
+        # Test forward pass
+        print("\nTesting forward pass:")
+        print(f"Input shape: {dummy_input.shape}")
+        print(f"Input range: [{dummy_input.min():.2f}, {dummy_input.max():.2f}]")
+        with torch.cuda.amp.autocast(enabled=True):
+            output = model(dummy_input)
+        if isinstance(output, list):
+            print(f"Output is a list of {len(output)} tensors")
+            for i, out in enumerate(output):
+                print(f"Output[{i}] shape: {out.shape}")
+                print(f"Output[{i}] range: [{out.min().item():.2f}, {out.max().item():.2f}]")
+        else:
+            print(f"Output shape: {output.shape}")
+            print(f"Output range: [{output.min().item():.2f}, {output.max().item():.2f}]")
+    except Exception as e:
+        print(f"Error in model debugging: {str(e)}")
+        raise
+
 plt.style.use('dark_background')
 plt.rcParams['figure.dpi'] = 300
 plt.rcParams['figure.figsize'] = [20, 15]  # Made wider for 3 panels
