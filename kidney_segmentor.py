@@ -44,12 +44,13 @@ class KidneySegmentor:
                 output=str(output_path),
                 fast=self.model_type == "fast",
                 roi_subset=["kidney_right", "kidney_left"],
-                # Removed nr_thr argument as it's not supported
                 ml=True  # Use machine learning model
             )
             
             if self.debug:
                 print("Segmentation completed successfully")
+                print(f"Looking for segmentation files in {output_path}")
+                print(f"Available files: {list(Path(output_path).glob('*.nii.gz'))}")
                 
             return True
             
@@ -60,10 +61,34 @@ class KidneySegmentor:
     def _combine_kidney_masks(self, seg_dir):
         """Combine individual kidney segmentations into a single mask"""
         combined_mask = None
+        seg_dir = Path(seg_dir)
         
-        for kidney, label in self.KIDNEY_LABELS.items():
-            # Load individual kidney segmentation
-            mask_path = seg_dir / f"{kidney}.nii.gz"
+        # Look for both possible naming patterns
+        possible_patterns = [
+            # Original pattern
+            {'kidney_right': 'kidney_right.nii.gz', 'kidney_left': 'kidney_left.nii.gz'},
+            # Alternative pattern
+            {'kidney_right': 'total_segmentator_kidney_right.nii.gz', 
+             'kidney_left': 'total_segmentator_kidney_left.nii.gz'}
+        ]
+        
+        found_files = False
+        for pattern in possible_patterns:
+            if all((seg_dir / filename).exists() for filename in pattern.values()):
+                if self.debug:
+                    print(f"Found kidney files using pattern: {pattern}")
+                filenames = pattern
+                found_files = True
+                break
+                
+        if not found_files:
+            if self.debug:
+                print("Could not find kidney segmentation files with any known pattern")
+            return None
+            
+        # Process found files
+        for kidney, filename in filenames.items():
+            mask_path = seg_dir / filename
             if not mask_path.exists():
                 if self.debug:
                     print(f"Warning: {mask_path} not found")
@@ -80,9 +105,17 @@ class KidneySegmentor:
                 # Add this kidney's mask
                 combined_mask[mask_data > 0] = 1
                 
+                if self.debug:
+                    print(f"Added {kidney} mask, shape: {mask_data.shape}, "
+                          f"range: [{mask_data.min():.2f}, {mask_data.max():.2f}]")
+                
             except Exception as e:
                 print(f"Error processing {kidney} mask: {str(e)}")
                 continue
+        
+        if combined_mask is not None and self.debug:
+            print(f"Combined mask shape: {combined_mask.shape}, "
+                  f"range: [{combined_mask.min():.2f}, {combined_mask.max():.2f}]")
         
         return combined_mask
     
