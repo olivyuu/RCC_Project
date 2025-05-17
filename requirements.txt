@@ -1,6 +1,8 @@
 # Medical imaging libraries
 nibabel>=5.0.0
 SimpleITK>=2.2.0
+TotalSegmentator>=1.5.6  # Added for kidney segmentation
+totalsegmentator>=1.5.6  # CLI tool
 
 # Core dependencies (specific versions for compatibility)
 numpy>=1.24.0,<2.0.0  # Must use numpy 1.x for PyTorch compatibility

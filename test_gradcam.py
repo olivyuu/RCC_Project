@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from model import nnUNetv2
 from full_volume_inference import FullVolumeInference
+from kidney_segmentor import KidneySegmentor
 from config import nnUNetConfig
 import random
 import os
@@ -85,18 +86,7 @@ def load_model(checkpoint_path, debug=False):
     return model.to(device), device
 
 def visualize_results(img_slice, pred_slice, attn_slice, name, save_path, save_raw=False, spacing=(1.0, 1.0), debug=False):
-    """
-    Create and save clinically-relevant visualization of results
-    
-    Args:
-        img_slice: Original CT scan slice
-        pred_slice: Prediction probabilities [0,1]
-        attn_slice: Attention map from Grad-CAM
-        name: Description of the slice
-        save_path: Output directory
-        save_raw: Whether to save raw numpy arrays
-        spacing: Pixel spacing in mm for the current view
-    """
+    """Create and save clinically-relevant visualization of results"""
     try:
         if debug:
             print(f"\nInput shapes:")
@@ -203,16 +193,17 @@ def process_full_volume(model, device, config, case_path, output_dir, debug=Fals
         # Check available GPU memory
         if torch.cuda.is_available() and debug:
             print(f"\nInitial GPU memory: {torch.cuda.memory_allocated()/1e9:.2f}GB")
-            
+        
         # Initialize inference handler
         if debug:
             print("Initializing FullVolumeInference...")
         full_volume_handler = FullVolumeInference(model, config)
         
-        # Load and process the case
+        # Initialize kidney segmentor
         if debug:
-            print("Loading volume data...")
-            
+            print("Initializing KidneySegmentor...")
+        kidney_segmentor = KidneySegmentor(debug=debug)
+        
         # Load image with spacing information
         img_path = case_path / "imaging.nii.gz"
         if not img_path.exists():
@@ -239,10 +230,21 @@ def process_full_volume(model, device, config, case_path, output_dir, debug=Fals
         except:
             spacing = (1.0, 1.0, 1.0)
             
+        # Get kidney segmentation
+        if debug:
+            print("Generating kidney segmentation...")
+        kidney_mask = kidney_segmentor.get_kidney_mask(img_path, case_path.name)
+        
+        if kidney_mask is None:
+            print("Warning: Failed to generate kidney mask, proceeding without anatomical constraints")
+        elif debug:
+            print(f"Kidney mask shape: {kidney_mask.shape}")
+            print(f"Kidney mask range: [{kidney_mask.min():.2f}, {kidney_mask.max():.2f}]")
+        
         # Run inference
         if debug:
             print("Running inference...")
-        predictions, attention_maps = full_volume_handler.sliding_window_inference(volume)
+        predictions, attention_maps = full_volume_handler.sliding_window_inference(volume, kidney_mask)
         
         if debug:
             print(f"Volume shape: {volume.shape}")
@@ -253,11 +255,11 @@ def process_full_volume(model, device, config, case_path, output_dir, debug=Fals
         volume_dir = output_dir / case_path.name / 'full_volume'
         volume_dir.mkdir(exist_ok=True, parents=True)
         
-        # Process multiple slices for each view
+        # Find slices with high tumor probabilities for each view
         slice_indices = {
-            'Axial': [volume.shape[0]//4, volume.shape[0]//2, 3*volume.shape[0]//4],
-            'Sagittal': [volume.shape[1]//4, volume.shape[1]//2, 3*volume.shape[1]//4],
-            'Coronal': [volume.shape[2]//4, volume.shape[2]//2, 3*volume.shape[2]//4]
+            'Axial': full_volume_handler._find_high_prob_slices(predictions, axis=0),
+            'Sagittal': full_volume_handler._find_high_prob_slices(predictions, axis=1),
+            'Coronal': full_volume_handler._find_high_prob_slices(predictions, axis=2)
         }
         
         # Create visualizations for each view
@@ -293,9 +295,9 @@ def process_full_volume(model, device, config, case_path, output_dir, debug=Fals
                     # Verify shapes match
                     if img_slice.shape != pred_slice.shape or img_slice.shape != attn_slice.shape:
                         raise ValueError(f"Shape mismatch - Image: {img_slice.shape}, "
-                                      f"Prediction: {pred_slice.shape}, "
-                                      f"Attention: {attn_slice.shape}")
-                                      
+                                     f"Prediction: {pred_slice.shape}, "
+                                     f"Attention: {attn_slice.shape}")
+                                       
                 except Exception as e:
                     print(f"Error extracting slices: {str(e)}")
                     raise
