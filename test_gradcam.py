@@ -16,12 +16,18 @@ from mpl_toolkits.axes_grid1.anchored_artists import AnchoredSizeBar
 import matplotlib.font_manager as fm
 
 # Set up matplotlib for high quality medical visualization
+plt.style.use('dark_background')
+plt.rcParams['figure.dpi'] = 300
+plt.rcParams['figure.figsize'] = [20, 15]  # Made wider for 3 panels
+
 def load_model(checkpoint_path, debug=False):
     """Load the trained model from checkpoint"""
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
     if debug:
         print(f"\nLoading model from: {checkpoint_path}")
         print(f"Using device: {device}")
+    
     # Initialize model
     config = nnUNetConfig()
     model = nnUNetv2(
@@ -29,6 +35,7 @@ def load_model(checkpoint_path, debug=False):
         out_channels=config.out_channels,
         features=config.features
     )
+    
     try:
         checkpoint = torch.load(checkpoint_path, map_location=device)
         if 'model_state_dict' in checkpoint:
@@ -40,7 +47,9 @@ def load_model(checkpoint_path, debug=False):
     except Exception as e:
         print(f"Error loading model: {str(e)}")
         raise
+        
     return model.to(device), device
+
 def debug_model_output(model, dummy_input, checkpoint_path=None):
     """Debug model's forward pass"""
     print("\nDebugging model output:")
@@ -51,15 +60,19 @@ def debug_model_output(model, dummy_input, checkpoint_path=None):
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"Total parameters: {total_params:,}")
         print(f"Trainable parameters: {trainable_params:,}")
+        
         if checkpoint_path:
             checkpoint_size = Path(checkpoint_path).stat().st_size / (1024 * 1024)
             print(f"Checkpoint size: {checkpoint_size:.2f}MB")
+        
         # Test forward pass
         print("\nTesting forward pass:")
         print(f"Input shape: {dummy_input.shape}")
         print(f"Input range: [{dummy_input.min():.2f}, {dummy_input.max():.2f}]")
+        
         with torch.cuda.amp.autocast(enabled=True):
             output = model(dummy_input)
+        
         if isinstance(output, list):
             print(f"Output is a list of {len(output)} tensors")
             for i, out in enumerate(output):
@@ -68,13 +81,10 @@ def debug_model_output(model, dummy_input, checkpoint_path=None):
         else:
             print(f"Output shape: {output.shape}")
             print(f"Output range: [{output.min().item():.2f}, {output.max().item():.2f}]")
+            
     except Exception as e:
         print(f"Error in model debugging: {str(e)}")
         raise
-
-plt.style.use('dark_background')
-plt.rcParams['figure.dpi'] = 300
-plt.rcParams['figure.figsize'] = [20, 15]  # Made wider for 3 panels
 
 def visualize_results(img_slice, pred_slice, attn_slice, tumor_gt_slice, name, save_path, save_raw=False, spacing=(1.0, 1.0), debug=False):
     """Create and save clinically-relevant visualization of results"""
@@ -383,26 +393,29 @@ def main():
         output_dir.mkdir(exist_ok=True, parents=True)
         
         # Get case list and verify data
-        config = nnUNetConfig()
-        data_dir = Path(config.data_dir)
+        data_dir = Path("/workspace/kits23/dataset")  # Direct path to KiTS23 dataset
         
         if not data_dir.exists():
             raise ValueError(f"Data directory not found: {data_dir}")
             
-        # Find cases with ground truth segmentations
+        # Find all available cases
         all_cases = []
         for case_dir in sorted(data_dir.iterdir()):
             if not case_dir.is_dir() or not case_dir.name.startswith('case_'):
                 continue
-                
-            # Check for required files
-            has_imaging = (case_dir / "imaging.nii.gz").exists() or \
-                         (case_dir / "raw_data" / "imaging.nii.gz").exists()
-                         
-            has_seg = (case_dir / "aggregated_MAJ_seg.nii.gz").exists() or \
-                     (case_dir / "raw_data" / "aggregated_MAJ_seg.nii.gz").exists()
-                     
-            if has_imaging and has_seg:
+            
+            # Check for imaging file
+            has_imaging = False
+            for img_path in [case_dir / "imaging.nii.gz", 
+                           case_dir / "raw_data" / "imaging.nii.gz"]:
+                if img_path.exists():
+                    has_imaging = True
+                    if args.debug:
+                        print(f"Found case: {case_dir.name}")
+                        print(f"  Imaging file: {img_path}")
+                    break
+            
+            if has_imaging:
                 all_cases.append(case_dir)
         
         if not all_cases:
@@ -412,7 +425,7 @@ def main():
             print(f"\nData directory: {data_dir}")
             print(f"Total cases found: {len(all_cases)}")
             
-        # Randomly select cases with ground truth
+        # Randomly select cases
         selected_cases = random.sample(all_cases, min(args.cases, len(all_cases)))
         
         if args.debug:
