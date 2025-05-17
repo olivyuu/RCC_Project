@@ -2,6 +2,7 @@ import torch
 import numpy as np
 from pytorch_grad_cam import GradCAMPlusPlus
 from pytorch_grad_cam.base_cam import BaseCAM
+from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
 from typing import List, Callable
 
 def reshape_3d_transform(tensor):
@@ -17,12 +18,8 @@ def reshape_3d_transform(tensor):
 
 class GradCAMPlusPlus3D(BaseCAM):
     def __init__(self, model, target_layers, use_cuda=True):
-        super(GradCAMPlusPlus3D, self).__init__(
-            model=model,
-            target_layers=target_layers,
-            use_cuda=use_cuda,
-            reshape_transform=reshape_3d_transform,  # Always use 3D reshape
-        )
+        super().__init__(model, target_layers, reshape_transform=reshape_3d_transform)
+        self.cuda = use_cuda
 
     def get_cam_weights(self,
                        input_tensor: torch.Tensor,
@@ -40,6 +37,38 @@ class GradCAMPlusPlus3D(BaseCAM):
         weights = (alpha * torch.relu(grads)).sum(-1)
         
         return weights.cpu().numpy()
+
+    def forward(self, input_tensor: torch.Tensor, targets: List[torch.nn.Module], eigen_smooth: bool = False) -> np.ndarray:
+        if self.cuda:
+            input_tensor = input_tensor.cuda()
+
+        if self.compute_input_gradient:
+            input_tensor = torch.autograd.Variable(input_tensor,
+                                                 requires_grad=True)
+
+        outputs = self.activations_and_grads(input_tensor)
+        if targets is None:
+            target_categories = np.argmax(outputs.cpu().data.numpy(), axis=-1)
+            targets = [ClassifierOutputTarget(category) for category in target_categories]
+
+        if self.uses_gradients:
+            self.model.zero_grad()
+            loss = sum([target(output) for target, output in zip(targets, outputs)])
+            loss.backward(retain_graph=True)
+
+        # In most of the saliency attribution papers, the saliency is
+        # computed with a single target layer.
+        # Commonly it is the last convolutional layer.
+        # Here we support passing a list with multiple target layers.
+        # It will compute the saliency image for every image,
+        # and then aggregate them (with a default mean aggregation).
+        # This gives you more flexibility in case you just want to
+        # use all conv layers for example, all Batchnorm layers,
+        # or something else.
+        cam_per_layer = self.compute_cam_per_layer(input_tensor,
+                                                  targets,
+                                                  eigen_smooth)
+        return self.aggregate_multi_layers(cam_per_layer)
 
 class MultiScaleGradCAM:
     def __init__(self, model, target_layers=None, weights=None, use_cuda=True):
@@ -92,8 +121,9 @@ class MultiScaleGradCAM:
         for extractor, weight in zip(self.cam_extractors, self.weights):
             try:
                 # Generate CAM
+                targets = [ClassifierOutputTarget(target_category)]
                 cam = extractor(input_tensor=input_tensor,
-                              target_category=target_category,
+                              targets=targets,
                               eigen_smooth=False)  # (N, D, H, W)
                 
                 # Normalize and weight
