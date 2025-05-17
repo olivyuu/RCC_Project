@@ -1,4 +1,205 @@
-# [Previous imports remain the same]
+import torch
+import matplotlib.pyplot as plt
+from pathlib import Path
+from model import nnUNetv2
+from full_volume_inference import FullVolumeInference
+from kidney_segmentor import KidneySegmentor
+from config import nnUNetConfig
+import random
+import os
+import numpy as np
+import nibabel as nib
+import argparse
+from tqdm import tqdm
+import skimage.feature
+from mpl_toolkits.axes_grid1.anchored_artists import AnchoredSizeBar
+import matplotlib.font_manager as fm
+import glob
+import traceback
+
+# Set up matplotlib for high quality medical visualization
+plt.style.use('dark_background')
+plt.rcParams['figure.dpi'] = 300
+plt.rcParams['figure.figsize'] = [20, 15]  # Made wider for 3 panels
+
+def load_model(checkpoint_path, debug=False):
+    """Load the trained model from checkpoint"""
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+    if debug:
+        print(f"\nLoading model from: {checkpoint_path}")
+        print(f"Using device: {device}")
+    
+    # Initialize model
+    config = nnUNetConfig()
+    model = nnUNetv2(
+        in_channels=config.in_channels,
+        out_channels=config.out_channels,
+        features=config.features
+    )
+    
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            model.load_state_dict(checkpoint)
+        if debug:
+            print("Model loaded successfully")
+    except Exception as e:
+        print(f"Error loading model: {str(e)}")
+        raise
+        
+    return model.to(device), device
+
+def debug_model_output(model, dummy_input, checkpoint_path=None):
+    """Debug model's forward pass"""
+    print("\nDebugging model output:")
+    try:
+        # Check model architecture
+        print("\nModel architecture:")
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"Total parameters: {total_params:,}")
+        print(f"Trainable parameters: {trainable_params:,}")
+        
+        if checkpoint_path:
+            checkpoint_size = Path(checkpoint_path).stat().st_size / (1024 * 1024)
+            print(f"Checkpoint size: {checkpoint_size:.2f}MB")
+        
+        # Test forward pass
+        print("\nTesting forward pass:")
+        print(f"Input shape: {dummy_input.shape}")
+        print(f"Input range: [{dummy_input.min():.2f}, {dummy_input.max():.2f}]")
+        
+        with torch.cuda.amp.autocast(enabled=True):
+            output = model(dummy_input)
+        
+        if isinstance(output, list):
+            print(f"Output is a list of {len(output)} tensors")
+            for i, out in enumerate(output):
+                print(f"Output[{i}] shape: {out.shape}")
+                print(f"Output[{i}] range: [{out.min().item():.2f}, {out.max().item():.2f}]")
+        else:
+            print(f"Output shape: {output.shape}")
+            print(f"Output range: [{output.min().item():.2f}, {output.max().item():.2f}]")
+            
+    except Exception as e:
+        print(f"Error in model debugging: {str(e)}")
+        raise
+
+def visualize_results(img_slice, pred_slice, attn_slice, tumor_gt_slice, name, save_path, save_raw=False, spacing=(1.0, 1.0), debug=False):
+    """Create and save clinically-relevant visualization of results"""
+    try:
+        if debug:
+            print(f"\nInput shapes:")
+            print(f"Image: {img_slice.shape}, Range: [{img_slice.min():.2f}, {img_slice.max():.2f}]")
+            print(f"Predictions: {pred_slice.shape}, Range: [{pred_slice.min():.2f}, {pred_slice.max():.2f}]")
+            print(f"Attention: {attn_slice.shape}, Range: [{attn_slice.min():.2f}, {attn_slice.max():.2f}]")
+            if tumor_gt_slice is not None:
+                print(f"Ground Truth: {tumor_gt_slice.shape}, Range: [{tumor_gt_slice.min():.2f}, {tumor_gt_slice.max():.2f}]")
+            print(f"Spacing: {spacing}")
+            
+        # Create figure with three side-by-side panels
+        fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 7))
+        fig.suptitle(f'Tumor Detection Analysis\n{name}', fontsize=16, y=0.95)
+        
+        # Left panel: Original CT scan
+        ax1.imshow(img_slice, cmap='gray')
+        ax1.set_title('Original CT Scan', fontsize=14)
+        ax1.axis('off')
+        
+        # Add scale bar
+        scalebar = AnchoredSizeBar(ax1.transData,
+                                 100/spacing[0],  # 10mm in pixels
+                                 '10 mm',
+                                 'lower right',
+                                 pad=0.5,
+                                 color='white',
+                                 frameon=False,
+                                 size_vertical=1)
+        ax1.add_artist(scalebar)
+        
+        # Middle panel: Ground truth overlay
+        ax2.imshow(img_slice, cmap='gray')
+        if tumor_gt_slice is not None:
+            # Create tumor mask overlay
+            tumor_mask = np.ma.masked_where(tumor_gt_slice == 0, tumor_gt_slice)
+            ax2.imshow(tumor_mask, cmap='Reds', alpha=0.6)
+        ax2.set_title('Ground Truth Tumor', fontsize=14)
+        ax2.axis('off')
+        
+        # Right panel: Model predictions
+        ax3.imshow(img_slice, cmap='gray')
+        
+        # Normalize attention map to [0,1]
+        attn_norm = (attn_slice - attn_slice.min()) / (attn_slice.max() - attn_slice.min() + 1e-8)
+        
+        # Create weighted heatmap combining attention and probability
+        combined_heatmap = attn_norm * pred_slice
+        combined_heatmap = np.clip(combined_heatmap, 0, 1)
+        
+        # Display heatmap
+        heatmap = ax3.imshow(combined_heatmap, 
+                           cmap='RdYlBu_r',
+                           alpha=0.7)
+        ax3.set_title('Model Predictions', fontsize=14)
+        ax3.axis('off')
+        
+        # Add colorbar with probability scale
+        cbar = plt.colorbar(heatmap, ax=ax3)
+        cbar.set_label('Tumor Probability Score', fontsize=12)
+        
+        # Add probability annotations for high confidence predictions
+        try:
+            high_prob_threshold = 0.75
+            if debug:
+                print("\nFinding peaks:")
+                print(f"Combined heatmap range: [{combined_heatmap.min():.2f}, {combined_heatmap.max():.2f}]")
+            
+            # Ensure input is properly formatted for peak_local_max
+            combined_heatmap = combined_heatmap.astype(np.float64)
+            # Use absolute threshold instead of relative
+            threshold_abs = high_prob_threshold * combined_heatmap.max()
+            peak_coords = skimage.feature.peak_local_max(
+                combined_heatmap,
+                min_distance=10,
+                threshold_abs=threshold_abs,
+                exclude_border=False
+            )
+            
+            if debug:
+                print(f"Input range for peak detection: [{combined_heatmap.min():.3f}, {combined_heatmap.max():.3f}]")
+                print(f"Absolute threshold: {threshold_abs:.3f}")
+                print(f"Found {len(peak_coords)} peaks above threshold {high_prob_threshold}")
+                
+            for y, x in peak_coords:
+                if pred_slice[y, x] > high_prob_threshold:
+                    ax3.text(x, y, f'{pred_slice[y, x]:.2f}',
+                            color='white', fontsize=8,
+                            ha='center', va='center',
+                            bbox=dict(facecolor='black', alpha=0.5, pad=1))
+                            
+        except Exception as e:
+            print(f"Warning: Peak detection failed: {str(e)}")
+        
+        # Save visualization
+        plt.tight_layout()
+        plt.savefig(save_path / 'analysis.png', bbox_inches='tight', dpi=300)
+        plt.close()
+        
+        # Save raw data if requested
+        if save_raw:
+            save_path.mkdir(exist_ok=True, parents=True)
+            np.save(save_path / 'scan.npy', img_slice)
+            np.save(save_path / 'probabilities.npy', pred_slice)
+            np.save(save_path / 'heatmap.npy', combined_heatmap)
+            if tumor_gt_slice is not None:
+                np.save(save_path / 'ground_truth.npy', tumor_gt_slice)
+            
+    except Exception as e:
+        print(f"Error in visualization: {str(e)}")
+        raise
 
 def process_full_volume(model, device, case_path, output_dir, debug=False, save_raw=False, spacing=None):
     """Process a full volume with Grad-CAM"""
@@ -263,7 +464,7 @@ def main():
                 torch.cuda.empty_cache()
             except Exception as e:
                 print(f"Error processing case {case_path.name}: {str(e)}")
-                if args.debug:
+                if args.debug:  # Fixed debug variable reference
                     raise
                 continue
                 
@@ -275,5 +476,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-# [Previous visualize_results function remains unchanged]
