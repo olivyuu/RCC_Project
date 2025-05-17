@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 import nibabel as nib
 import numpy as np
-from totalsegmentator import totalsegmentator
+from totalsegmentator.python_api import totalsegmentator  # Fixed import
 from tempfile import TemporaryDirectory
 import shutil
 
@@ -39,9 +39,9 @@ class KidneySegmentor:
                 print(f"Output directory: {output_path}")
                 
             # Run TotalSegmentator with kidney-specific settings
-            totalsegmentator.totalsegmentator(
-                input_path,
-                output_path,
+            totalsegmentator(
+                input=input_path,  # Changed from input_path to input
+                output=output_path,  # Changed from output_path to output
                 fast=self.model_type == "fast",
                 roi_subset=["kidney_right", "kidney_left"],
                 nr_thr=-1  # Use all available threads
