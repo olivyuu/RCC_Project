@@ -5,27 +5,47 @@ from pytorch_grad_cam.base_cam import BaseCAM
 from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
 from typing import List, Callable
 
-def reshape_3d_transform(tensor):
+def reshape_3d_transform(tensor, debug=True):
     """
-    Reshape function for 3D volumes
+    Reshape function for 3D volumes - handles both activations and gradients
     Args:
-        tensor: Input tensor of shape (batch_size, channels, D, H, W)
+        tensor: Input tensor of shape (B,C,D,H,W) or (N,C,H,W)
     Returns:
         Reshaped tensor suitable for GradCAM
     """
-    # Check input
+    if debug:
+        print(f"\nReshape transform input:")
+        print(f"Shape: {tensor.shape}")
+        print(f"Type: {tensor.dtype}")
+        print(f"Device: {tensor.device}")
+        print(f"Range: [{tensor.min():.2f}, {tensor.max():.2f}]")
+    
+    # Handle 4D activation tensors from conv layers
+    if tensor.dim() == 4:
+        N, C, H, W = tensor.shape
+        # Reshape to 5D by adding depth dimension
+        tensor = tensor.view(N, C, 1, H, W)
+        if debug:
+            print(f"Reshaped 4D -> 5D: {tensor.shape}")
+    
+    # Check input dimensions
     if tensor.dim() != 5:
-        raise ValueError(f"Expected 5D tensor (B,C,D,H,W), got shape {tensor.shape}")
+        raise ValueError(f"Expected 5D tensor after reshaping, got shape {tensor.shape}")
     
     # For 3D, we want to keep spatial dimensions together
     # (B, C, D, H, W) -> (B, C, H, W, D)
     tensor = tensor.permute(0, 1, 3, 4, 2)
+    
+    if debug:
+        print(f"Output shape: {tensor.shape}")
+        
     return tensor
 
 class GradCAMPlusPlus3D(BaseCAM):
     def __init__(self, model, target_layers, use_cuda=True):
         super().__init__(model, target_layers, reshape_transform=reshape_3d_transform)
         self.cuda = use_cuda
+        self.debug = True
 
     def get_cam_weights(self,
                        input_tensor: torch.Tensor,
@@ -33,6 +53,12 @@ class GradCAMPlusPlus3D(BaseCAM):
                        target_category: int,
                        activations: torch.Tensor,
                        grads: torch.Tensor) -> np.ndarray:
+        if self.debug:
+            print(f"\nComputing CAM weights:")
+            print(f"Target layer: {target_layer.__class__.__name__}")
+            print(f"Activations shape: {activations.shape}")
+            print(f"Gradients shape: {grads.shape}")
+        
         # Adapt GradCAM++ for 3D volumes
         grads = grads.reshape(grads.shape[0], -1)  # Flatten spatial dimensions
         activations = activations.reshape(activations.shape[0], -1)
@@ -42,9 +68,16 @@ class GradCAMPlusPlus3D(BaseCAM):
         alpha = grad_2 / (2 * grad_2 + (grad_3 * activations).sum(-1, keepdim=True) + 1e-7)
         weights = (alpha * torch.relu(grads)).sum(-1)
         
+        if self.debug:
+            print(f"Computed weights shape: {weights.shape}")
+            
         return weights.cpu().numpy()
 
     def forward(self, input_tensor: torch.Tensor, targets: List[torch.nn.Module], eigen_smooth: bool = False) -> np.ndarray:
+        if self.debug:
+            print(f"\nForward pass:")
+            print(f"Input shape: {input_tensor.shape}")
+        
         if self.cuda:
             input_tensor = input_tensor.cuda()
 
@@ -62,19 +95,15 @@ class GradCAMPlusPlus3D(BaseCAM):
             loss = sum([target(output) for target, output in zip(targets, outputs)])
             loss.backward(retain_graph=True)
 
-        # In most of the saliency attribution papers, the saliency is
-        # computed with a single target layer.
-        # Commonly it is the last convolutional layer.
-        # Here we support passing a list with multiple target layers.
-        # It will compute the saliency image for every image,
-        # and then aggregate them (with a default mean aggregation).
-        # This gives you more flexibility in case you just want to
-        # use all conv layers for example, all Batchnorm layers,
-        # or something else.
         cam_per_layer = self.compute_cam_per_layer(input_tensor,
                                                   targets,
                                                   eigen_smooth)
-        return self.aggregate_multi_layers(cam_per_layer)
+        cam = self.aggregate_multi_layers(cam_per_layer)
+        
+        if self.debug:
+            print(f"Output CAM shape: {cam.shape}")
+            
+        return cam
 
 class MultiScaleGradCAM:
     def __init__(self, model, target_layers=None, weights=None, use_cuda=True):
@@ -89,11 +118,17 @@ class MultiScaleGradCAM:
         """
         self.model = model
         self.use_cuda = use_cuda
+        self.debug = True
         
         # Get target layers if not provided
         if target_layers is None:
             target_layers = self.get_target_layers_from_model(model)
         self.target_layers = target_layers
+        
+        if self.debug:
+            print("\nInitializing MultiScaleGradCAM:")
+            for i, layer in enumerate(target_layers):
+                print(f"Layer {i}: {layer.__class__.__name__}")
         
         # Default to equal weights if none provided
         if weights is None:
@@ -121,18 +156,28 @@ class MultiScaleGradCAM:
         Returns:
             Combined attention map (D, H, W)
         """
+        if self.debug:
+            print(f"\nGenerating multi-scale CAM:")
+            print(f"Input shape: {input_tensor.shape}")
+        
         if self.use_cuda:
             input_tensor = input_tensor.cuda()
             
         # Get CAM from each layer
         attention_maps = []
-        for extractor, weight in zip(self.cam_extractors, self.weights):
+        for i, (extractor, weight) in enumerate(zip(self.cam_extractors, self.weights)):
             try:
+                if self.debug:
+                    print(f"\nProcessing layer {i}:")
+                
                 # Generate CAM
                 targets = [ClassifierOutputTarget(target_category)]
                 cam = extractor(input_tensor=input_tensor,
                               targets=targets,
                               eigen_smooth=False)  # (N, D, H, W)
+                
+                if self.debug:
+                    print(f"Raw CAM shape: {cam.shape}")
                 
                 # Move depth dimension back to middle
                 cam = np.moveaxis(cam, 1, -1)  # (N, H, W, D)
@@ -141,8 +186,13 @@ class MultiScaleGradCAM:
                 cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
                 cam = cam * weight
                 attention_maps.append(cam)
+                
+                if self.debug:
+                    print(f"Processed CAM shape: {cam.shape}")
+                    print(f"Range: [{cam.min():.2f}, {cam.max():.2f}]")
+                    
             except Exception as e:
-                print(f"Error generating CAM for layer: {str(e)}")
+                print(f"Error generating CAM for layer {i}: {str(e)}")
                 continue
             
         if not attention_maps:
@@ -154,6 +204,11 @@ class MultiScaleGradCAM:
         
         # Move depth back to first dimension for visualization
         combined_cam = np.moveaxis(combined_cam, -1, 1)[0]  # (D, H, W)
+        
+        if self.debug:
+            print(f"\nFinal output shape: {combined_cam.shape}")
+            print(f"Range: [{combined_cam.min():.2f}, {combined_cam.max():.2f}]")
+            
         return combined_cam
         
     @staticmethod
