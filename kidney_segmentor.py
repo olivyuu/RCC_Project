@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 import nibabel as nib
 import numpy as np
-from totalsegmentator.python_api import totalsegmentator  # Fixed import
+from totalsegmentator.python_api import totalsegmentator
 from tempfile import TemporaryDirectory
 import shutil
 
@@ -40,11 +40,12 @@ class KidneySegmentor:
                 
             # Run TotalSegmentator with kidney-specific settings
             totalsegmentator(
-                input=input_path,  # Changed from input_path to input
-                output=output_path,  # Changed from output_path to output
+                input=str(input_path),
+                output=str(output_path),
                 fast=self.model_type == "fast",
                 roi_subset=["kidney_right", "kidney_left"],
-                nr_thr=-1  # Use all available threads
+                # Removed nr_thr argument as it's not supported
+                ml=True  # Use machine learning model
             )
             
             if self.debug:
@@ -123,7 +124,7 @@ class KidneySegmentor:
             temp_dir = Path(temp_dir)
             
             # Run segmentation
-            if not self._run_segmentation(str(img_path), str(temp_dir)):
+            if not self._run_segmentation(img_path, temp_dir):
                 return None
             
             # Combine individual kidney masks
