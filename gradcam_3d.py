@@ -4,13 +4,25 @@ from pytorch_grad_cam import GradCAMPlusPlus
 from pytorch_grad_cam.base_cam import BaseCAM
 from typing import List, Callable
 
-class GradCAMPlusPlus3D(BaseCAM):  # Changed to inherit from BaseCAM directly
-    def __init__(self, model, target_layers, use_cuda=True,
-                 reshape_transform=None):
-        super(GradCAMPlusPlus3D, self).__init__(model, 
-                                               target_layers, 
-                                               use_cuda,
-                                               reshape_transform)
+def reshape_3d_transform(tensor):
+    """
+    Reshape function for 3D volumes
+    Args:
+        tensor: Input tensor of shape (batch_size, channels, D, H, W)
+    Returns:
+        Reshaped tensor suitable for GradCAM
+    """
+    result = tensor.transpose(2, 4).transpose(2, 3)
+    return result
+
+class GradCAMPlusPlus3D(BaseCAM):
+    def __init__(self, model, target_layers, use_cuda=True):
+        super(GradCAMPlusPlus3D, self).__init__(
+            model=model,
+            target_layers=target_layers,
+            use_cuda=use_cuda,
+            reshape_transform=reshape_3d_transform,  # Always use 3D reshape
+        )
 
     def get_cam_weights(self,
                        input_tensor: torch.Tensor,
@@ -24,7 +36,7 @@ class GradCAMPlusPlus3D(BaseCAM):  # Changed to inherit from BaseCAM directly
         
         grad_2 = grads.pow(2)
         grad_3 = grads.pow(3)
-        alpha = grad_2 / (2 * grad_2 + (grad_3 * activations).sum(-1, keepdim=True))
+        alpha = grad_2 / (2 * grad_2 + (grad_3 * activations).sum(-1, keepdim=True) + 1e-7)
         weights = (alpha * torch.relu(grads)).sum(-1)
         
         return weights.cpu().numpy()
@@ -78,15 +90,22 @@ class MultiScaleGradCAM:
         # Get CAM from each layer
         attention_maps = []
         for extractor, weight in zip(self.cam_extractors, self.weights):
-            # Generate CAM
-            cam = extractor(input_tensor=input_tensor,
-                          target_category=target_category,
-                          eigen_smooth=False)  # (N, D, H, W)
+            try:
+                # Generate CAM
+                cam = extractor(input_tensor=input_tensor,
+                              target_category=target_category,
+                              eigen_smooth=False)  # (N, D, H, W)
+                
+                # Normalize and weight
+                cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+                cam = cam * weight
+                attention_maps.append(cam)
+            except Exception as e:
+                print(f"Error generating CAM for layer: {str(e)}")
+                continue
             
-            # Normalize and weight
-            cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
-            cam = cam * weight
-            attention_maps.append(cam)
+        if not attention_maps:
+            raise ValueError("No valid attention maps generated")
             
         # Combine attention maps
         combined_cam = np.sum(attention_maps, axis=0)
@@ -99,7 +118,7 @@ class MultiScaleGradCAM:
         """Helper to get common target layers from nnUNetv2"""
         # Find the encoder blocks (last conv layer in each block)
         encoder_layers = []
-        for module in model.modules():
+        for name, module in model.named_modules():
             if isinstance(module, torch.nn.Conv3d):
                 encoder_layers.append(module)
                 
