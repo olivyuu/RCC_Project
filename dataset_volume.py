@@ -55,7 +55,7 @@ class KiTS23VolumeDataset(Dataset):
                     try:
                         # Quick validation of saved volume
                         data = torch.load(output_file)
-                        if isinstance(data, tuple) and len(data) == 2:
+                        if isinstance(data, tuple) and len(data) == 3:  # Now expecting 3 elements (image, kidney_mask, tumor_mask)
                             print(f"Found valid preprocessed volume: {output_file}")
                             self.case_paths.append(case_path)
                             continue
@@ -103,16 +103,17 @@ class KiTS23VolumeDataset(Dataset):
         
         try:
             with gpu_memory_check() if self.debug_logger else nullcontext():
-                image, mask = torch.load(volume_file)
+                # Load image, kidney mask and tumor mask
+                image, kidney_mask, tumor_mask = torch.load(volume_file)
                 
                 if self.debug_logger:
-                    self.debug_logger.log_shapes("Loaded volume", image=image, mask=mask)
-                    self.debug_logger.log_stats("Volume stats", image=image, mask=mask)
+                    self.debug_logger.log_shapes("Loaded volume", image=image, kidney_mask=kidney_mask, tumor_mask=tumor_mask)
+                    self.debug_logger.log_stats("Volume stats", image=image, kidney_mask=kidney_mask, tumor_mask=tumor_mask)
                     
                     # Save detailed debug info for first batch
                     if idx == 0:
                         debug_data_sample(
-                            (image, mask),
+                            (image, kidney_mask, tumor_mask),
                             self.preprocessed_dir / "debug_samples"
                         )
             
@@ -122,22 +123,26 @@ class KiTS23VolumeDataset(Dataset):
                     self.debug_logger.log_memory("Before resizing")
                 
                 image = self._resize_volume(image, self.config.vol_max_dim)
-                mask = self._resize_volume(mask, self.config.vol_max_dim, mode='nearest')
+                kidney_mask = self._resize_volume(kidney_mask, self.config.vol_max_dim, mode='nearest')
+                tumor_mask = self._resize_volume(tumor_mask, self.config.vol_max_dim, mode='nearest')
                 
                 if self.debug_logger:
-                    self.debug_logger.log_shapes("After resize", image=image, mask=mask)
+                    self.debug_logger.log_shapes("After resize", image=image, kidney_mask=kidney_mask, tumor_mask=tumor_mask)
+            
+            # Concatenate image and kidney mask as input channels
+            model_input = torch.cat([image.unsqueeze(0), kidney_mask.unsqueeze(0)], dim=0)
             
             # Apply augmentations if in training mode
             if self.augmenter is not None:
-                image, mask = self.augmenter(image, mask)
+                model_input, tumor_mask = self.augmenter(model_input, tumor_mask)
             
-            return image, mask
+            return model_input, tumor_mask
             
         except Exception as e:
             print(f"Error loading volume {volume_file}: {e}")
             # Return a dummy volume in case of error
-            dummy_shape = (1,) + tuple(self.config.vol_max_dim)
-            return torch.zeros(dummy_shape), torch.zeros(dummy_shape)
+            dummy_shape = (2,) + tuple(self.config.vol_max_dim)  # 2 channels for input
+            return torch.zeros(dummy_shape), torch.zeros((1,) + tuple(self.config.vol_max_dim))
     
     @staticmethod
     def _resize_volume(volume: torch.Tensor, target_size: Tuple[int, int, int], mode='trilinear') -> torch.Tensor:
@@ -159,28 +164,28 @@ class KiTS23VolumeDataset(Dataset):
     @staticmethod
     def collate_fn(batch):
         """Custom collate function to handle variable sized volumes."""
-        images, masks = zip(*batch)
+        inputs, masks = zip(*batch)
         
         # Find maximum dimensions in the batch
-        max_shape = [max(s) for s in zip(*[img.shape[-3:] for img in images])]
+        max_shape = [max(s) for s in zip(*[img.shape[-3:] for img in inputs])]
         
         # Pad volumes to same size
-        padded_images = []
+        padded_inputs = []
         padded_masks = []
         
-        for img, msk in zip(images, masks):
+        for inp, msk in zip(inputs, masks):
             # Calculate padding
-            pad_size = [m - s for m, s in zip(max_shape, img.shape[-3:])]
+            pad_size = [m - s for m, s in zip(max_shape, inp.shape[-3:])]
             pad = []
             for p in reversed(pad_size):  # Reverse for pytorch padding format
                 pad.extend([0, p])
                 
             # Pad volumes
-            padded_images.append(torch.nn.functional.pad(img, pad))
+            padded_inputs.append(torch.nn.functional.pad(inp, pad))
             padded_masks.append(torch.nn.functional.pad(msk, pad))
         
         # Stack padded volumes
-        stacked_images = torch.stack(padded_images)
+        stacked_inputs = torch.stack(padded_inputs)
         stacked_masks = torch.stack(padded_masks)
         
-        return stacked_images, stacked_masks
+        return stacked_inputs, stacked_masks

@@ -10,7 +10,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from model import nnUNetv2
 from dataset_volume import KiTS23VolumeDataset
-from losses import DC_and_CE_loss
+from losses import DC_and_BCE_loss
 
 class nnUNetVolumeTrainer:
     def __init__(self, config, debug_logger=None):
@@ -29,10 +29,10 @@ class nnUNetVolumeTrainer:
         # Create checkpoint directory
         self.config.checkpoint_dir.mkdir(exist_ok=True)
         
-        # Initialize model
+        # Initialize model with 2 input channels
         self.model = nnUNetv2(
-            in_channels=config.in_channels,
-            out_channels=config.out_channels,
+            in_channels=2,  # Changed to 2 for image + kidney mask
+            out_channels=2,  # Binary segmentation (background, tumor)
             features=config.features
         ).to(self.device)
         
@@ -40,13 +40,30 @@ class nnUNetVolumeTrainer:
         if config.transfer_learning and config.patch_weights_path:
             self._load_patch_weights()
         
-        # Initialize training components
-        self.criterion = DC_and_CE_loss()
-        self.optimizer = torch.optim.Adam(
+        # Initialize training components with new combined loss
+        self.criterion = DC_and_BCE_loss(
+            weight_ce=1.0,
+            weight_dice=1.0,
+            weight_boundary=0.5,
+            weight_focal_tversky=0.5
+        )
+        
+        # Use AdamW optimizer for better weight decay handling
+        self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=config.initial_lr,
-            weight_decay=config.weight_decay
+            weight_decay=config.weight_decay,
+            betas=(0.9, 0.999)
         )
+        
+        # Learning rate scheduler
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            self.optimizer,
+            T_0=10,  # Restart every 10 epochs
+            T_mult=2,  # Double the restart interval after each restart
+            eta_min=1e-6  # Minimum learning rate
+        )
+        
         self.scaler = GradScaler()
         self.writer = SummaryWriter(f"runs/{config.experiment_name}_volume_fold_{config.fold}")
         
@@ -69,20 +86,31 @@ class nnUNetVolumeTrainer:
         print(f"Loading patch-trained weights from {self.config.patch_weights_path}")
         checkpoint = torch.load(self.config.patch_weights_path)
         
-        # Load only model weights, not optimizer state
+        # Handle different input channels
         if 'model_state_dict' in checkpoint:
-            self.model.load_state_dict(checkpoint['model_state_dict'])
+            state_dict = checkpoint['model_state_dict']
         else:
-            self.model.load_state_dict(checkpoint)
+            state_dict = checkpoint
+
+        # Modify first conv layer to accept 2 channels
+        old_conv = state_dict['down_blocks.0.conv_block.0.conv.weight']
+        new_conv = torch.zeros(old_conv.shape[0], 2, *old_conv.shape[2:])
+        new_conv[:, 0] = old_conv.squeeze(1)  # Copy weights for image channel
+        # Initialize kidney mask channel with mean of image channel weights
+        new_conv[:, 1] = old_conv.squeeze(1).mean(dim=0)
+        state_dict['down_blocks.0.conv_block.0.conv.weight'] = new_conv
+
+        # Load modified state dict
+        self.model.load_state_dict(state_dict, strict=False)
         
         if self.config.freeze_layers:
             self._freeze_early_layers()
     
     def _freeze_early_layers(self):
-        """Freeze early layers of the model for transfer learning."""
+        """Freeze early layers for transfer learning."""
         print("Freezing early layers for transfer learning")
         for name, param in self.model.named_parameters():
-            if 'encoder' in name:  # Freeze encoder layers
+            if 'down_blocks.0' in name or 'down_blocks.1' in name:  # Freeze first two encoder blocks
                 param.requires_grad = False
         self.frozen_layers = True
     
@@ -96,19 +124,13 @@ class nnUNetVolumeTrainer:
     def train(self, dataset_path: str):
         print("\nDebug: Initializing training...")
         print(f"Dataset path: {dataset_path}")
-        if hasattr(self, 'preprocessor'):
-            print("Debug: Preprocessor found in trainer")
-            print(f"Preprocessor methods: {[m for m in dir(self.preprocessor) if not m.startswith('__')]}")
-            print(f"Has preprocess_volume: {hasattr(self.preprocessor, 'preprocess_volume')}")
-        else:
-            print("Debug: No preprocessor found in trainer")
         
         # Create dataset
         print("\nDebug: Creating dataset...")
         dataset = KiTS23VolumeDataset(
             dataset_path,
             self.config,
-            preprocessor=self.preprocessor,  # Pass the preprocessor
+            preprocessor=self.preprocessor,
             train=True,
             preprocess=self.config.preprocess,
             debug=self.config.debug
@@ -123,11 +145,13 @@ class nnUNetVolumeTrainer:
             generator=torch.Generator().manual_seed(self.config.seed)
         )
         
-        # Create dataloaders
+        # Create dataloaders with weighted sampling for challenging cases
+        train_sampler = self._create_weighted_sampler(train_dataset)
+        
         train_loader = DataLoader(
             train_dataset,
             batch_size=self.config.vol_batch_size,
-            shuffle=True,
+            sampler=train_sampler,  # Use weighted sampler instead of shuffle
             num_workers=self.config.num_workers,
             pin_memory=True,
             collate_fn=KiTS23VolumeDataset.collate_fn
@@ -157,7 +181,7 @@ class nnUNetVolumeTrainer:
                 self.model.train()
                 train_loss = 0
                 train_dice = 0
-                self.optimizer.zero_grad()  # Zero gradients at start of epoch
+                self.optimizer.zero_grad()
                 
                 with tqdm(train_loader, desc=f"Epoch {epoch+1}/{self.config.num_epochs}") as pbar:
                     for batch_idx, (images, targets) in enumerate(pbar):
@@ -168,10 +192,19 @@ class nnUNetVolumeTrainer:
                         with autocast(enabled=self.config.use_amp):
                             outputs = self.model(images)
                             if isinstance(outputs, list):
-                                loss = self.criterion(outputs[0], targets)
-                                # Add deep supervision losses
-                                for aux_output in outputs[1:]:
-                                    loss += 0.4 * self.criterion(aux_output, targets)
+                                # Progressive learning with deep supervision
+                                loss = 0
+                                for idx, output in enumerate(outputs):
+                                    if idx == 0:
+                                        loss += self.criterion(output, targets)
+                                    else:
+                                        # Scale target to match deep supervision output size
+                                        scaled_target = F.interpolate(
+                                            targets.float(),
+                                            size=output.shape[2:],
+                                            mode='nearest'
+                                        )
+                                        loss += 0.5 * self.criterion(output, scaled_target)
                                 main_output = outputs[0]
                             else:
                                 loss = self.criterion(outputs, targets)
@@ -184,6 +217,10 @@ class nnUNetVolumeTrainer:
                         self.scaler.scale(loss).backward()
                         
                         if (batch_idx + 1) % self.config.vol_gradient_accumulation_steps == 0:
+                            # Gradient clipping
+                            self.scaler.unscale_(self.optimizer)
+                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                            
                             self.scaler.step(self.optimizer)
                             self.scaler.update()
                             self.optimizer.zero_grad()
@@ -195,8 +232,12 @@ class nnUNetVolumeTrainer:
                         
                         pbar.set_postfix({
                             'loss': loss.item() * self.config.vol_gradient_accumulation_steps,
-                            'dice': dice
+                            'dice': dice,
+                            'lr': self.optimizer.param_groups[0]['lr']
                         })
+                
+                # Update learning rate
+                self.scheduler.step()
                 
                 # Calculate epoch metrics
                 train_loss /= len(train_loader)
@@ -210,6 +251,7 @@ class nnUNetVolumeTrainer:
                 self.writer.add_scalar('Loss/val', val_loss, epoch)
                 self.writer.add_scalar('Dice/train', train_dice, epoch)
                 self.writer.add_scalar('Dice/val', val_dice, epoch)
+                self.writer.add_scalar('LR', self.optimizer.param_groups[0]['lr'], epoch)
                 
                 # Print epoch results
                 print(f"\nEpoch {epoch+1}/{self.config.num_epochs}")
@@ -246,6 +288,27 @@ class nnUNetVolumeTrainer:
         self.writer.close()
         print(f"Training completed! Best validation Dice: {self.best_val_dice:.4f}")
     
+    def _create_weighted_sampler(self, dataset):
+        """Create a weighted sampler to focus on challenging cases."""
+        weights = []
+        for idx in range(len(dataset)):
+            _, target = dataset[idx]
+            # Calculate weight based on tumor size
+            tumor_size = (target > 0).sum().item()
+            total_size = target.numel()
+            ratio = tumor_size / total_size
+            # Give higher weights to smaller tumors
+            weight = 1.0 / (ratio + 1e-5)
+            weights.append(weight)
+        
+        weights = torch.FloatTensor(weights)
+        sampler = torch.utils.data.WeightedRandomSampler(
+            weights,
+            len(weights),
+            replacement=True
+        )
+        return sampler
+    
     def _validate(self, val_loader):
         self.model.eval()
         val_loss = 0
@@ -270,7 +333,6 @@ class nnUNetVolumeTrainer:
         """Calculate Dice score."""
         # Ensure outputs and targets have same size
         if outputs.shape != targets.shape:
-            # Resize targets to match output size, shape difference is expected
             targets = torch.nn.functional.interpolate(
                 targets,
                 size=outputs.shape[-3:],
@@ -291,6 +353,7 @@ class nnUNetVolumeTrainer:
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
             'scaler_state_dict': self.scaler.state_dict(),
             'best_val_dice': self.best_val_dice,
             'patience_counter': self.patience_counter,
@@ -324,6 +387,7 @@ class nnUNetVolumeTrainer:
         
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
         self.start_epoch = checkpoint['epoch'] + 1
         self.best_val_dice = checkpoint['best_val_dice']
