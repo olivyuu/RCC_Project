@@ -26,8 +26,9 @@ class FullVolumeInference:
     def sliding_window_inference(self, 
                                volume: np.ndarray,
                                kidney_mask: Optional[np.ndarray] = None,
-                               window_size: Tuple[int, int, int] = (64, 128, 128),
-                               overlap: float = 0.5) -> Tuple[np.ndarray, np.ndarray]:
+                               window_size: Tuple[int, int, int] = (128, 256, 256),
+                               overlap: float = 0.75  # Increased overlap for larger windows
+                                ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Run inference on full volume using sliding window
         
