@@ -22,14 +22,9 @@ plt.style.use('dark_background')
 plt.rcParams['figure.dpi'] = 300
 plt.rcParams['figure.figsize'] = [20, 15]  # Made wider for 3 panels
 
-def load_model(checkpoint_path, device=None, debug=False):
+def load_model(checkpoint_path, debug=False):
     """Load the trained model from checkpoint"""
-    if device is None:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    # Override device if CUDA is requested but not available
-    if device == 'cuda' and not torch.cuda.is_available():
-        print("Warning: CUDA requested but not available. Falling back to CPU.")
-        device = 'cpu'
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     if debug:
         print(f"\nLoading model from: {checkpoint_path}")
@@ -212,7 +207,7 @@ def process_full_volume(model, device, case_path, output_dir, debug=False, save_
     
     try:
         # Check available GPU memory
-        if device == 'cuda' and debug:
+        if torch.cuda.is_available() and debug:
             print(f"\nInitial GPU memory: {torch.cuda.memory_allocated()/1e9:.2f}GB")
         
         # Initialize inference handler
@@ -394,15 +389,13 @@ def main():
                       help='Directory to save results')
     parser.add_argument('--debug', action='store_true',
                       help='Enable debug output')
-    parser.add_argument('--device', type=str, choices=['cuda', 'cpu'], default=None,
-                      help='Device to run on (cuda/cpu). Defaults to cuda if available.')
     
     args = parser.parse_args()
     
     try:
-        # Load model with specified device
+        # Load model
         print("\nInitializing...")
-        model, device = load_model(args.checkpoint, device=args.device, debug=args.debug)
+        model, device = load_model(args.checkpoint, args.debug)
         model.eval()
         
         if args.debug:
@@ -468,8 +461,7 @@ def main():
                     model, device, case_path, output_dir,
                     debug=args.debug, save_raw=args.save_raw
                 )
-                if device == 'cuda':
-                    torch.cuda.empty_cache()
+                torch.cuda.empty_cache()
             except Exception as e:
                 print(f"Error processing case {case_path.name}: {str(e)}")
                 if args.debug:
