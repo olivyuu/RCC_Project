@@ -22,9 +22,14 @@ plt.style.use('dark_background')
 plt.rcParams['figure.dpi'] = 300
 plt.rcParams['figure.figsize'] = [20, 15]  # Made wider for 3 panels
 
-def load_model(checkpoint_path, debug=False):
+def load_model(checkpoint_path, device=None, debug=False):
     """Load the trained model from checkpoint"""
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    if device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    # Override device if CUDA is requested but not available
+    if device == 'cuda' and not torch.cuda.is_available():
+        print("Warning: CUDA requested but not available. Falling back to CPU.")
+        device = 'cpu'
     
     if debug:
         print(f"\nLoading model from: {checkpoint_path}")
@@ -111,13 +116,13 @@ def visualize_results(img_slice, pred_slice, attn_slice, tumor_gt_slice, name, s
         
         # Add scale bar
         scalebar = AnchoredSizeBar(ax1.transData,
-                                 100/spacing[0],  # 10mm in pixels
-                                 '10 mm',
-                                 'lower right',
-                                 pad=0.5,
-                                 color='white',
-                                 frameon=False,
-                                 size_vertical=1)
+                                100/spacing[0],  # 10mm in pixels
+                                '10 mm',
+                                'lower right',
+                                pad=0.5,
+                                color='white',
+                                frameon=False,
+                                size_vertical=1)
         ax1.add_artist(scalebar)
         
         # Middle panel: Ground truth overlay
@@ -207,7 +212,7 @@ def process_full_volume(model, device, case_path, output_dir, debug=False, save_
     
     try:
         # Check available GPU memory
-        if torch.cuda.is_available() and debug:
+        if device == 'cuda' and debug:
             print(f"\nInitial GPU memory: {torch.cuda.memory_allocated()/1e9:.2f}GB")
         
         # Initialize inference handler
@@ -389,13 +394,15 @@ def main():
                       help='Directory to save results')
     parser.add_argument('--debug', action='store_true',
                       help='Enable debug output')
+    parser.add_argument('--device', type=str, choices=['cuda', 'cpu'], default=None,
+                      help='Device to run on (cuda/cpu). Defaults to cuda if available.')
     
     args = parser.parse_args()
     
     try:
-        # Load model
+        # Load model with specified device
         print("\nInitializing...")
-        model, device = load_model(args.checkpoint, args.debug)
+        model, device = load_model(args.checkpoint, device=args.device, debug=args.debug)
         model.eval()
         
         if args.debug:
@@ -461,10 +468,11 @@ def main():
                     model, device, case_path, output_dir,
                     debug=args.debug, save_raw=args.save_raw
                 )
-                torch.cuda.empty_cache()
+                if device == 'cuda':
+                    torch.cuda.empty_cache()
             except Exception as e:
                 print(f"Error processing case {case_path.name}: {str(e)}")
-                if args.debug:  # Fixed debug variable reference
+                if args.debug:
                     raise
                 continue
                 
