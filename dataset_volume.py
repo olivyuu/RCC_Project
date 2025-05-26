@@ -106,6 +106,11 @@ class KiTS23VolumeDataset(Dataset):
                 # Load image, kidney mask and tumor mask
                 image, kidney_mask, tumor_mask = torch.load(volume_file)
                 
+                # Remove any extra dimensions
+                image = image.squeeze()
+                kidney_mask = kidney_mask.squeeze()
+                tumor_mask = tumor_mask.squeeze()
+                
                 if self.debug_logger:
                     self.debug_logger.log_shapes("Loaded volume", image=image, kidney_mask=kidney_mask, tumor_mask=tumor_mask)
                     self.debug_logger.log_stats("Volume stats", image=image, kidney_mask=kidney_mask, tumor_mask=tumor_mask)
@@ -129,8 +134,16 @@ class KiTS23VolumeDataset(Dataset):
                 if self.debug_logger:
                     self.debug_logger.log_shapes("After resize", image=image, kidney_mask=kidney_mask, tumor_mask=tumor_mask)
             
+            # Add channel dimension if needed
+            if len(image.shape) == 3:
+                image = image.unsqueeze(0)
+            if len(kidney_mask.shape) == 3:
+                kidney_mask = kidney_mask.unsqueeze(0)
+            if len(tumor_mask.shape) == 3:
+                tumor_mask = tumor_mask.unsqueeze(0)
+            
             # Concatenate image and kidney mask as input channels
-            model_input = torch.cat([image.unsqueeze(0), kidney_mask.unsqueeze(0)], dim=0)
+            model_input = torch.cat([image, kidney_mask], dim=0)
             
             # Apply augmentations if in training mode
             if self.augmenter is not None:
