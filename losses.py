@@ -48,13 +48,16 @@ class BoundaryLoss(nn.Module):
 
     def _compute_gradient(self, x):
         print(f"Computing gradient for shape: {x.shape}")
-        # Compute gradients in xyz directions with proper padding
-        grad_x = torch.abs(F.conv3d(F.pad(x, (1, 1, 0, 0, 0, 0), mode='replicate'), 
-                                  self._get_sobel_kernel('x').to(x.device)))
-        grad_y = torch.abs(F.conv3d(F.pad(x, (0, 0, 1, 1, 0, 0), mode='replicate'), 
-                                  self._get_sobel_kernel('y').to(x.device)))
-        grad_z = torch.abs(F.conv3d(F.pad(x, (0, 0, 0, 0, 1, 1), mode='replicate'), 
-                                  self._get_sobel_kernel('z').to(x.device)))
+        
+        # Apply padding first to ensure consistent output size
+        padded = F.pad(x, (1, 1, 1, 1, 1, 1), mode='replicate')
+        print(f"After padding shape: {padded.shape}")
+        
+        # Compute gradients in xyz directions
+        grad_x = torch.abs(F.conv3d(padded[:, :, :, 1:-1, 1:-1], self._get_sobel_kernel('x').to(x.device)))
+        grad_y = torch.abs(F.conv3d(padded[:, :, :, 1:-1, 1:-1], self._get_sobel_kernel('y').to(x.device)))
+        grad_z = torch.abs(F.conv3d(padded[:, :, :, 1:-1, 1:-1], self._get_sobel_kernel('z').to(x.device)))
+        
         print(f"Gradient components - x: {grad_x.shape}, y: {grad_y.shape}, z: {grad_z.shape}")
         
         grad = (grad_x + grad_y + grad_z) / 3.0
@@ -70,16 +73,16 @@ class BoundaryLoss(nn.Module):
             kernel = torch.tensor([[[1, 2, 1],
                                   [0, 0, 0],
                                   [-1, -2, -1]]])
-        else:  # z direction
-            kernel = torch.tensor([[[1, 2, 1],
-                                  [2, 4, 2],
-                                  [1, 2, 1]],
-                                 [[0, 0, 0],
-                                  [0, 0, 0],
+        else:  # z direction, make sure it's properly 3D
+            kernel = torch.tensor([[[0, 0, 0],
+                                  [0, 1, 0],
                                   [0, 0, 0]],
-                                 [[-1, -2, -1],
-                                  [-2, -4, -2],
-                                  [-1, -2, -1]]])
+                                 [[0, 1, 0],
+                                  [1, 2, 1],
+                                  [0, 1, 0]],
+                                 [[0, 0, 0],
+                                  [0, -1, 0],
+                                  [0, 0, 0]]])
         return kernel.unsqueeze(0).unsqueeze(0).float()
 
 class FocalTverskyLoss(nn.Module):
