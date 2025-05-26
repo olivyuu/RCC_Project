@@ -30,6 +30,11 @@ class BoundaryLoss(nn.Module):
             target = target.unsqueeze(1)
             
         target = (target > 0).float()
+        
+        # Interpolate pred to match target size
+        if pred.shape[-3:] != target.shape[-3:]:
+            pred = F.interpolate(pred, size=target.shape[-3:], mode='trilinear', align_corners=False)
+            
         print(f"Processed shapes - pred: {pred.shape}, target: {target.shape}")
         
         # Calculate gradients
@@ -43,12 +48,18 @@ class BoundaryLoss(nn.Module):
 
     def _compute_gradient(self, x):
         print(f"Computing gradient for shape: {x.shape}")
-        # Compute gradients in xyz directions with padding
-        grad_x = torch.abs(F.conv3d(x, self._get_sobel_kernel('x').to(x.device), padding=1))
-        grad_y = torch.abs(F.conv3d(x, self._get_sobel_kernel('y').to(x.device), padding=1))
-        grad_z = torch.abs(F.conv3d(x, self._get_sobel_kernel('z').to(x.device), padding=1))
+        # Compute gradients in xyz directions with proper padding
+        grad_x = torch.abs(F.conv3d(F.pad(x, (1, 1, 0, 0, 0, 0), mode='replicate'), 
+                                  self._get_sobel_kernel('x').to(x.device)))
+        grad_y = torch.abs(F.conv3d(F.pad(x, (0, 0, 1, 1, 0, 0), mode='replicate'), 
+                                  self._get_sobel_kernel('y').to(x.device)))
+        grad_z = torch.abs(F.conv3d(F.pad(x, (0, 0, 0, 0, 1, 1), mode='replicate'), 
+                                  self._get_sobel_kernel('z').to(x.device)))
         print(f"Gradient components - x: {grad_x.shape}, y: {grad_y.shape}, z: {grad_z.shape}")
-        return (grad_x + grad_y + grad_z) / 3.0
+        
+        grad = (grad_x + grad_y + grad_z) / 3.0
+        print(f"Combined gradient shape: {grad.shape}")
+        return grad
 
     def _get_sobel_kernel(self, direction):
         if direction == 'x':
@@ -151,7 +162,6 @@ class DC_and_BCE_loss(nn.Module):
                  
         return result
 
-# Keep existing RobustCrossEntropyLoss and SoftDiceLoss classes unchanged
 class RobustCrossEntropyLoss(nn.Module):
     def __init__(self, reduction='none'):
         super().__init__()
