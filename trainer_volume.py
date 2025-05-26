@@ -15,15 +15,12 @@ from losses import DC_and_BCE_loss
 
 class nnUNetVolumeTrainer:
     def __init__(self, config, debug_logger=None):
-        print("\nDebug: Initializing trainer...")
         self.config = config
         self.debug_logger = debug_logger
 
         # Initialize preprocessor early
-        print("Debug: Creating preprocessor instance")
         from preprocessing.preprocessor import KiTS23Preprocessor
         self.preprocessor = KiTS23Preprocessor(config)
-        print(f"Debug: Preprocessor methods: {[m for m in dir(self.preprocessor) if not m.startswith('__')]}")
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
         
@@ -42,12 +39,7 @@ class nnUNetVolumeTrainer:
             self._load_patch_weights()
         
         # Initialize training components with new combined loss
-        self.criterion = DC_and_BCE_loss(
-            weight_ce=1.0,
-            weight_dice=1.0,
-            weight_boundary=0.5,
-            weight_focal_tversky=0.5
-        )
+        self.criterion = DC_and_BCE_loss()
         
         # Use AdamW optimizer for better weight decay handling
         self.optimizer = torch.optim.AdamW(
@@ -123,11 +115,7 @@ class nnUNetVolumeTrainer:
         self.frozen_layers = False
     
     def train(self, dataset_path: str):
-        print("\nDebug: Initializing training...")
-        print(f"Dataset path: {dataset_path}")
-        
         # Create dataset
-        print("\nDebug: Creating dataset...")
         dataset = KiTS23VolumeDataset(
             dataset_path,
             self.config,
