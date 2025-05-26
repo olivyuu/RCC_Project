@@ -16,19 +16,20 @@ from mpl_toolkits.axes_grid1.anchored_artists import AnchoredSizeBar
 import matplotlib.font_manager as fm
 import glob
 import traceback
+from tools.debug_utils import DebugLogger, validate_volume_shapes, gpu_memory_check, force_cuda_sync
 
 # Set up matplotlib for high quality medical visualization
 plt.style.use('dark_background')
 plt.rcParams['figure.dpi'] = 300
 plt.rcParams['figure.figsize'] = [20, 15]  # Made wider for 3 panels
 
-def load_model(checkpoint_path, debug=False):
+def load_model(checkpoint_path, debug=False, debug_logger=None):
     """Load the trained model from checkpoint"""
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
-    if debug:
-        print(f"\nLoading model from: {checkpoint_path}")
-        print(f"Using device: {device}")
+    if debug_logger:
+        debug_logger.logger.info(f"\nLoading model from: {checkpoint_path}")
+        debug_logger.logger.info(f"Using device: {device}")
     
     # Initialize model
     config = nnUNetConfig()
@@ -39,66 +40,76 @@ def load_model(checkpoint_path, debug=False):
     )
     
     try:
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        if 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'])
-        else:
-            model.load_state_dict(checkpoint)
-        if debug:
-            print("Model loaded successfully")
+        with gpu_memory_check():
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            if 'model_state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['model_state_dict'])
+            else:
+                model.load_state_dict(checkpoint)
+            if debug_logger:
+                debug_logger.logger.info("Model loaded successfully")
+                debug_logger.log_memory("After model load")
     except Exception as e:
-        print(f"Error loading model: {str(e)}")
+        if debug_logger:
+            debug_logger.logger.error(f"Error loading model: {str(e)}")
         raise
         
     return model.to(device), device
 
-def debug_model_output(model, dummy_input, checkpoint_path=None):
+def debug_model_output(model, dummy_input, checkpoint_path=None, debug_logger=None):
     """Debug model's forward pass"""
-    print("\nDebugging model output:")
+    if debug_logger:
+        debug_logger.logger.info("\nDebugging model output:")
     try:
         # Check model architecture
-        print("\nModel architecture:")
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"Total parameters: {total_params:,}")
-        print(f"Trainable parameters: {trainable_params:,}")
+        if debug_logger:
+            debug_logger.logger.info(f"Total parameters: {total_params:,}")
+            debug_logger.logger.info(f"Trainable parameters: {trainable_params:,}")
         
         if checkpoint_path:
             checkpoint_size = Path(checkpoint_path).stat().st_size / (1024 * 1024)
-            print(f"Checkpoint size: {checkpoint_size:.2f}MB")
+            if debug_logger:
+                debug_logger.logger.info(f"Checkpoint size: {checkpoint_size:.2f}MB")
         
         # Test forward pass
-        print("\nTesting forward pass:")
-        print(f"Input shape: {dummy_input.shape}")
-        print(f"Input range: [{dummy_input.min():.2f}, {dummy_input.max():.2f}]")
+        if debug_logger:
+            debug_logger.logger.info("\nTesting forward pass:")
+            debug_logger.log_shapes("Input", input=dummy_input)
+            debug_logger.log_stats("Input", input=dummy_input)
         
-        with torch.cuda.amp.autocast(enabled=True):
-            output = model(dummy_input)
+        with gpu_memory_check():
+            with torch.cuda.amp.autocast(enabled=True):
+                output = model(dummy_input)
         
         if isinstance(output, list):
-            print(f"Output is a list of {len(output)} tensors")
-            for i, out in enumerate(output):
-                print(f"Output[{i}] shape: {out.shape}")
-                print(f"Output[{i}] range: [{out.min().item():.2f}, {out.max().item():.2f}]")
+            if debug_logger:
+                debug_logger.logger.info(f"Output is a list of {len(output)} tensors")
+                for i, out in enumerate(output):
+                    debug_logger.log_shapes(f"Output[{i}]", output=out)
+                    debug_logger.log_stats(f"Output[{i}]", output=out)
         else:
-            print(f"Output shape: {output.shape}")
-            print(f"Output range: [{output.min().item():.2f}, {output.max().item():.2f}]")
+            if debug_logger:
+                debug_logger.log_shapes("Output", output=output)
+                debug_logger.log_stats("Output", output=output)
             
     except Exception as e:
-        print(f"Error in model debugging: {str(e)}")
+        if debug_logger:
+            debug_logger.logger.error(f"Error in model debugging: {str(e)}")
         raise
 
-def visualize_results(img_slice, pred_slice, attn_slice, tumor_gt_slice, name, save_path, save_raw=False, spacing=(1.0, 1.0), debug=False):
+def visualize_results(img_slice, pred_slice, attn_slice, tumor_gt_slice, name, save_path, save_raw=False, spacing=(1.0, 1.0), debug=False, debug_logger=None):
     """Create and save clinically-relevant visualization of results"""
     try:
-        if debug:
-            print(f"\nInput shapes:")
-            print(f"Image: {img_slice.shape}, Range: [{img_slice.min():.2f}, {img_slice.max():.2f}]")
-            print(f"Predictions: {pred_slice.shape}, Range: [{pred_slice.min():.2f}, {pred_slice.max():.2f}]")
-            print(f"Attention: {attn_slice.shape}, Range: [{attn_slice.min():.2f}, {attn_slice.max():.2f}]")
+        if debug_logger:
+            debug_logger.logger.debug(f"\nVisualizing {name}:")
+            debug_logger.log_stats("Input arrays",
+                                 image=torch.tensor(img_slice),
+                                 pred=torch.tensor(pred_slice),
+                                 attn=torch.tensor(attn_slice))
             if tumor_gt_slice is not None:
-                print(f"Ground Truth: {tumor_gt_slice.shape}, Range: [{tumor_gt_slice.min():.2f}, {tumor_gt_slice.max():.2f}]")
-            print(f"Spacing: {spacing}")
+                debug_logger.log_stats("Ground Truth", gt=torch.tensor(tumor_gt_slice))
             
         # Create figure with three side-by-side panels
         fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 7))
@@ -138,6 +149,11 @@ def visualize_results(img_slice, pred_slice, attn_slice, tumor_gt_slice, name, s
         # Create weighted heatmap combining attention and probability
         combined_heatmap = attn_norm * pred_slice
         combined_heatmap = np.clip(combined_heatmap, 0, 1)
+
+        if debug_logger:
+            debug_logger.log_stats("Heatmap", 
+                                 attn_norm=torch.tensor(attn_norm),
+                                 combined=torch.tensor(combined_heatmap))
         
         # Display heatmap
         heatmap = ax3.imshow(combined_heatmap, 
@@ -153,13 +169,12 @@ def visualize_results(img_slice, pred_slice, attn_slice, tumor_gt_slice, name, s
         # Add probability annotations for high confidence predictions
         try:
             high_prob_threshold = 0.75
-            if debug:
-                print("\nFinding peaks:")
-                print(f"Combined heatmap range: [{combined_heatmap.min():.2f}, {combined_heatmap.max():.2f}]")
+            if debug_logger:
+                debug_logger.logger.debug("\nFinding peaks:")
+                debug_logger.logger.debug(f"Combined heatmap range: [{combined_heatmap.min():.2f}, {combined_heatmap.max():.2f}]")
             
             # Ensure input is properly formatted for peak_local_max
             combined_heatmap = combined_heatmap.astype(np.float64)
-            # Use absolute threshold instead of relative
             threshold_abs = high_prob_threshold * combined_heatmap.max()
             peak_coords = skimage.feature.peak_local_max(
                 combined_heatmap,
@@ -168,10 +183,8 @@ def visualize_results(img_slice, pred_slice, attn_slice, tumor_gt_slice, name, s
                 exclude_border=False
             )
             
-            if debug:
-                print(f"Input range for peak detection: [{combined_heatmap.min():.3f}, {combined_heatmap.max():.3f}]")
-                print(f"Absolute threshold: {threshold_abs:.3f}")
-                print(f"Found {len(peak_coords)} peaks above threshold {high_prob_threshold}")
+            if debug_logger:
+                debug_logger.logger.debug(f"Found {len(peak_coords)} peaks above threshold {high_prob_threshold}")
                 
             for y, x in peak_coords:
                 if pred_slice[y, x] > high_prob_threshold:
@@ -181,7 +194,8 @@ def visualize_results(img_slice, pred_slice, attn_slice, tumor_gt_slice, name, s
                             bbox=dict(facecolor='black', alpha=0.5, pad=1))
                             
         except Exception as e:
-            print(f"Warning: Peak detection failed: {str(e)}")
+            if debug_logger:
+                debug_logger.logger.warning(f"Peak detection failed: {str(e)}")
         
         # Save visualization
         plt.tight_layout()
@@ -198,26 +212,28 @@ def visualize_results(img_slice, pred_slice, attn_slice, tumor_gt_slice, name, s
                 np.save(save_path / 'ground_truth.npy', tumor_gt_slice)
             
     except Exception as e:
-        print(f"Error in visualization: {str(e)}")
+        if debug_logger:
+            debug_logger.logger.error(f"Error in visualization: {str(e)}")
         raise
 
-def process_full_volume(model, device, case_path, output_dir, debug=False, save_raw=False, spacing=None):
+def process_full_volume(model, device, case_path, output_dir, debug=False, save_raw=False, spacing=None, debug_logger=None):
     """Process a full volume with Grad-CAM"""
-    print(f"\nProcessing case: {case_path.name}")
+    if debug_logger:
+        debug_logger.logger.info(f"\nProcessing case: {case_path.name}")
     
     try:
         # Check available GPU memory
-        if torch.cuda.is_available() and debug:
-            print(f"\nInitial GPU memory: {torch.cuda.memory_allocated()/1e9:.2f}GB")
+        if torch.cuda.is_available() and debug_logger:
+            debug_logger.log_memory("Initial state")
         
         # Initialize inference handler
-        if debug:
-            print("Initializing FullVolumeInference...")
+        if debug_logger:
+            debug_logger.logger.debug("Initializing FullVolumeInference...")
         full_volume_handler = FullVolumeInference(model, config=None)  # Config not needed for inference
         
         # Initialize kidney segmentor
-        if debug:
-            print("Initializing KidneySegmentor...")
+        if debug_logger:
+            debug_logger.logger.debug("Initializing KidneySegmentor...")
         kidney_segmentor = KidneySegmentor(debug=debug)
         
         # Load image with spacing information
@@ -231,11 +247,12 @@ def process_full_volume(model, device, case_path, output_dir, debug=False, save_
         try:
             img_obj = nib.load(str(img_path))
             volume = img_obj.get_fdata()
-            if debug:
-                print(f"Loaded volume shape: {volume.shape}")
-                print(f"Volume range: [{volume.min():.2f}, {volume.max():.2f}]")
+            if debug_logger:
+                debug_logger.logger.debug(f"Loaded volume shape: {volume.shape}")
+                debug_logger.log_stats("Volume", volume=torch.tensor(volume))
         except Exception as e:
-            print(f"Error loading NIFTI file: {str(e)}")
+            if debug_logger:
+                debug_logger.logger.error(f"Error loading NIFTI file: {str(e)}")
             raise
             
         # Load tumor ground truth from instance files
@@ -248,56 +265,66 @@ def process_full_volume(model, device, case_path, output_dir, debug=False, save_
                 
                 # Look for all tumor instance files
                 for tumor_file in instances_dir.glob("tumor_instance-*_annotation-*.nii.gz"):
-                    if debug:
-                        print(f"Loading tumor instance: {tumor_file.name}")
+                    if debug_logger:
+                        debug_logger.logger.debug(f"Loading tumor instance: {tumor_file.name}")
                     instance_mask = nib.load(str(tumor_file)).get_fdata()
                     # Add to combined mask (any non-zero value indicates tumor)
                     tumor_gt[instance_mask > 0] = 1
                     
-                if debug:
+                if debug_logger:
                     if np.any(tumor_gt):
-                        print(f"Loaded tumor ground truth:")
-                        print(f"  Shape: {tumor_gt.shape}")
-                        print(f"  Tumor voxels: {np.count_nonzero(tumor_gt)}")
+                        debug_logger.logger.debug("Tumor ground truth loaded:")
+                        debug_logger.log_stats("Ground Truth", gt=torch.tensor(tumor_gt))
                         tumor_locations = np.where(tumor_gt > 0)
-                        print(f"  Tumor extent: z={min(tumor_locations[0])}-{max(tumor_locations[0])}, "
-                              f"y={min(tumor_locations[1])}-{max(tumor_locations[1])}, "
-                              f"x={min(tumor_locations[2])}-{max(tumor_locations[2])}")
+                        debug_logger.logger.debug(
+                            f"Tumor extent: z={min(tumor_locations[0])}-{max(tumor_locations[0])}, "
+                            f"y={min(tumor_locations[1])}-{max(tumor_locations[1])}, "
+                            f"x={min(tumor_locations[2])}-{max(tumor_locations[2])}"
+                        )
                     else:
-                        print("No tumor instances found in ground truth")
+                        debug_logger.logger.debug("No tumor instances found in ground truth")
                         
         except Exception as e:
-            print(f"Error loading ground truth: {str(e)}")
+            if debug_logger:
+                debug_logger.logger.error(f"Error loading ground truth: {str(e)}")
             tumor_gt = None
         
         # Get voxel spacing
         try:
             spacing = img_obj.header.get_zooms()
-            if debug:
-                print(f"Voxel spacing (mm): {spacing}")
+            if debug_logger:
+                debug_logger.logger.debug(f"Voxel spacing (mm): {spacing}")
         except:
             spacing = (1.0, 1.0, 1.0)
             
         # Get kidney segmentation
-        if debug:
-            print("Generating kidney segmentation...")
+        if debug_logger:
+            debug_logger.logger.debug("Generating kidney segmentation...")
         kidney_mask = kidney_segmentor.get_kidney_mask(img_path, case_path.name)
         
         if kidney_mask is None:
-            print("Warning: Failed to generate kidney mask, proceeding without anatomical constraints")
-        elif debug:
-            print(f"Kidney mask shape: {kidney_mask.shape}")
-            print(f"Kidney mask range: [{kidney_mask.min():.2f}, {kidney_mask.max():.2f}]")
+            if debug_logger:
+                debug_logger.logger.warning("Failed to generate kidney mask, proceeding without anatomical constraints")
+        elif debug_logger:
+            debug_logger.log_stats("Kidney Mask", mask=torch.tensor(kidney_mask))
         
         # Run inference
-        if debug:
-            print("Running inference...")
-        predictions, attention_maps = full_volume_handler.sliding_window_inference(volume, kidney_mask)
+        if debug_logger:
+            debug_logger.logger.debug("Running inference...")
+            force_cuda_sync()  # Ensure clean memory state
+            
+        with gpu_memory_check():
+            predictions, attention_maps = full_volume_handler.sliding_window_inference(volume, kidney_mask)
+            force_cuda_sync()  # Ensure inference is complete
         
-        if debug:
-            print(f"Volume shape: {volume.shape}")
-            print(f"Predictions shape: {predictions.shape}")
-            print(f"Attention maps shape: {attention_maps.shape}")
+        if debug_logger:
+            debug_logger.log_shapes("Inference results",
+                                  volume=torch.tensor(volume),
+                                  predictions=torch.tensor(predictions),
+                                  attention=torch.tensor(attention_maps))
+            debug_logger.log_stats("Predictions",
+                                 predictions=torch.tensor(predictions),
+                                 attention=torch.tensor(attention_maps))
         
         # Create output directory
         volume_dir = output_dir / case_path.name / 'full_volume'
@@ -310,10 +337,15 @@ def process_full_volume(model, device, case_path, output_dir, debug=False, save_
             'Coronal': full_volume_handler._find_high_prob_slices(predictions, axis=2)
         }
         
+        if debug_logger:
+            debug_logger.logger.debug("\nHigh probability slice indices:")
+            for view, indices in slice_indices.items():
+                debug_logger.logger.debug(f"{view}: {indices}")
+        
         # Create visualizations for each view
         for axis, name in enumerate(['Axial', 'Sagittal', 'Coronal']):
-            if debug:
-                print(f"\nProcessing {name} view slices...")
+            if debug_logger:
+                debug_logger.logger.debug(f"\nProcessing {name} view slices...")
                 
             for slice_idx in slice_indices[name]:
                 try:
@@ -337,15 +369,13 @@ def process_full_volume(model, device, case_path, output_dir, debug=False, save_
                         tumor_gt_slice = tumor_gt[:, :, slice_idx] if tumor_gt is not None else None
                         current_spacing = spacing[:2]
                         
-                    if debug:
-                        print(f"\nSlice shapes for {name} view, slice {slice_idx}:")
-                        print(f"Image: {img_slice.shape}")
-                        print(f"Prediction: {pred_slice.shape}")
-                        print(f"Attention: {attn_slice.shape}")
-                        if tumor_gt_slice is not None:
-                            print(f"Ground Truth: {tumor_gt_slice.shape}")
-                            if np.any(tumor_gt_slice):
-                                print(f"Tumor present in slice")
+                    if debug_logger:
+                        debug_logger.logger.debug(f"\nProcessing {name} view, slice {slice_idx}")
+                        debug_logger.log_shapes("Slice data",
+                                             image=torch.tensor(img_slice),
+                                             pred=torch.tensor(pred_slice),
+                                             attn=torch.tensor(attn_slice),
+                                             gt=torch.tensor(tumor_gt_slice) if tumor_gt_slice is not None else None)
                         
                     # Create slice-specific directory
                     slice_dir = volume_dir / f'{name.lower()}_slice_{slice_idx}'
@@ -357,24 +387,24 @@ def process_full_volume(model, device, case_path, output_dir, debug=False, save_
                         f'{name} View - Slice {slice_idx}',
                         slice_dir, save_raw,
                         spacing=current_spacing,
-                        debug=debug
+                        debug=debug,
+                        debug_logger=debug_logger
                     )
                     
                 except Exception as e:
-                    print(f"Error processing slice {slice_idx}: {str(e)}")
-                    if debug:
-                        import traceback
-                        print(traceback.format_exc())
+                    if debug_logger:
+                        debug_logger.logger.error(f"Error processing slice {slice_idx}: {str(e)}")
+                        debug_logger.logger.error(traceback.format_exc())
                     continue
                 
-        if debug:
-            print("Processing complete")
+        if debug_logger:
+            debug_logger.logger.info("Processing complete")
+            debug_logger.log_memory("Final state")
             
     except Exception as e:
-        print(f"Error processing case {case_path.name}: {str(e)}")
-        if debug:
-            import traceback
-            print(traceback.format_exc())
+        if debug_logger:
+            debug_logger.logger.error(f"Error processing case {case_path.name}: {str(e)}")
+            debug_logger.logger.error(traceback.format_exc())
         raise
 
 def main():
@@ -393,86 +423,55 @@ def main():
     args = parser.parse_args()
     
     try:
-        # Load model
-        print("\nInitializing...")
-        model, device = load_model(args.checkpoint, args.debug)
-        model.eval()
-        
-        if args.debug:
-            # Test with dummy input
-            dummy_input = torch.randn(1, 1, 64, 128, 128).to(device)
-            debug_model_output(model, dummy_input, args.checkpoint)
-        
-        # Create output directory
+        checkpoint_path = Path(args.checkpoint)
         output_dir = Path(args.output_dir)
         output_dir.mkdir(exist_ok=True, parents=True)
+
+        # Initialize debug logger
+        debug_logger = DebugLogger(output_dir, debug=args.debug) if args.debug else None
         
-        # Get case list and verify data
-        data_dir = Path("/workspace/kits23/dataset")  # Direct path to KiTS23 dataset
+        # Load model
+        model, device = load_model(checkpoint_path, args.debug, debug_logger)
+        model.eval()
         
-        if not data_dir.exists():
-            raise ValueError(f"Data directory not found: {data_dir}")
-            
-        # Find all available cases
-        all_cases = []
-        for case_dir in sorted(data_dir.iterdir()):
-            if not case_dir.is_dir() or not case_dir.name.startswith('case_'):
-                continue
-            
-            # Check for imaging file
-            has_imaging = False
-            for img_path in [case_dir / "imaging.nii.gz", 
-                           case_dir / "raw_data" / "imaging.nii.gz"]:
-                if img_path.exists():
-                    has_imaging = True
-                    if args.debug:
-                        print(f"Found case: {case_dir.name}")
-                        print(f"  Imaging file: {img_path}")
-                        # Check for tumor instances
-                        instances_dir = case_dir / "instances"
-                        if instances_dir.exists():
-                            tumor_files = list(instances_dir.glob("tumor_instance-*.nii.gz"))
-                            if tumor_files:
-                                print(f"  Found {len(tumor_files)} tumor instances")
-                    break
-            
-            if has_imaging:
-                all_cases.append(case_dir)
-        
-        if not all_cases:
-            raise ValueError(f"No valid cases found in {data_dir}")
-            
+        # Debug model
         if args.debug:
-            print(f"\nData directory: {data_dir}")
-            print(f"Total cases found: {len(all_cases)}")
-            
-        # Randomly select cases
-        selected_cases = random.sample(all_cases, min(args.cases, len(all_cases)))
+            dummy_input = torch.randn(1, 2, 128, 256, 256).to(device)
+            try:
+                validate_volume_shapes(dummy_input)
+            except ValueError as e:
+                if debug_logger:
+                    debug_logger.logger.error(f"Volume shape validation failed: {str(e)}")
+                raise
+            debug_model_output(model, dummy_input, checkpoint_path, debug_logger)
         
-        if args.debug:
-            print(f"\nSelected cases: {[case.name for case in selected_cases]}")
-            print(f"Running with {'debug enabled' if args.debug else 'debug disabled'}")
+        # Process cases
+        kits_dir = Path("/workspace/kits23/dataset")
+        all_cases = sorted([d for d in kits_dir.glob("case_*") if d.is_dir()])
+        
+        # Select random subset if needed
+        if 0 < args.cases < len(all_cases):
+            selected_cases = random.sample(all_cases, args.cases)
+        else:
+            selected_cases = all_cases[:args.cases]
             
         # Process each case
-        for i, case_path in enumerate(selected_cases, 1):
-            print(f"\nProcessing case {i}/{len(selected_cases)}: {case_path.name}")
-            try:
-                process_full_volume(
-                    model, device, case_path, output_dir,
-                    debug=args.debug, save_raw=args.save_raw
-                )
-                torch.cuda.empty_cache()
-            except Exception as e:
-                print(f"Error processing case {case_path.name}: {str(e)}")
-                if args.debug:
-                    raise
-                continue
-                
-        print("\nProcessing complete!")
-        
+        for case_path in tqdm(selected_cases, desc="Processing cases"):
+            process_full_volume(
+                model, device, case_path, output_dir,
+                debug=args.debug, save_raw=args.save_raw,
+                debug_logger=debug_logger
+            )
+            
     except Exception as e:
-        print(f"\nError in main execution: {str(e)}")
+        if debug_logger:
+            debug_logger.logger.error(f"Error in main: {str(e)}")
+            debug_logger.logger.error(traceback.format_exc())
         raise
+        
+    finally:
+        if debug_logger:
+            debug_logger.log_memory("Program end")
 
 if __name__ == '__main__':
     main()
