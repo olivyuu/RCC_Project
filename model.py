@@ -67,11 +67,11 @@ class DownBlock(nn.Module):
 class UpBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
-        self.upconv = nn.ConvTranspose3d(in_channels, out_channels, 
+        self.upconv = nn.ConvTranspose3d(in_channels, in_channels//2, 
                                         kernel_size=2, stride=2)
-        self.attention_gate = AttentionGate(F_g=in_channels, F_l=out_channels, F_int=out_channels//2)
+        self.attention_gate = AttentionGate(F_g=in_channels//2, F_l=out_channels, F_int=out_channels//2)
         self.conv_block = nn.Sequential(
-            ConvDropoutNormNonlin(in_channels + out_channels, out_channels),
+            ConvDropoutNormNonlin(in_channels//2 + out_channels, out_channels),
             ConvDropoutNormNonlin(out_channels, out_channels)
         )
         self.channel_attention = ChannelAttention(out_channels)
@@ -129,7 +129,7 @@ class DeepSupervisionHead(nn.Module):
 
 class nnUNetv2(nn.Module):
     def __init__(self, in_channels=2, out_channels=2, 
-                 features=(32, 64, 128, 256, 320)):
+                 features=(32, 64, 128, 256, 512)):  # Modified feature dimensions
         super().__init__()
         
         # Encoder

@@ -9,7 +9,7 @@ preprocessed_dir: "preprocessed_volumes"
 # Model parameters
 in_channels: 1
 out_channels: 2
-features: [32, 64, 128, 256, 320]
+features: [32, 64, 128, 256, 512]
 
 # Volume training parameters
 vol_batch_size: 1
