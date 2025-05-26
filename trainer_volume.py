@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler, autocast
 from pathlib import Path
@@ -333,8 +334,8 @@ class nnUNetVolumeTrainer:
         """Calculate Dice score."""
         # Ensure outputs and targets have same size
         if outputs.shape != targets.shape:
-            targets = torch.nn.functional.interpolate(
-                targets,
+            targets = F.interpolate(
+                targets.float(),
                 size=outputs.shape[-3:],
                 mode='nearest'
             )
