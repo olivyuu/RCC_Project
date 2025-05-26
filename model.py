@@ -6,14 +6,18 @@ class ConvDropoutNormNonlin(nn.Module):
     def __init__(self, in_channels, out_channels, 
                  conv_op=nn.Conv3d, norm_op=nn.InstanceNorm3d):
         super().__init__()
+        print(f"Creating ConvDropoutNormNonlin with in_channels={in_channels}, out_channels={out_channels}")
         self.conv = conv_op(in_channels, out_channels, 3, padding=1)
         self.norm = norm_op(out_channels)
         self.nonlin = nn.LeakyReLU(inplace=True)
         self.dropout = nn.Dropout3d(p=0.1)
 
     def forward(self, x):
+        print(f"ConvDropoutNormNonlin input shape: {x.shape}")
         x = self.conv(x)
+        print(f"After conv shape: {x.shape}")
         x = self.norm(x)
+        print(f"After norm shape: {x.shape}")
         x = self.nonlin(x)
         x = self.dropout(x)
         return x
@@ -67,7 +71,7 @@ class DownBlock(nn.Module):
 class UpBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
-        print(f"Creating UpBlock with in_channels={in_channels}, out_channels={out_channels}")
+        print(f"\nCreating UpBlock with in_channels={in_channels}, out_channels={out_channels}")
         
         # Keep original upconv behavior that matches checkpoint
         self.upconv = nn.ConvTranspose3d(in_channels, out_channels, 
@@ -91,7 +95,10 @@ class UpBlock(nn.Module):
         else:
             concat_channels = out_channels * 2  # Fallback
             
-        print(f"UpBlock concat_channels={concat_channels}")
+        # Add expansion layer to match checkpoint dimensions after concatenation
+        self.expand_concat = nn.Conv3d(out_channels * 2, concat_channels, kernel_size=1)
+            
+        print(f"UpBlock target concat_channels={concat_channels}")
         
         self.conv_block = nn.Sequential(
             ConvDropoutNormNonlin(concat_channels, out_channels),
@@ -123,7 +130,11 @@ class UpBlock(nn.Module):
         
         # Concatenate skip connection
         x = torch.cat((skip, x), dim=1)
-        print(f"After concatenation shape: {x.shape}")
+        print(f"After initial concatenation shape: {x.shape}")
+        
+        # Expand channels to match checkpoint dimensions
+        x = self.expand_concat(x)
+        print(f"After expanding concatenated channels: {x.shape}")
         
         x = self.conv_block(x)
         print(f"After conv block shape: {x.shape}")
