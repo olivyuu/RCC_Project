@@ -3,6 +3,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Union, Tuple
 
+def print_tensor_stats(name: str, tensor: torch.Tensor):
+    """Helper function to print detailed tensor information"""
+    print(f"\n{name}:")
+    print(f"Shape: {tensor.shape}")
+    print(f"Min/Max: {tensor.min():.4f}/{tensor.max():.4f}")
+    print(f"Mean/Std: {tensor.mean():.4f}/{tensor.std():.4f}")
+    if torch.isnan(tensor).any():
+        print("WARNING: Contains NaN values!")
+    if torch.isinf(tensor).any():
+        print("WARNING: Contains Inf values!")
+
 class BoundaryLoss(nn.Module):
     """
     Boundary loss to emphasize tumor edges
@@ -14,12 +25,12 @@ class BoundaryLoss(nn.Module):
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         print(f"\nBoundaryLoss forward:")
-        print(f"Input pred shape: {pred.shape}")
-        print(f"Input target shape: {target.shape}")
+        print_tensor_stats("Input pred", pred)
+        print_tensor_stats("Input target", target)
         
         # Get probability map
         pred = pred.softmax(dim=1)
-        print(f"After softmax shape: {pred.shape}")
+        print_tensor_stats("After softmax", pred)
         
         # For binary case, we only care about tumor class (channel 1)
         if pred.shape[1] == 2:
@@ -35,36 +46,65 @@ class BoundaryLoss(nn.Module):
         if pred.shape[-3:] != target.shape[-3:]:
             pred = F.interpolate(pred, size=target.shape[-3:], mode='trilinear', align_corners=False)
             
-        print(f"Processed shapes - pred: {pred.shape}, target: {target.shape}")
+        print(f"\nProcessed shapes - pred: {pred.shape}, target: {target.shape}")
+        print_tensor_stats("Processed pred", pred)
+        print_tensor_stats("Processed target", target)
         
         # Calculate gradients
         grad_pred = self._compute_gradient(pred)
         grad_target = self._compute_gradient(target)
-        print(f"Gradient shapes - pred: {grad_pred.shape}, target: {grad_target.shape}")
+        
+        print_tensor_stats("Gradient pred", grad_pred)
+        print_tensor_stats("Gradient target", grad_target)
         
         # Calculate boundary loss
         boundary_loss = F.mse_loss(grad_pred, grad_target)
+        print(f"Boundary loss value: {boundary_loss.item():.4f}")
         return boundary_loss
 
     def _compute_gradient(self, x):
-        print(f"Computing gradient for shape: {x.shape}")
+        print(f"\nComputing gradient for shape: {x.shape}")
+        
+        # Convert kernels to proper device
+        device = x.device
+        kernel_x = self._get_sobel_kernel('x').to(device)
+        kernel_y = self._get_sobel_kernel('y').to(device)
+        kernel_z = self._get_sobel_kernel('z').to(device)
+        
+        print_tensor_stats("X kernel", kernel_x)
+        print_tensor_stats("Y kernel", kernel_y)
+        print_tensor_stats("Z kernel", kernel_z)
         
         # Apply padding first to ensure consistent output size
-        padded = F.pad(x, (1, 1, 1, 1, 1, 1), mode='replicate')
-        print(f"After padding shape: {padded.shape}")
+        pad_size = (1, 1, 1, 1, 1, 1)
+        print(f"Padding size: {pad_size}")
+        padded = F.pad(x, pad_size, mode='replicate')
+        print_tensor_stats("After padding", padded)
+        
+        # Extract central region for convolution
+        central = padded[:, :, 1:-1, 1:-1, 1:-1]
+        print_tensor_stats("Central region", central)
         
         # Compute gradients in xyz directions
-        grad_x = torch.abs(F.conv3d(padded[:, :, :, 1:-1, 1:-1], self._get_sobel_kernel('x').to(x.device)))
-        grad_y = torch.abs(F.conv3d(padded[:, :, :, 1:-1, 1:-1], self._get_sobel_kernel('y').to(x.device)))
-        grad_z = torch.abs(F.conv3d(padded[:, :, :, 1:-1, 1:-1], self._get_sobel_kernel('z').to(x.device)))
+        grad_x = torch.abs(F.conv3d(central, kernel_x))
+        grad_y = torch.abs(F.conv3d(central, kernel_y))
+        grad_z = torch.abs(F.conv3d(central, kernel_z))
         
-        print(f"Gradient components - x: {grad_x.shape}, y: {grad_y.shape}, z: {grad_z.shape}")
+        print_tensor_stats("X gradient", grad_x)
+        print_tensor_stats("Y gradient", grad_y)
+        print_tensor_stats("Z gradient", grad_z)
+        
+        print(f"Final gradient component shapes:")
+        print(f"X: {grad_x.shape}")
+        print(f"Y: {grad_y.shape}")
+        print(f"Z: {grad_z.shape}")
         
         grad = (grad_x + grad_y + grad_z) / 3.0
-        print(f"Combined gradient shape: {grad.shape}")
+        print_tensor_stats("Combined gradient", grad)
         return grad
 
     def _get_sobel_kernel(self, direction):
+        print(f"\nCreating {direction}-direction kernel")
         if direction == 'x':
             kernel = torch.tensor([[[1, 0, -1],
                                   [2, 0, -2],
@@ -73,7 +113,7 @@ class BoundaryLoss(nn.Module):
             kernel = torch.tensor([[[1, 2, 1],
                                   [0, 0, 0],
                                   [-1, -2, -1]]])
-        else:  # z direction, make sure it's properly 3D
+        else:  # z direction, symmetric 3D kernel
             kernel = torch.tensor([[[0, 0, 0],
                                   [0, 1, 0],
                                   [0, 0, 0]],
@@ -83,7 +123,11 @@ class BoundaryLoss(nn.Module):
                                  [[0, 0, 0],
                                   [0, -1, 0],
                                   [0, 0, 0]]])
-        return kernel.unsqueeze(0).unsqueeze(0).float()
+        
+        kernel = kernel.unsqueeze(0).unsqueeze(0).float()
+        print(f"Shape: {kernel.shape}")
+        print(f"Values:\n{kernel.squeeze()}")
+        return kernel
 
 class FocalTverskyLoss(nn.Module):
     """
