@@ -13,8 +13,13 @@ class BoundaryLoss(nn.Module):
         self.sigma = sigma
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        print(f"\nBoundaryLoss forward:")
+        print(f"Input pred shape: {pred.shape}")
+        print(f"Input target shape: {target.shape}")
+        
         # Get probability map
         pred = pred.softmax(dim=1)
+        print(f"After softmax shape: {pred.shape}")
         
         # For binary case, we only care about tumor class (channel 1)
         if pred.shape[1] == 2:
@@ -25,20 +30,24 @@ class BoundaryLoss(nn.Module):
             target = target.unsqueeze(1)
             
         target = (target > 0).float()
+        print(f"Processed shapes - pred: {pred.shape}, target: {target.shape}")
         
         # Calculate gradients
         grad_pred = self._compute_gradient(pred)
         grad_target = self._compute_gradient(target)
+        print(f"Gradient shapes - pred: {grad_pred.shape}, target: {grad_target.shape}")
         
         # Calculate boundary loss
         boundary_loss = F.mse_loss(grad_pred, grad_target)
         return boundary_loss
 
     def _compute_gradient(self, x):
-        # Compute gradients in xyz directions
-        grad_x = torch.abs(F.conv3d(x, self._get_sobel_kernel('x').to(x.device)))
-        grad_y = torch.abs(F.conv3d(x, self._get_sobel_kernel('y').to(x.device)))
-        grad_z = torch.abs(F.conv3d(x, self._get_sobel_kernel('z').to(x.device)))
+        print(f"Computing gradient for shape: {x.shape}")
+        # Compute gradients in xyz directions with padding
+        grad_x = torch.abs(F.conv3d(x, self._get_sobel_kernel('x').to(x.device), padding=1))
+        grad_y = torch.abs(F.conv3d(x, self._get_sobel_kernel('y').to(x.device), padding=1))
+        grad_z = torch.abs(F.conv3d(x, self._get_sobel_kernel('z').to(x.device), padding=1))
+        print(f"Gradient components - x: {grad_x.shape}, y: {grad_y.shape}, z: {grad_z.shape}")
         return (grad_x + grad_y + grad_z) / 3.0
 
     def _get_sobel_kernel(self, direction):
