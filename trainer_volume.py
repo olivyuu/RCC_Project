@@ -22,7 +22,6 @@ class nnUNetVolumeTrainer:
         from preprocessing.preprocessor import KiTS23Preprocessor
         self.preprocessor = KiTS23Preprocessor(config)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Using device: {self.device}")
         
         # Create checkpoint directory
         self.config.checkpoint_dir.mkdir(exist_ok=True)

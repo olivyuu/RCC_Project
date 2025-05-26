@@ -4,6 +4,7 @@ import torch
 import multiprocessing as mp
 from config import nnUNetConfig
 from trainer_volume import nnUNetVolumeTrainer
+from tools.create_experiment import create_experiment_structure
 
 def set_seed(seed: int, deterministic: bool = False, benchmark: bool = True):
     """Set seeds for reproducibility."""
@@ -65,6 +66,12 @@ def main():
     config.experiment_name = args.experiment_name
     config.resume_training = args.resume
     config.preprocess = True if args.preprocess is None else args.preprocess.lower() == 'true'
+    
+    # Create experiment directory structure
+    create_experiment_structure(args.experiment_name)
+    
+    # Update checkpoint directory to use experiment-specific path
+    config.checkpoint_dir = Path(f"experiments/{args.experiment_name}/checkpoints")
     
     # Transfer learning settings
     if args.patch_weights:

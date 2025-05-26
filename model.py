@@ -6,18 +6,14 @@ class ConvDropoutNormNonlin(nn.Module):
     def __init__(self, in_channels, out_channels, 
                  conv_op=nn.Conv3d, norm_op=nn.InstanceNorm3d):
         super().__init__()
-        print(f"Creating ConvDropoutNormNonlin with in_channels={in_channels}, out_channels={out_channels}")
         self.conv = conv_op(in_channels, out_channels, 3, padding=1)
         self.norm = norm_op(out_channels)
         self.nonlin = nn.LeakyReLU(inplace=True)
         self.dropout = nn.Dropout3d(p=0.1)
 
     def forward(self, x):
-        print(f"ConvDropoutNormNonlin input shape: {x.shape}")
         x = self.conv(x)
-        print(f"After conv shape: {x.shape}")
         x = self.norm(x)
-        print(f"After norm shape: {x.shape}")
         x = self.nonlin(x)
         x = self.dropout(x)
         return x
@@ -71,19 +67,11 @@ class DownBlock(nn.Module):
 class UpBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
-        print(f"\nCreating UpBlock with in_channels={in_channels}, out_channels={out_channels}")
-        
-        # Keep original upconv behavior that matches checkpoint
         self.upconv = nn.ConvTranspose3d(in_channels, out_channels, 
                                       kernel_size=2, stride=2)
-        
-        # Reduce skip connection channels to match upconv output
         self.reduce_skip = nn.Conv3d(in_channels, out_channels, kernel_size=1)
-        
-        # Initialize attention gate with correct dimensions
         self.attention_gate = AttentionGate(F_g=out_channels, F_l=out_channels, F_int=out_channels//2)
         
-        # Calculate concat channels based on checkpoint dimensions
         if in_channels == 320:
             concat_channels = 576  # From checkpoint
         elif in_channels == 256:
@@ -95,11 +83,7 @@ class UpBlock(nn.Module):
         else:
             concat_channels = out_channels * 2  # Fallback
             
-        # Add expansion layer to match checkpoint dimensions after concatenation
         self.expand_concat = nn.Conv3d(out_channels * 2, concat_channels, kernel_size=1)
-            
-        print(f"UpBlock target concat_channels={concat_channels}")
-        
         self.conv_block = nn.Sequential(
             ConvDropoutNormNonlin(concat_channels, out_channels),
             ConvDropoutNormNonlin(out_channels, out_channels)
@@ -108,37 +92,14 @@ class UpBlock(nn.Module):
         self.spatial_attention = SpatialAttention(out_channels)
 
     def forward(self, x, skip):
-        print(f"\nUpBlock forward:")
-        print(f"Input shape: {x.shape}")
-        print(f"Skip shape: {skip.shape}")
-        
         x = self.upconv(x)
-        print(f"After upconv shape: {x.shape}")
-        
-        # Handle different sized feature maps
         if x.shape != skip.shape:
             x = F.interpolate(x, skip.shape[2:])
-            print(f"After interpolate shape: {x.shape}")
-        
-        # Reduce skip connection channels
         skip = self.reduce_skip(skip)
-        print(f"After reducing skip channels: {skip.shape}")
-        
-        # Apply attention gate
         skip = self.attention_gate(x, skip)
-        print(f"After attention gate shape: {skip.shape}")
-        
-        # Concatenate skip connection
         x = torch.cat((skip, x), dim=1)
-        print(f"After initial concatenation shape: {x.shape}")
-        
-        # Expand channels to match checkpoint dimensions
         x = self.expand_concat(x)
-        print(f"After expanding concatenated channels: {x.shape}")
-        
         x = self.conv_block(x)
-        print(f"After conv block shape: {x.shape}")
-        
         x = self.channel_attention(x)
         x = self.spatial_attention(x)
         return x
@@ -146,7 +107,6 @@ class UpBlock(nn.Module):
 class AttentionGate(nn.Module):
     def __init__(self, F_g, F_l, F_int):
         super().__init__()
-        print(f"Creating AttentionGate with F_g={F_g}, F_l={F_l}, F_int={F_int}")
         self.W_g = nn.Sequential(
             nn.Conv3d(F_g, F_int, kernel_size=1),
             nn.BatchNorm3d(F_int)
@@ -183,18 +143,13 @@ class DeepSupervisionHead(nn.Module):
 
 class nnUNetv2(nn.Module):
     def __init__(self, in_channels=2, out_channels=2, 
-                 features=(32, 64, 128, 256, 320)):  # Original dimensions
+                 features=(32, 64, 128, 256, 320)):
         super().__init__()
-        print(f"\nInitializing nnUNetv2:")
-        print(f"Input channels: {in_channels}")
-        print(f"Output channels: {out_channels}")
-        print(f"Feature dimensions: {features}")
         
         # Encoder
         self.down_blocks = nn.ModuleList()
         current_channels = in_channels
         for feature in features:
-            print(f"Adding DownBlock: {current_channels} -> {feature}")
             self.down_blocks.append(DownBlock(current_channels, feature))
             current_channels = feature
 
@@ -212,7 +167,6 @@ class nnUNetv2(nn.Module):
         features = list(reversed(features))
         scales = [8, 4, 2, 1]  # Scale factors for deep supervision
         for i in range(len(features) - 1):
-            print(f"Adding UpBlock {i}: {features[i]} -> {features[i + 1]}")
             self.up_blocks.append(UpBlock(features[i], features[i + 1]))
             self.deep_supervision.append(
                 DeepSupervisionHead(features[i + 1], out_channels, scales[i])
@@ -244,9 +198,6 @@ class nnUNetv2(nn.Module):
             self.target_layer = target_layer
 
     def forward(self, x):
-        print(f"\nnnUNetv2 forward pass:")
-        print(f"Input shape: {x.shape}")
-        
         # Get normalized progressive weights
         if self.training:
             weights = self.softmax(self.progressive_weights)
@@ -256,34 +207,23 @@ class nnUNetv2(nn.Module):
         for i, down_block in enumerate(self.down_blocks[:-1]):
             x, skip = down_block(x)
             skip_connections.append(skip)
-            print(f"Down block {i} output shape: {x.shape}")
-            print(f"Skip connection {i} shape: {skip.shape}")
         
         x, skip = self.down_blocks[-1](x)
-        print(f"Final down block output shape: {x.shape}")
-        print(f"Final skip connection shape: {skip.shape}")
-        
         x = self.bottleneck(x)
-        print(f"After bottleneck shape: {x.shape}")
-        
         skip_connections.append(skip)
         skip_connections = skip_connections[::-1]  # Reverse for decoder
 
         # Decoder with deep supervision
         deep_outputs = []
         for i, up_block in enumerate(self.up_blocks):
-            print(f"\nUp block {i}:")
             x = up_block(x, skip_connections[i])
-            print(f"Up block {i} output shape: {x.shape}")
             if self.training:
                 deep_out = self.deep_supervision[i](x)
                 deep_outputs.append(deep_out)
 
         output = self.final_conv(x)
-        print(f"Final output shape: {output.shape}")
 
         if self.training:
-            # Weight outputs according to progressive learning weights
             outputs = [output] + deep_outputs
             weighted_outputs = [out * weight for out, weight in zip(outputs, weights)]
             return weighted_outputs
