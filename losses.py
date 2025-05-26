@@ -135,6 +135,9 @@ class FocalTverskyLoss(nn.Module):
         self.smooth = smooth
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        print(f"\nFocalTverskyLoss forward:")
+        print(f"Input shapes - pred: {pred.shape}, target: {target.shape}")
+        
         # Get probability map
         pred = pred.softmax(dim=1)
         
@@ -145,12 +148,20 @@ class FocalTverskyLoss(nn.Module):
         # Ensure target is in correct format
         if len(target.shape) == len(pred.shape) - 1:
             target = target.unsqueeze(1)
-        
+            
         target = (target > 0).float()
+        
+        # Interpolate predictions to match target size if needed
+        if pred.shape[-3:] != target.shape[-3:]:
+            pred = F.interpolate(pred, size=target.shape[-3:], mode='trilinear', align_corners=False)
+            
+        print(f"After preprocessing - pred: {pred.shape}, target: {target.shape}")
         
         # Flatten predictions and targets
         pred = pred.flatten(2)
         target = target.flatten(2)
+        
+        print(f"After flattening - pred: {pred.shape}, target: {target.shape}")
         
         # Calculate True Positives, False Positives, and False Negatives
         tp = (pred * target).sum(dim=2)
@@ -165,7 +176,9 @@ class FocalTverskyLoss(nn.Module):
         # Apply focal factor
         focal_tversky = torch.pow((1 - tversky), self.gamma)
         
-        return focal_tversky.mean()
+        loss = focal_tversky.mean()
+        print(f"Loss value: {loss.item():.4f}")
+        return loss
 
 class DC_and_BCE_loss(nn.Module):
     def __init__(self, bce_kwargs: dict = None, soft_dice_kwargs: dict = None, 
