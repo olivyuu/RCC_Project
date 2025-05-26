@@ -74,8 +74,18 @@ class UpBlock(nn.Module):
                                       kernel_size=2, stride=2)
         self.attention_gate = AttentionGate(F_g=out_channels, F_l=out_channels, F_int=out_channels//2)
         
-        # After concatenation, input channels will be out_channels * 2 from skip connection
-        concat_channels = out_channels * 2
+        # Calculate concat channels based on checkpoint dimensions
+        if in_channels == 320:
+            concat_channels = 576  # From checkpoint
+        elif in_channels == 256:
+            concat_channels = 384  # From checkpoint
+        elif in_channels == 128:
+            concat_channels = 192  # From checkpoint
+        elif in_channels == 64:
+            concat_channels = 96   # From checkpoint
+        else:
+            concat_channels = out_channels * 2  # Fallback
+            
         print(f"UpBlock concat_channels={concat_channels}")
         
         self.conv_block = nn.Sequential(
