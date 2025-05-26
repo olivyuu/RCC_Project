@@ -72,6 +72,11 @@ class UpBlock(nn.Module):
         # Keep original upconv behavior that matches checkpoint
         self.upconv = nn.ConvTranspose3d(in_channels, out_channels, 
                                       kernel_size=2, stride=2)
+        
+        # Reduce skip connection channels to match upconv output
+        self.reduce_skip = nn.Conv3d(in_channels, out_channels, kernel_size=1)
+        
+        # Initialize attention gate with correct dimensions
         self.attention_gate = AttentionGate(F_g=out_channels, F_l=out_channels, F_int=out_channels//2)
         
         # Calculate concat channels based on checkpoint dimensions
@@ -108,6 +113,10 @@ class UpBlock(nn.Module):
             x = F.interpolate(x, skip.shape[2:])
             print(f"After interpolate shape: {x.shape}")
         
+        # Reduce skip connection channels
+        skip = self.reduce_skip(skip)
+        print(f"After reducing skip channels: {skip.shape}")
+        
         # Apply attention gate
         skip = self.attention_gate(x, skip)
         print(f"After attention gate shape: {skip.shape}")
@@ -126,6 +135,7 @@ class UpBlock(nn.Module):
 class AttentionGate(nn.Module):
     def __init__(self, F_g, F_l, F_int):
         super().__init__()
+        print(f"Creating AttentionGate with F_g={F_g}, F_l={F_l}, F_int={F_int}")
         self.W_g = nn.Sequential(
             nn.Conv3d(F_g, F_int, kernel_size=1),
             nn.BatchNorm3d(F_int)
