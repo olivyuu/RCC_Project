@@ -76,19 +76,13 @@ class BoundaryLoss(nn.Module):
         print_tensor_stats("Z kernel", kernel_z)
         
         # Apply padding first to ensure consistent output size
-        pad_size = (1, 1, 1, 1, 1, 1)
-        print(f"Padding size: {pad_size}")
-        padded = F.pad(x, pad_size, mode='replicate')
+        padded = F.pad(x, (1, 1, 1, 1, 1, 1), mode='reflect')
         print_tensor_stats("After padding", padded)
-        
-        # Extract central region for convolution
-        central = padded[:, :, 1:-1, 1:-1, 1:-1]
-        print_tensor_stats("Central region", central)
-        
-        # Compute gradients in xyz directions
-        grad_x = torch.abs(F.conv3d(central, kernel_x))
-        grad_y = torch.abs(F.conv3d(central, kernel_y))
-        grad_z = torch.abs(F.conv3d(central, kernel_z))
+
+        # Compute gradients in xyz directions with appropriate convolution padding
+        grad_x = torch.abs(F.conv3d(padded, kernel_x, padding=(0, 1, 1)))
+        grad_y = torch.abs(F.conv3d(padded, kernel_y, padding=(0, 1, 1)))
+        grad_z = torch.abs(F.conv3d(padded, kernel_z, padding=(1, 1, 1)))
         
         print_tensor_stats("X gradient", grad_x)
         print_tensor_stats("Y gradient", grad_y)
