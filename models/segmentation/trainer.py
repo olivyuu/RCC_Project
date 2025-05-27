@@ -15,6 +15,29 @@ from model import nnUNetv2
 from dataset_volume import KiTS23VolumeDataset
 from losses import DC_and_BCE_loss
 
+def check_tensor(tensor, name="", check_grad=False):
+    """Debug helper to check tensor properties"""
+    if tensor is None:
+        print(f"{name} is None!")
+        return False
+        
+    has_nan = torch.isnan(tensor).any()
+    has_inf = torch.isinf(tensor).any()
+    
+    if has_nan or has_inf:
+        print(f"\nWarning: {name} contains NaN: {has_nan} or Inf: {has_inf}")
+        print(f"Shape: {tensor.shape}")
+        print(f"Range: [{tensor.min().item():.4f}, {tensor.max().item():.4f}]")
+        print(f"Mean: {tensor.mean().item():.4f}, Std: {tensor.std().item():.4f}")
+        
+        if check_grad and tensor.grad is not None:
+            grad = tensor.grad
+            print(f"Gradient range: [{grad.min().item():.4f}, {grad.max().item():.4f}]")
+            print(f"Gradient mean: {grad.mean().item():.4f}, std: {grad.std().item():.4f}")
+        
+        return False
+    return True
+
 class DebugStats:
     """Helper class to track and log training statistics"""
     def __init__(self, log_dir):
@@ -36,9 +59,16 @@ class DebugStats:
             if param.grad is not None:
                 grad_norm += param.grad.norm().item()
             weight_norm += param.norm().item()
+            
+            # Check each parameter
+            check_tensor(param, f"Parameter {name}", check_grad=True)
         
         self.stats['gradient_norms'].append(grad_norm)
         self.stats['weight_norms'].append(weight_norm)
+        
+        # Check outputs and targets
+        check_tensor(outputs, "Model outputs")
+        check_tensor(targets, "Targets")
         
         # Log outputs range
         output_min = outputs.min().item()
@@ -52,7 +82,7 @@ class DebugStats:
         # Save detailed batch info periodically
         if batch_idx % 10 == 0:
             self._save_batch_info(epoch, batch_idx, model, outputs, targets)
-    
+
     def _save_batch_info(self, epoch, batch_idx, model, outputs, targets):
         info_file = self.log_dir / f"batch_e{epoch}_b{batch_idx}.txt"
         with open(info_file, "w") as f:
@@ -70,7 +100,9 @@ class DebugStats:
                 if param.grad is not None:
                     f.write(f"\n{name}:\n")
                     f.write(f"Weight range: [{param.min().item():.4f}, {param.max().item():.4f}]\n")
+                    f.write(f"Weight mean: {param.mean().item():.4f}, std: {param.std().item():.4f}\n")
                     f.write(f"Gradient range: [{param.grad.min().item():.4f}, {param.grad.max().item():.4f}]\n")
+                    f.write(f"Gradient mean: {param.grad.mean().item():.4f}, std: {param.grad.std().item():.4f}\n")
                     f.write(f"Weight norm: {param.norm().item():.4f}\n")
                     f.write(f"Gradient norm: {param.grad.norm().item():.4f}\n")
             
@@ -88,26 +120,29 @@ class SegmentationTrainer:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
         
-        # Initialize debug stats using log_dir
+        # Initialize debug stats
         self.debug_stats = DebugStats(config.log_dir)
         
         # Create checkpoint directory
         self.config.checkpoint_dir.mkdir(exist_ok=True)
         
-        # Initialize model
+        # Initialize model with He initialization
         self.model = nnUNetv2(
-            in_channels=2,  # Image and kidney mask channels
-            out_channels=1,  # Tumor segmentation
+            in_channels=2,
+            out_channels=1,
             features=config.features
         ).to(self.device)
         
-        # Initialize training components
+        # Initialize weights properly
+        self._initialize_weights()
+        
+        # Initialize training components with stable settings
         self.criterion = DC_and_BCE_loss()
         self.optimizer = torch.optim.Adam(
             self.model.parameters(),
-            lr=1e-4,  # Lower learning rate
-            weight_decay=1e-5,  # L2 regularization
-            eps=1e-8  # For numerical stability
+            lr=1e-4,
+            weight_decay=1e-5,
+            eps=1e-8
         )
         
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -117,18 +152,27 @@ class SegmentationTrainer:
         self.scaler = GradScaler()
         self.writer = SummaryWriter(log_dir=config.log_dir)
         
-        # Initialize training state
+        # Training state
         self.start_epoch = 0
         self.best_val_dice = float('-inf')
         self.current_epoch = 0
         self.max_grad_norm = 1.0
         
-        # Register signal handlers
-        signal.signal(signal.SIGINT, self._handle_interrupt)
-        signal.signal(signal.SIGTERM, self._handle_interrupt)
-        
         if config.resume_training:
             self._load_checkpoint()
+
+    def _initialize_weights(self):
+        """Initialize network weights using He initialization"""
+        for m in self.model.modules():
+            if isinstance(m, (torch.nn.Conv3d, torch.nn.ConvTranspose3d)):
+                torch.nn.init.kaiming_normal_(
+                    m.weight, mode='fan_out', nonlinearity='relu'
+                )
+                if m.bias is not None:
+                    torch.nn.init.zeros_(m.bias)
+            elif isinstance(m, torch.nn.BatchNorm3d):
+                torch.nn.init.constant_(m.weight, 1)
+                torch.nn.init.zeros_(m.bias)
 
     def train(self, dataset_path: str):
         dataset = KiTS23VolumeDataset(dataset_path, self.config, preprocess=self.config.preprocess)
@@ -164,8 +208,6 @@ class SegmentationTrainer:
         try:
             for epoch in range(self.start_epoch, self.config.num_epochs):
                 self.current_epoch = epoch
-                
-                # Training phase
                 self.model.train()
                 train_loss = 0
                 train_dice = 0
@@ -176,55 +218,56 @@ class SegmentationTrainer:
                         images = images.to(self.device)
                         targets = targets.to(self.device)
                         
-                        # Forward pass with mixed precision
-                        with autocast():
-                            outputs = self.model(images)
-                            if isinstance(outputs, (list, tuple)):
-                                outputs = outputs[-1]
-                            
-                            # Debug pre-interpolation
-                            if batch_idx % 10 == 0:
-                                print(f"\nPre-interpolation shape: {outputs.shape}")
-                                print(f"Pre-interpolation range: [{outputs.min().item():.4f}, {outputs.max().item():.4f}]")
-                            
-                            if outputs.shape[-3:] != targets.shape[-3:]:
-                                outputs = F.interpolate(
-                                    outputs.float(),
-                                    size=targets.shape[-3:],
-                                    mode='trilinear',
-                                    align_corners=False
-                                )
-                                
-                                # Debug post-interpolation
-                                if batch_idx % 10 == 0:
-                                    print(f"Post-interpolation shape: {outputs.shape}")
-                                    print(f"Post-interpolation range: [{outputs.min().item():.4f}, {outputs.max().item():.4f}]")
-                            
-                            # Apply sigmoid for binary classification
-                            outputs = torch.sigmoid(outputs)
-                            
-                            # Debug final outputs
-                            if batch_idx % 10 == 0:
-                                print(f"Final output range: [{outputs.min().item():.4f}, {outputs.max().item():.4f}]")
-                                print(f"Positive prediction ratio: {(outputs > 0.5).float().mean().item():.4f}")
-                                print(f"Target positive ratio: {(targets > 0).float().mean().item():.4f}")
-                            
-                            loss = self.criterion(outputs, targets)
+                        # Check inputs
+                        check_tensor(images, "Input images")
+                        check_tensor(targets, "Target masks")
                         
-                        # Backward pass with gradient clipping
-                        self.optimizer.zero_grad()
-                        self.scaler.scale(loss).backward()
+                        # Forward pass without mixed precision initially
+                        outputs = self.model(images)
+                        if isinstance(outputs, (list, tuple)):
+                            outputs = outputs[-1]
                         
-                        # Log gradients before clipping
+                        # Debug pre-interpolation
                         if batch_idx % 10 == 0:
-                            grad_norms = {name: param.grad.norm().item() 
-                                        for name, param in self.model.named_parameters() 
-                                        if param.grad is not None}
-                            print("\nGradient norms before clipping:")
-                            for name, norm in grad_norms.items():
-                                print(f"{name}: {norm:.4f}")
+                            print(f"\nPre-interpolation shape: {outputs.shape}")
+                            print(f"Pre-interpolation range: [{outputs.min().item():.4f}, {outputs.max().item():.4f}]")
+                            check_tensor(outputs, "Pre-interpolation outputs")
                         
-                        self.scaler.unscale_(self.optimizer)
+                        if outputs.shape[-3:] != targets.shape[-3:]:
+                            outputs = F.interpolate(
+                                outputs.float(),
+                                size=targets.shape[-3:],
+                                mode='trilinear',
+                                align_corners=False
+                            )
+                            
+                            if batch_idx % 10 == 0:
+                                print(f"Post-interpolation shape: {outputs.shape}")
+                                print(f"Post-interpolation range: [{outputs.min().item():.4f}, {outputs.max().item():.4f}]")
+                                check_tensor(outputs, "Post-interpolation outputs")
+                        
+                        # Calculate loss without sigmoid activation
+                        loss = self.criterion(outputs, targets)
+                        
+                        if torch.isnan(loss) or torch.isinf(loss):
+                            print("\nWarning: Invalid loss value detected!")
+                            print(f"Loss: {loss.item()}")
+                            continue
+                        
+                        # Backward pass with gradient monitoring
+                        self.optimizer.zero_grad()
+                        loss.backward()
+                        
+                        # Check gradients before clipping
+                        if batch_idx % 10 == 0:
+                            print("\nGradient norms before clipping:")
+                            for name, param in self.model.named_parameters():
+                                if param.grad is not None:
+                                    grad_norm = param.grad.norm().item()
+                                    print(f"{name}: {grad_norm:.4f}")
+                                    check_tensor(param.grad, f"Gradient for {name}")
+                        
+                        # Clip gradients
                         total_norm = torch.nn.utils.clip_grad_norm_(
                             self.model.parameters(),
                             self.max_grad_norm
@@ -233,24 +276,23 @@ class SegmentationTrainer:
                         if batch_idx % 10 == 0:
                             print(f"Total gradient norm after clipping: {total_norm:.4f}")
                         
-                        self.scaler.step(self.optimizer)
-                        self.scaler.update()
+                        self.optimizer.step()
                         
                         # Calculate metrics
                         with torch.no_grad():
-                            dice = self._calculate_dice(outputs.detach(), targets)
+                            outputs_sigmoid = torch.sigmoid(outputs)  # Apply sigmoid after training
+                            dice = self._calculate_dice(outputs_sigmoid.detach(), targets)
+                            
                             if not torch.isnan(dice) and not torch.isinf(dice):
                                 train_loss += loss.item()
                                 train_dice += dice
                                 valid_batches += 1
                                 
-                                # Log batch statistics
                                 self.debug_stats.log_batch(
                                     epoch, batch_idx, self.model,
-                                    loss, dice, outputs, targets
+                                    loss, dice, outputs_sigmoid, targets
                                 )
                         
-                        # Update progress bar
                         pbar.set_postfix({
                             'loss': f"{loss.item():.4f}",
                             'dice': f"{dice.item():.4f}",
@@ -279,12 +321,6 @@ class SegmentationTrainer:
                 self.writer.add_scalar('Dice/train', train_dice, epoch)
                 self.writer.add_scalar('Dice/val', val_dice, epoch)
                 self.writer.add_scalar('LearningRate', current_lr, epoch)
-                
-                # Save histograms
-                for name, param in self.model.named_parameters():
-                    self.writer.add_histogram(f'weights/{name}', param, epoch)
-                    if param.grad is not None:
-                        self.writer.add_histogram(f'grads/{name}', param.grad, epoch)
                 
                 # Print epoch results
                 print(f"\nEpoch {epoch+1}/{self.config.num_epochs}")
@@ -335,23 +371,23 @@ class SegmentationTrainer:
                 images = images.to(self.device)
                 targets = targets.to(self.device)
                 
-                with autocast():
-                    outputs = self.model(images)
-                    if isinstance(outputs, (list, tuple)):
-                        outputs = outputs[-1]
-                    
-                    if outputs.shape[-3:] != targets.shape[-3:]:
-                        outputs = F.interpolate(
-                            outputs.float(),
-                            size=targets.shape[-3:],
-                            mode='trilinear',
-                            align_corners=False
-                        )
-                    
-                    outputs = torch.sigmoid(outputs)
-                    loss = self.criterion(outputs, targets)
+                outputs = self.model(images)
+                if isinstance(outputs, (list, tuple)):
+                    outputs = outputs[-1]
                 
-                dice = self._calculate_dice(outputs, targets)
+                if outputs.shape[-3:] != targets.shape[-3:]:
+                    outputs = F.interpolate(
+                        outputs.float(),
+                        size=targets.shape[-3:],
+                        mode='trilinear',
+                        align_corners=False
+                    )
+                
+                # Calculate loss and metrics
+                loss = self.criterion(outputs, targets)
+                outputs_sigmoid = torch.sigmoid(outputs)
+                dice = self._calculate_dice(outputs_sigmoid, targets)
+                
                 if not torch.isnan(dice) and not torch.isinf(dice):
                     val_loss += loss.item()
                     val_dice += dice
@@ -368,7 +404,7 @@ class SegmentationTrainer:
             return float('inf'), 0
 
     def _calculate_dice(self, outputs, targets, smooth=1e-5):
-        # Already have sigmoid in forward pass
+        # Threshold predictions
         preds = (outputs > 0.5).float()
         
         intersection = (preds * targets).sum()
@@ -383,6 +419,10 @@ class SegmentationTrainer:
             print(f"Targets sum: {targets.sum().item()}")
             print(f"Intersection: {intersection.item()}")
             print(f"Union: {union.item()}")
+            
+            # Additional prediction statistics
+            print(f"Prediction stats - Mean: {outputs.mean().item():.4f}, Std: {outputs.std().item():.4f}")
+            print(f"Target stats - Mean: {targets.mean().item():.4f}, Std: {targets.std().item():.4f}")
         
         return dice
 
@@ -397,11 +437,9 @@ class SegmentationTrainer:
             'metrics': metrics
         }
         
-        # Save latest checkpoint
         latest_path = self.config.checkpoint_dir / "latest.pth"
         torch.save(checkpoint, latest_path)
         
-        # Save best model
         if is_best:
             best_path = self.config.checkpoint_dir / f"best_model_dice_{metrics['dice']:.4f}.pth"
             torch.save(checkpoint, best_path)
