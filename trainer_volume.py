@@ -31,7 +31,7 @@ class nnUNetVolumeTrainer:
         self.best_val_dice = float('-inf')
         self.patience_counter = 0
         self.current_epoch = 0
-        self.frozen_encoder_blocks = 4  # Initialize before loading weights
+        self.frozen_encoder_blocks = 2  # Start with fewer blocks frozen for more aggressive training
         
         # Initialize model with 2 input channels
         self.model = nnUNetv2(
@@ -47,7 +47,7 @@ class nnUNetVolumeTrainer:
         # Initialize training components with new combined loss
         self.criterion = DC_and_BCE_loss()
         
-        # Use AdamW optimizer for better weight decay handling
+        # Use AdamW optimizer with higher initial learning rate
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=config.initial_lr,
@@ -55,12 +55,12 @@ class nnUNetVolumeTrainer:
             betas=(0.9, 0.999)
         )
         
-        # Learning rate scheduler
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        # Learning rate scheduler with longer cycles
+        self.scheduler = torch.optim.CosineAnnealingWarmRestarts(
             self.optimizer,
-            T_0=10,  # Restart every 10 epochs
-            T_mult=2,  # Double the restart interval after each restart
-            eta_min=1e-6  # Minimum learning rate
+            T_0=20,  # Longer initial cycle for better exploration
+            T_mult=1,  # Keep consistent cycle length
+            eta_min=1e-5  # Higher minimum learning rate
         )
         
         self.scaler = GradScaler()
@@ -117,16 +117,15 @@ class nnUNetVolumeTrainer:
         """Get progressive weights for deep supervision outputs."""
         # Start with emphasis on detection (deeper layers)
         # Gradually shift to segmentation (shallower layers)
-        progress = min(epoch / (self.config.num_epochs * 0.7), 1.0)  # Transition over 70% of training
+        progress = min(epoch / (self.config.num_epochs * 0.5), 1.0)  # Transition over 50% of training
         
-        # Weights for [final_output, deep3, deep2, deep1]
-        # Early epochs: [0.4, 0.3, 0.2, 0.1]
-        # Late epochs:  [0.1, 0.2, 0.3, 0.4]
+        # More aggressive weight transition
+        # Early: [0.3, 0.2, 0.2, 0.3] -> Late: [0.1, 0.1, 0.3, 0.5]
         weights = torch.tensor([
-            0.4 - 0.3 * progress,  # Final output (detection)
-            0.3 - 0.1 * progress,  # Deep3
+            0.3 - 0.2 * progress,  # Final output (detection) - less emphasis
+            0.2 - 0.1 * progress,  # Deep3
             0.2 + 0.1 * progress,  # Deep2
-            0.1 + 0.3 * progress   # Deep1 (segmentation)
+            0.3 + 0.2 * progress   # Deep1 (segmentation) - more emphasis
         ])
         
         return weights.to(self.device)
@@ -177,8 +176,8 @@ class nnUNetVolumeTrainer:
             for epoch in range(self.start_epoch, self.config.num_epochs):
                 self.current_epoch = epoch
                 
-                # Progressive unfreezing
-                if epoch > 0 and epoch % (self.config.num_epochs // 4) == 0:
+                # More frequent unfreezing (every 1/8th of training)
+                if epoch > 0 and epoch % (self.config.num_epochs // 8) == 0:
                     self._unfreeze_one_block()
                 
                 # Get supervision weights for this epoch
@@ -384,7 +383,7 @@ class nnUNetVolumeTrainer:
         self.start_epoch = checkpoint['epoch'] + 1
         self.best_val_dice = checkpoint['best_val_dice']
         self.patience_counter = checkpoint['patience_counter']
-        self.frozen_encoder_blocks = checkpoint.get('frozen_encoder_blocks', 4)
+        self.frozen_encoder_blocks = checkpoint.get('frozen_encoder_blocks', 2)
         
         print(f"Resuming training from epoch {self.start_epoch}")
     
