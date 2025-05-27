@@ -12,7 +12,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from model import nnUNetv2
 from dataset_volume import KiTS23VolumeDataset
-from losses import DC_and_CE_loss
+from losses import DC_and_BCE_loss
 
 class SegmentationTrainer:
     def __init__(self, config):
@@ -31,14 +31,14 @@ class SegmentationTrainer:
         ).to(self.device)
         
         # Initialize training components
-        self.criterion = DC_and_CE_loss()
+        self.criterion = DC_and_BCE_loss()
         self.optimizer = torch.optim.Adam(
             self.model.parameters(),
             lr=config.initial_lr,
             weight_decay=0.0001
         )
         self.scaler = GradScaler()
-        self.writer = SummaryWriter(logs_dir=config.log_dir)
+        self.writer = SummaryWriter(log_dir=config.log_dir)
         
         # Initialize training state
         self.start_epoch = 0
