@@ -131,11 +131,11 @@ class DC_and_BCE_loss(nn.Module):
         if bce_kwargs is None:
             bce_kwargs = {}
 
-        # Adjusted weights based on analysis
-        self.weight_ce = 0.3  # Reduced CE weight
-        self.weight_dice = 1.0  # Primary segmentation metric
-        self.weight_boundary = 0.8  # Increased for better edge detection
-        self.weight_focal_tversky = 1.0  # Increased for small feature detection
+        # More conservative weights
+        self.weight_ce = 0.5          # Increased from 0.3
+        self.weight_dice = 1.0        # Unchanged
+        self.weight_boundary = 0.3    # Reduced from 0.8
+        self.weight_focal_tversky = 0.3  # Reduced from 1.0
         
         self.ce = RobustCrossEntropyLoss(**bce_kwargs)
         self.dc = SoftDiceLoss(**soft_dice_kwargs)
