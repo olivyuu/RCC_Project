@@ -1,17 +1,18 @@
+import multiprocessing as mp
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 from torch.cuda.amp import GradScaler, autocast
-from torch.utils.tensorboard import SummaryWriter
 from pathlib import Path
 import numpy as np
+from tqdm import tqdm
 import signal
 import sys
-from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
 
-from dataset import KiTS23Dataset
-from losses import DC_and_BCE_loss
-from .model import SegmentationModel
+from model import nnUNetv2
+from dataset_volume import KiTS23VolumeDataset
+from losses import DC_and_CE_loss
 
 class SegmentationTrainer:
     def __init__(self, config):
@@ -23,33 +24,25 @@ class SegmentationTrainer:
         self.config.checkpoint_dir.mkdir(exist_ok=True)
         
         # Initialize model
-        self.model = SegmentationModel(
-            in_channels=config.in_channels,
-            out_channels=config.out_channels,
+        self.model = nnUNetv2(
+            in_channels=2,  # Image and kidney mask channels
+            out_channels=1,  # Tumor segmentation
             features=config.features
         ).to(self.device)
         
         # Initialize training components
-        self.criterion = DC_and_BCE_loss()  # Combined loss for segmentation
+        self.criterion = DC_and_CE_loss()
         self.optimizer = torch.optim.Adam(
             self.model.parameters(),
             lr=config.initial_lr,
-            weight_decay=config.weight_decay
-        )
-        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer,
-            mode='max',
-            factor=config.lr_reduce_factor,
-            patience=config.lr_schedule_patience,
-            verbose=True
+            weight_decay=0.0001
         )
         self.scaler = GradScaler()
-        self.writer = SummaryWriter(f"{config.log_dir}/{config.experiment_name}_fold_{config.fold}")
+        self.writer = SummaryWriter(logs_dir=config.log_dir)
         
         # Initialize training state
         self.start_epoch = 0
         self.best_val_dice = float('-inf')
-        self.patience_counter = 0
         self.current_epoch = 0
         
         # Register signal handlers
@@ -65,48 +58,35 @@ class SegmentationTrainer:
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
             'scaler_state_dict': self.scaler.state_dict(),
             'best_val_dice': self.best_val_dice,
-            'patience_counter': self.patience_counter,
             'metrics': metrics
         }
         
         # Save latest checkpoint
-        if self.config.save_latest:
-            latest_path = self.config.checkpoint_dir / "latest.pth"
-            torch.save(checkpoint, latest_path)
-            print(f"Saved latest checkpoint: {latest_path}")
+        latest_path = self.config.checkpoint_dir / "latest.pth"
+        torch.save(checkpoint, latest_path)
         
         # Save best model
         if is_best:
             best_path = self.config.checkpoint_dir / f"best_model_dice_{metrics['dice']:.4f}.pth"
             torch.save(checkpoint, best_path)
             print(f"Saved best model: {best_path}")
-        
-        # Save periodic checkpoint
-        if (epoch + 1) % self.config.save_frequency == 0:
-            path = self.config.checkpoint_dir / f"checkpoint_epoch_{epoch+1}.pth"
-            torch.save(checkpoint, path)
-            print(f"Saved periodic checkpoint: {path}")
 
     def _load_checkpoint(self):
-        checkpoint_path = self.config.checkpoint_dir / self.config.checkpoint_file
-        if not checkpoint_path.exists():
-            print(f"No checkpoint found at {checkpoint_path}")
+        latest_path = self.config.checkpoint_dir / "latest.pth"
+        if not latest_path.exists():
+            print(f"No checkpoint found at {latest_path}")
             return
         
-        print(f"Loading checkpoint: {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path)
+        print(f"Loading checkpoint: {latest_path}")
+        checkpoint = torch.load(latest_path)
         
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        if 'scheduler_state_dict' in checkpoint:
-            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
         self.start_epoch = checkpoint['epoch'] + 1
         self.best_val_dice = checkpoint['best_val_dice']
-        self.patience_counter = checkpoint['patience_counter']
         
         print(f"Resuming training from epoch {self.start_epoch}")
 
@@ -122,33 +102,38 @@ class SegmentationTrainer:
 
     def train(self, dataset_path: str):
         # Create dataset
-        dataset = KiTS23Dataset(dataset_path, self.config, preprocess=self.config.preprocess)
+        dataset = KiTS23VolumeDataset(dataset_path, self.config, preprocess=self.config.preprocess)
         
         # Split dataset
-        val_size = int(len(dataset) * self.config.validation_split)
+        val_size = int(len(dataset) * 0.2)  # 20% validation split
         train_size = len(dataset) - val_size
-        generator = torch.Generator().manual_seed(self.config.seed)
-        train_dataset, val_dataset = random_split(dataset, [train_size, val_size], generator=generator)
+        train_dataset, val_dataset = random_split(
+            dataset, 
+            [train_size, val_size],
+            generator=torch.Generator().manual_seed(42)
+        )
         
         # Create dataloaders
         train_loader = DataLoader(
             train_dataset,
             batch_size=self.config.batch_size,
             shuffle=True,
-            num_workers=self.config.num_workers,
-            pin_memory=self.config.pin_memory
+            num_workers=4,
+            pin_memory=True,
+            collate_fn=KiTS23VolumeDataset.collate_fn
         )
         
         val_loader = DataLoader(
             val_dataset,
-            batch_size=self.config.batch_size,
+            batch_size=1,  # Use batch size 1 for validation
             shuffle=False,
-            num_workers=self.config.num_workers,
-            pin_memory=self.config.pin_memory
+            num_workers=4,
+            pin_memory=True,
+            collate_fn=KiTS23VolumeDataset.collate_fn
         )
         
-        print(f"Training on {len(train_dataset)} samples")
-        print(f"Validating on {len(val_dataset)} samples")
+        print(f"\nTraining on {len(train_dataset)} volumes")
+        print(f"Validating on {len(val_dataset)} volumes")
         
         try:
             for epoch in range(self.start_epoch, self.config.num_epochs):
@@ -164,20 +149,11 @@ class SegmentationTrainer:
                         images, targets = images.to(self.device), targets.to(self.device)
                         
                         # Forward pass with mixed precision
-                        with autocast(enabled=self.config.use_amp):
+                        with autocast():
                             outputs = self.model(images)
-                            if isinstance(outputs, list):
-                                loss = self.criterion(outputs[0], targets)
-                                
-                                # Add deep supervision losses
-                                ds_weight = 0.4
-                                for aux_output in outputs[1:]:
-                                    loss += ds_weight * self.criterion(aux_output, targets)
-                                    
-                                main_output = outputs[0]
-                            else:
-                                loss = self.criterion(outputs, targets)
-                                main_output = outputs
+                            if isinstance(outputs, tuple):
+                                outputs = outputs[0]  # Take main output if model returns multiple outputs
+                            loss = self.criterion(outputs, targets)
                         
                         # Backward pass
                         self.optimizer.zero_grad()
@@ -185,10 +161,9 @@ class SegmentationTrainer:
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
                         
-                        # Update metrics
+                        # Calculate metrics
+                        dice = self._calculate_dice(outputs.detach(), targets)
                         train_loss += loss.item()
-                        main_output = outputs[0] if isinstance(outputs, list) else outputs
-                        dice = self._calculate_dice(main_output, targets)
                         train_dice += dice
                         
                         # Update progress bar
@@ -204,39 +179,27 @@ class SegmentationTrainer:
                 # Validation phase
                 val_loss, val_dice = self._validate(val_loader)
                 
-                # Update learning rate
-                self.scheduler.step(val_dice)
-                
                 # Log metrics
                 self.writer.add_scalar('Loss/train', train_loss, epoch)
                 self.writer.add_scalar('Loss/val', val_loss, epoch)
                 self.writer.add_scalar('Dice/train', train_dice, epoch)
                 self.writer.add_scalar('Dice/val', val_dice, epoch)
-                self.writer.add_scalar('LR', self.optimizer.param_groups[0]['lr'], epoch)
                 
                 # Print epoch results
                 print(f"\nEpoch {epoch+1}/{self.config.num_epochs}")
                 print(f"Train - Loss: {train_loss:.4f}, Dice: {train_dice:.4f}")
                 print(f"Val   - Loss: {val_loss:.4f}, Dice: {val_dice:.4f}")
                 
-                # Save checkpoints
+                # Save best model
                 is_best = val_dice > self.best_val_dice
                 if is_best:
                     self.best_val_dice = val_dice
-                    self.patience_counter = 0
-                else:
-                    self.patience_counter += 1
                 
                 self._save_checkpoint(
                     epoch,
                     {'loss': val_loss, 'dice': val_dice},
                     is_best=is_best
                 )
-                
-                # Early stopping
-                if self.patience_counter >= self.config.early_stopping_patience:
-                    print(f"\nEarly stopping triggered after {epoch+1} epochs!")
-                    break
                 
         except KeyboardInterrupt:
             print("\nTraining interrupted by user. Saving checkpoint...")
@@ -258,17 +221,17 @@ class SegmentationTrainer:
         val_loss = 0
         val_dice = 0
         
-        print("\nStarting validation...")
         with tqdm(val_loader, desc="Validating") as pbar:
             for images, targets in pbar:
                 images, targets = images.to(self.device), targets.to(self.device)
                 
-                with autocast(enabled=self.config.use_amp):
+                with autocast():
                     outputs = self.model(images)
-                    main_output = outputs[0] if isinstance(outputs, list) else outputs
-                    loss = self.criterion(main_output, targets)
+                    if isinstance(outputs, tuple):
+                        outputs = outputs[0]
+                    loss = self.criterion(outputs, targets)
                 
-                dice = self._calculate_dice(main_output, targets)
+                dice = self._calculate_dice(outputs, targets)
                 val_loss += loss.item()
                 val_dice += dice
                 
@@ -280,29 +243,11 @@ class SegmentationTrainer:
         return val_loss / len(val_loader), val_dice / len(val_loader)
 
     def _calculate_dice(self, outputs, targets):
-        if outputs.shape[-3:] != targets.shape[-3:]:
-            outputs = F.interpolate(
-                outputs,
-                size=targets.shape[-3:],
-                mode='trilinear',
-                align_corners=False
-            )
+        # Convert logits to binary predictions
+        preds = (torch.sigmoid(outputs) > 0.5).float()
         
-        # Convert logits to predictions
-        preds = torch.argmax(outputs, dim=1)
-        if len(targets.shape) == len(preds.shape) + 1:
-            targets = targets.squeeze(1)
+        # Calculate dice coefficient
+        intersection = (preds * targets).sum()
+        union = preds.sum() + targets.sum()
         
-        # Calculate Dice coefficient for all classes
-        dice_scores = []
-        for class_idx in range(1, outputs.shape[1]):  # Skip background class
-            class_pred = (preds == class_idx)
-            class_target = (targets == class_idx)
-            
-            intersection = (class_pred & class_target).sum().float()
-            union = class_pred.sum().float() + class_target.sum().float()
-            
-            dice = (2. * intersection + 1e-5) / (union + 1e-5)
-            dice_scores.append(dice)
-        
-        return sum(dice_scores) / len(dice_scores)
+        return (2. * intersection + 1e-5) / (union + 1e-5)

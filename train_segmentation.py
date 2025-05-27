@@ -5,7 +5,7 @@ import random
 import numpy as np
 from models.segmentation import SegmentationModel, SegmentationConfig
 from models.segmentation.trainer import SegmentationTrainer
-from models.segmentation.dataset import SegmentationDataset
+from dataset_volume import KiTS23VolumeDataset
 import pkg_resources
 import os
 
@@ -60,7 +60,7 @@ def main():
                        help="Path to KiTS23 dataset directory")
     parser.add_argument("--output_dir", type=str, default="outputs/segmentation",
                        help="Directory to save model outputs")
-    parser.add_argument("--batch_size", type=int, default=4,
+    parser.add_argument("--batch_size", type=int, default=1,
                        help="Batch size for training")
     parser.add_argument("--epochs", type=int, default=100,
                        help="Number of epochs to train")
@@ -97,6 +97,7 @@ def main():
     config.log_dir = logs_dir
     config.experiment_name = f"segmentation_bs{args.batch_size}_lr{args.lr}"
     config.preprocess = True if args.preprocess is None else args.preprocess.lower() == "true"
+    config.preprocessed_volumes_dir = "preprocessed_volumes"  # Directory for preprocessed volumes
 
     # Save all configuration and environment details
     with open(output_dir / "experiment_config.txt", "w") as f:
