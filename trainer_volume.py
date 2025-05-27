@@ -26,6 +26,13 @@ class nnUNetVolumeTrainer:
         # Create checkpoint directory
         self.config.checkpoint_dir.mkdir(exist_ok=True)
         
+        # Training state initialization
+        self.start_epoch = 0
+        self.best_val_dice = float('-inf')
+        self.patience_counter = 0
+        self.current_epoch = 0
+        self.frozen_encoder_blocks = 4  # Initialize before loading weights
+        
         # Initialize model with 2 input channels
         self.model = nnUNetv2(
             in_channels=2,  # Changed to 2 for image + kidney mask
@@ -58,13 +65,6 @@ class nnUNetVolumeTrainer:
         
         self.scaler = GradScaler()
         self.writer = SummaryWriter(f"runs/{config.experiment_name}_volume_fold_{config.fold}")
-        
-        # Training state
-        self.start_epoch = 0
-        self.best_val_dice = float('-inf')
-        self.patience_counter = 0
-        self.current_epoch = 0
-        self.frozen_encoder_blocks = 4  # Start with most of encoder frozen
         
         # Register signal handlers
         signal.signal(signal.SIGINT, self._handle_interrupt)
