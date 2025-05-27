@@ -64,7 +64,7 @@ class nnUNetVolumeTrainer:
         self.best_val_dice = float('-inf')
         self.patience_counter = 0
         self.current_epoch = 0
-        self.frozen_layers = False
+        self.frozen_encoder_blocks = 4  # Start with most of encoder frozen
         
         # Register signal handlers
         signal.signal(signal.SIGINT, self._handle_interrupt)
@@ -72,13 +72,12 @@ class nnUNetVolumeTrainer:
         
         if config.resume_training:
             self._load_checkpoint()
-    
+
     def _load_patch_weights(self):
         """Load weights from patch-trained model."""
         print(f"Loading patch-trained weights from {self.config.patch_weights_path}")
         checkpoint = torch.load(self.config.patch_weights_path)
         
-        # Handle different input channels
         if 'model_state_dict' in checkpoint:
             state_dict = checkpoint['model_state_dict']
         else:
@@ -88,43 +87,61 @@ class nnUNetVolumeTrainer:
         old_conv = state_dict['down_blocks.0.conv_block.0.conv.weight']
         new_conv = torch.zeros(old_conv.shape[0], 2, *old_conv.shape[2:])
         new_conv[:, 0] = old_conv.squeeze(1)  # Copy weights for image channel
-        # Initialize kidney mask channel with mean of image channel weights
-        new_conv[:, 1] = old_conv.squeeze(1).mean(dim=0)
+        new_conv[:, 1] = old_conv.squeeze(1).mean(dim=0)  # Initialize kidney mask channel
         state_dict['down_blocks.0.conv_block.0.conv.weight'] = new_conv
 
-        # Load modified state dict
         self.model.load_state_dict(state_dict, strict=False)
-        
-        if self.config.freeze_layers:
-            self._freeze_early_layers()
+        self._freeze_encoder_blocks(self.frozen_encoder_blocks)
     
-    def _freeze_early_layers(self):
-        """Freeze early layers for transfer learning."""
-        print("Freezing early layers for transfer learning")
+    def _freeze_encoder_blocks(self, num_blocks):
+        """Freeze specified number of encoder blocks."""
+        print(f"Freezing {num_blocks} encoder blocks")
         for name, param in self.model.named_parameters():
-            if 'down_blocks.0' in name or 'down_blocks.1' in name:  # Freeze first two encoder blocks
-                param.requires_grad = False
-        self.frozen_layers = True
+            # Freeze specified number of encoder blocks
+            for i in range(num_blocks):
+                if f'down_blocks.{i}' in name:
+                    param.requires_grad = False
+        self.frozen_encoder_blocks = num_blocks
     
-    def _unfreeze_layers(self):
-        """Unfreeze all layers for fine-tuning."""
-        print("Unfreezing all layers")
-        for param in self.model.parameters():
-            param.requires_grad = True
-        self.frozen_layers = False
-    
+    def _unfreeze_one_block(self):
+        """Unfreeze the next encoder block."""
+        if self.frozen_encoder_blocks > 0:
+            self.frozen_encoder_blocks -= 1
+            print(f"Unfreezing encoder block {self.frozen_encoder_blocks}")
+            # Unfreeze the specific block
+            for name, param in self.model.named_parameters():
+                if f'down_blocks.{self.frozen_encoder_blocks}' in name:
+                    param.requires_grad = True
+
+    def _get_supervision_weights(self, epoch):
+        """Get progressive weights for deep supervision outputs."""
+        # Start with emphasis on detection (deeper layers)
+        # Gradually shift to segmentation (shallower layers)
+        progress = min(epoch / (self.config.num_epochs * 0.7), 1.0)  # Transition over 70% of training
+        
+        # Weights for [final_output, deep3, deep2, deep1]
+        # Early epochs: [0.4, 0.3, 0.2, 0.1]
+        # Late epochs:  [0.1, 0.2, 0.3, 0.4]
+        weights = torch.tensor([
+            0.4 - 0.3 * progress,  # Final output (detection)
+            0.3 - 0.1 * progress,  # Deep3
+            0.2 + 0.1 * progress,  # Deep2
+            0.1 + 0.3 * progress   # Deep1 (segmentation)
+        ])
+        
+        return weights.to(self.device)
+
     def train(self, dataset_path: str):
-        # Create dataset
+        # Create dataset and loaders
         dataset = KiTS23VolumeDataset(
             dataset_path,
             self.config,
             preprocessor=self.preprocessor,
             train=True,
-            preprocess=self.config.preprocess,
-            debug=self.config.debug
+            preprocess=self.config.preprocess
         )
         
-        # Split for validation
+        # Split and create dataloaders
         val_size = int(len(dataset) * self.config.validation_split)
         train_size = len(dataset) - val_size
         train_dataset, val_dataset = torch.utils.data.random_split(
@@ -133,13 +150,12 @@ class nnUNetVolumeTrainer:
             generator=torch.Generator().manual_seed(self.config.seed)
         )
         
-        # Create dataloaders with weighted sampling for challenging cases
         train_sampler = self._create_weighted_sampler(train_dataset)
         
         train_loader = DataLoader(
             train_dataset,
             batch_size=self.config.vol_batch_size,
-            sampler=train_sampler,  # Use weighted sampler instead of shuffle
+            sampler=train_sampler,
             num_workers=self.config.num_workers,
             pin_memory=True,
             collate_fn=KiTS23VolumeDataset.collate_fn
@@ -161,9 +177,12 @@ class nnUNetVolumeTrainer:
             for epoch in range(self.start_epoch, self.config.num_epochs):
                 self.current_epoch = epoch
                 
-                # Unfreeze layers if needed
-                if self.frozen_layers and epoch >= self.config.freeze_epochs:
-                    self._unfreeze_layers()
+                # Progressive unfreezing
+                if epoch > 0 and epoch % (self.config.num_epochs // 4) == 0:
+                    self._unfreeze_one_block()
+                
+                # Get supervision weights for this epoch
+                supervision_weights = self._get_supervision_weights(epoch)
                 
                 # Training phase
                 self.model.train()
@@ -176,36 +195,31 @@ class nnUNetVolumeTrainer:
                         images = images.to(self.device)
                         targets = targets.to(self.device)
                         
-                        # Forward pass with mixed precision
                         with autocast(enabled=self.config.use_amp):
                             outputs = self.model(images)
                             if isinstance(outputs, list):
-                                # Progressive learning with deep supervision
+                                # Progressive learning with weighted deep supervision
                                 loss = 0
-                                for idx, output in enumerate(outputs):
+                                for idx, (output, weight) in enumerate(zip(outputs, supervision_weights)):
                                     if idx == 0:
-                                        loss += self.criterion(output, targets)
+                                        loss += weight * self.criterion(output, targets)
                                     else:
-                                        # Scale target to match deep supervision output size
                                         scaled_target = F.interpolate(
                                             targets.float(),
                                             size=output.shape[2:],
                                             mode='nearest'
                                         )
-                                        loss += 0.5 * self.criterion(output, scaled_target)
+                                        loss += weight * self.criterion(output, scaled_target)
                                 main_output = outputs[0]
                             else:
                                 loss = self.criterion(outputs, targets)
                                 main_output = outputs
                             
-                            # Scale loss for gradient accumulation
                             loss = loss / self.config.vol_gradient_accumulation_steps
                         
-                        # Backward pass with gradient accumulation
                         self.scaler.scale(loss).backward()
                         
                         if (batch_idx + 1) % self.config.vol_gradient_accumulation_steps == 0:
-                            # Gradient clipping
                             self.scaler.unscale_(self.optimizer)
                             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                             
@@ -213,7 +227,6 @@ class nnUNetVolumeTrainer:
                             self.scaler.update()
                             self.optimizer.zero_grad()
                         
-                        # Update metrics
                         train_loss += loss.item() * self.config.vol_gradient_accumulation_steps
                         dice = self._calculate_dice(main_output, targets)
                         train_dice += dice
@@ -224,14 +237,11 @@ class nnUNetVolumeTrainer:
                             'lr': self.optimizer.param_groups[0]['lr']
                         })
                 
-                # Update learning rate
                 self.scheduler.step()
                 
-                # Calculate epoch metrics
                 train_loss /= len(train_loader)
                 train_dice /= len(train_loader)
                 
-                # Validation phase
                 val_loss, val_dice = self._validate(val_loader)
                 
                 # Log metrics
@@ -281,11 +291,9 @@ class nnUNetVolumeTrainer:
         weights = []
         for idx in range(len(dataset)):
             _, target = dataset[idx]
-            # Calculate weight based on tumor size
             tumor_size = (target > 0).sum().item()
             total_size = target.numel()
             ratio = tumor_size / total_size
-            # Give higher weights to smaller tumors
             weight = 1.0 / (ratio + 1e-5)
             weights.append(weight)
         
@@ -319,14 +327,13 @@ class nnUNetVolumeTrainer:
     
     def _calculate_dice(self, outputs, targets):
         """Calculate Dice score."""
-        # Ensure outputs and targets have same size
         if outputs.shape != targets.shape:
             targets = F.interpolate(
                 targets.float(),
                 size=outputs.shape[-3:],
                 mode='nearest'
             )
-            
+        
         preds = torch.argmax(outputs, dim=1)
         if len(targets.shape) == len(preds.shape) + 1:
             targets = targets.squeeze(1)
@@ -346,20 +353,17 @@ class nnUNetVolumeTrainer:
             'best_val_dice': self.best_val_dice,
             'patience_counter': self.patience_counter,
             'metrics': metrics,
-            'frozen_layers': self.frozen_layers
+            'frozen_encoder_blocks': self.frozen_encoder_blocks
         }
         
-        # Save latest checkpoint
         if self.config.save_latest:
             latest_path = self.config.checkpoint_dir / "volume_latest.pth"
             torch.save(checkpoint, latest_path)
         
-        # Save best model
         if is_best:
             best_path = self.config.checkpoint_dir / f"volume_best_dice_{metrics['dice']:.4f}.pth"
             torch.save(checkpoint, best_path)
         
-        # Save periodic checkpoint
         if (epoch + 1) % self.config.save_frequency == 0:
             path = self.config.checkpoint_dir / f"volume_checkpoint_epoch_{epoch+1}.pth"
             torch.save(checkpoint, path)
@@ -380,7 +384,7 @@ class nnUNetVolumeTrainer:
         self.start_epoch = checkpoint['epoch'] + 1
         self.best_val_dice = checkpoint['best_val_dice']
         self.patience_counter = checkpoint['patience_counter']
-        self.frozen_layers = checkpoint.get('frozen_layers', False)
+        self.frozen_encoder_blocks = checkpoint.get('frozen_encoder_blocks', 4)
         
         print(f"Resuming training from epoch {self.start_epoch}")
     
