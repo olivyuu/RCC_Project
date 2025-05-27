@@ -146,13 +146,20 @@ class SegmentationTrainer:
                 
                 with tqdm(train_loader, desc=f"Epoch {epoch+1}/{self.config.num_epochs}") as pbar:
                     for batch_idx, (images, targets) in enumerate(pbar):
+                        # Ensure inputs are tensors
+                        if isinstance(images, list):
+                            images = torch.stack(images)
+                        if isinstance(targets, list):
+                            targets = torch.stack(targets)
+                            
                         images, targets = images.to(self.device), targets.to(self.device)
                         
                         # Forward pass with mixed precision
                         with autocast():
                             outputs = self.model(images)
-                            if isinstance(outputs, tuple):
-                                outputs = outputs[0]  # Take main output if model returns multiple outputs
+                            # Ensure output is a tensor, not a list
+                            if isinstance(outputs, (list, tuple)):
+                                outputs = outputs[0]
                             loss = self.criterion(outputs, targets)
                         
                         # Backward pass
@@ -223,11 +230,18 @@ class SegmentationTrainer:
         
         with tqdm(val_loader, desc="Validating") as pbar:
             for images, targets in pbar:
+                # Ensure inputs are tensors
+                if isinstance(images, list):
+                    images = torch.stack(images)
+                if isinstance(targets, list):
+                    targets = torch.stack(targets)
+                    
                 images, targets = images.to(self.device), targets.to(self.device)
                 
                 with autocast():
                     outputs = self.model(images)
-                    if isinstance(outputs, tuple):
+                    # Ensure output is a tensor, not a list
+                    if isinstance(outputs, (list, tuple)):
                         outputs = outputs[0]
                     loss = self.criterion(outputs, targets)
                 
