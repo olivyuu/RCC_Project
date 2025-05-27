@@ -18,8 +18,8 @@ from losses import DC_and_BCE_loss
 class DebugStats:
     """Helper class to track and log training statistics"""
     def __init__(self, log_dir):
-        self.log_dir = Path(log_dir)
-        self.log_dir.mkdir(exist_ok=True)
+        self.log_dir = Path(log_dir) / "debug_logs"
+        self.log_dir.mkdir(parents=True, exist_ok=True)
         self.stats = {
             'gradient_norms': [],
             'weight_norms': [],
@@ -88,8 +88,8 @@ class SegmentationTrainer:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
         
-        # Initialize debug stats
-        self.debug_stats = DebugStats(Path(config.output_dir) / "debug_logs")
+        # Initialize debug stats using log_dir
+        self.debug_stats = DebugStats(config.log_dir)
         
         # Create checkpoint directory
         self.config.checkpoint_dir.mkdir(exist_ok=True)
