@@ -8,6 +8,7 @@ from tqdm import tqdm
 import signal
 import sys
 from torch.utils.tensorboard import SummaryWriter
+import torch.optim.lr_scheduler as lr_scheduler  # Add explicit import
 
 from model import nnUNetv2
 from dataset_volume import KiTS23VolumeDataset
@@ -56,7 +57,7 @@ class nnUNetVolumeTrainer:
         )
         
         # Learning rate scheduler with longer cycles
-        self.scheduler = torch.optim.CosineAnnealingWarmRestarts(
+        self.scheduler = lr_scheduler.CosineAnnealingWarmRestarts(  # Use lr_scheduler namespace
             self.optimizer,
             T_0=20,  # Longer initial cycle for better exploration
             T_mult=1,  # Keep consistent cycle length
@@ -72,7 +73,7 @@ class nnUNetVolumeTrainer:
         
         if config.resume_training:
             self._load_checkpoint()
-
+    
     def _load_patch_weights(self):
         """Load weights from patch-trained model."""
         print(f"Loading patch-trained weights from {self.config.patch_weights_path}")
@@ -120,7 +121,6 @@ class nnUNetVolumeTrainer:
         progress = min(epoch / (self.config.num_epochs * 0.5), 1.0)  # Transition over 50% of training
         
         # More aggressive weight transition
-        # Early: [0.3, 0.2, 0.2, 0.3] -> Late: [0.1, 0.1, 0.3, 0.5]
         weights = torch.tensor([
             0.3 - 0.2 * progress,  # Final output (detection) - less emphasis
             0.2 - 0.1 * progress,  # Deep3
