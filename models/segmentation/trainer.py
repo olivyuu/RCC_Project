@@ -53,7 +53,7 @@ class SegmentationTrainer:
         if config.resume_training:
             self._load_checkpoint()
 
-    def _debug_tensor_info(self, name, tensor):
+    def _debug_tensor_info(self, name, tensor, extra_info=None):
         """Helper function to print tensor debug information"""
         if not isinstance(tensor, torch.Tensor):
             print(f"\n{name} is not a tensor, type: {type(tensor)}")
@@ -61,18 +61,25 @@ class SegmentationTrainer:
                 for i, t in enumerate(tensor):
                     if isinstance(t, torch.Tensor):
                         print(f"\n{name}[{i}] Debug Info:")
-                        print(f"Shape: {t.shape}")
-                        print(f"Type: {t.dtype}")
-                        print(f"Device: {t.device}")
-                        print(f"Min: {t.min().item():.4f}, Max: {t.max().item():.4f}")
-                        print(f"Memory: {t.element_size() * t.nelement() / 1024 / 1024:.2f} MB")
+                        self._print_tensor_stats(t)
             return
 
         print(f"\n{name} Debug Info:")
+        self._print_tensor_stats(tensor)
+        if extra_info:
+            print(f"Extra Info: {extra_info}")
+
+    def _print_tensor_stats(self, tensor):
         print(f"Shape: {tensor.shape}")
         print(f"Type: {tensor.dtype}")
         print(f"Device: {tensor.device}")
-        print(f"Min: {tensor.min().item():.4f}, Max: {tensor.max().item():.4f}")
+        if tensor.dtype in [torch.float16, torch.float32, torch.float64]:
+            print(f"Min: {tensor.min().item():.4f}, Max: {tensor.max().item():.4f}")
+            print(f"Mean: {tensor.mean().item():.4f}, Std: {tensor.std().item():.4f}")
+            nan_count = torch.isnan(tensor).sum().item()
+            inf_count = torch.isinf(tensor).sum().item()
+            if nan_count > 0 or inf_count > 0:
+                print(f"WARNING - NaN count: {nan_count}, Inf count: {inf_count}")
         print(f"Memory: {tensor.element_size() * tensor.nelement() / 1024 / 1024:.2f} MB")
 
     def _save_checkpoint(self, epoch: int, metrics: dict, is_best: bool = False):
@@ -179,25 +186,36 @@ class SegmentationTrainer:
                         with autocast():
                             outputs = self.model(images)
                             
-                            # Debug model outputs
+                            # Debug model outputs and interpolation
                             if batch_idx == 0 and epoch == 0:
                                 self._debug_tensor_info("Raw model outputs", outputs)
-                                # Extract main output if it's a tuple/list
-                                if isinstance(outputs, (tuple, list)):
-                                    outputs = outputs[0]
-                                    print("\nUsing first output tensor from model outputs")
-                                    self._debug_tensor_info("Processed model outputs", outputs)
-                            else:
-                                # Extract main output for non-debug iterations
-                                if isinstance(outputs, (tuple, list)):
-                                    outputs = outputs[0]
                             
-                            # Ensure outputs match target size
+                            # Extract main output if it's a tuple/list
+                            if isinstance(outputs, (tuple, list)):
+                                self._debug_tensor_info("Last output in list", outputs[-1])
+                                outputs = outputs[-1]  # Use the last output (should be highest resolution)
+                            
+                            # Debug interpolation
                             if outputs.shape[-3:] != targets.shape[-3:]:
-                                print(f"\nSize mismatch - Output: {outputs.shape}, Target: {targets.shape}")
-                                outputs = F.interpolate(outputs, size=targets.shape[-3:], mode='trilinear', align_corners=False)
+                                print(f"\nInterpolating output from {outputs.shape[-3:]} to {targets.shape[-3:]}")
+                                outputs_before_interp = outputs
+                                outputs = F.interpolate(
+                                    outputs.float(),  # Convert to float32 for interpolation
+                                    size=targets.shape[-3:],
+                                    mode='trilinear',
+                                    align_corners=False
+                                )
+                                self._debug_tensor_info("Outputs after interpolation", outputs, 
+                                                      f"Scale factor: {outputs.shape[-1]/outputs_before_interp.shape[-1]:.2f}")
                             
+                            # Calculate and debug loss
                             loss = self.criterion(outputs, targets)
+                            if batch_idx == 0 and epoch == 0:
+                                print(f"\nLoss value: {loss.item():.4f}")
+                                if torch.isnan(loss):
+                                    print("WARNING: NaN loss detected!")
+                                    self._debug_tensor_info("Final outputs before loss", outputs)
+                                    self._debug_tensor_info("Targets used in loss", targets)
                         
                         # Backward pass
                         self.optimizer.zero_grad()
@@ -210,6 +228,10 @@ class SegmentationTrainer:
                             dice = self._calculate_dice(outputs.detach(), targets)
                             train_loss += loss.item()
                             train_dice += dice
+                            
+                            # Debug dice calculation for first batch
+                            if batch_idx == 0 and epoch == 0:
+                                print(f"\nDice score: {dice.item():.4f}")
                         
                         # Update progress bar
                         pbar.set_postfix({
@@ -279,11 +301,12 @@ class SegmentationTrainer:
                 with autocast():
                     outputs = self.model(images)
                     if isinstance(outputs, (tuple, list)):
-                        outputs = outputs[0]
+                        outputs = outputs[-1]
                     
                     # Ensure outputs match target size
                     if outputs.shape[-3:] != targets.shape[-3:]:
-                        outputs = F.interpolate(outputs, size=targets.shape[-3:], mode='trilinear', align_corners=False)
+                        outputs = F.interpolate(outputs.float(), size=targets.shape[-3:],
+                                             mode='trilinear', align_corners=False)
                     
                     loss = self.criterion(outputs, targets)
                 
@@ -300,15 +323,6 @@ class SegmentationTrainer:
 
     def _calculate_dice(self, outputs, targets):
         with torch.no_grad():
-            # Debug tensor shapes if they don't match
-            if outputs.shape != targets.shape:
-                print(f"\nShape mismatch in dice calculation:")
-                print(f"Outputs shape: {outputs.shape}")
-                print(f"Targets shape: {targets.shape}")
-                
-                # Ensure outputs match target size
-                outputs = F.interpolate(outputs, size=targets.shape[-3:], mode='trilinear', align_corners=False)
-            
             # Convert logits to binary predictions
             preds = (torch.sigmoid(outputs) > 0.5).float()
             
