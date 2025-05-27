@@ -14,90 +14,32 @@ from model import nnUNetv2
 from dataset_volume import KiTS23VolumeDataset
 from losses import DC_and_BCE_loss
 
-class DebugMetrics:
-    """Lightweight debug helper to track essential training metrics"""
-    def __init__(self):
-        self.reset()
-    
-    def reset(self):
-        """Reset statistics for new epoch"""
-        self.gradient_norms = []
-        self.loss_values = []
-        self.activation_ranges = []
-        self.prediction_ratios = []
-    
-    def update(self, model, loss, outputs=None, targets=None):
-        """Update metrics with minimal memory overhead"""
-        # Track gradient norm without storing gradients
-        total_norm = 0.0
-        param_norm = 0.0
-        for p in model.parameters():
-            if p.grad is not None:
-                param_norm = p.grad.data.norm(2).item()
-                total_norm += param_norm * param_norm
-        total_norm = total_norm ** 0.5
-        self.gradient_norms.append(total_norm)
-        
-        # Track scalar metrics
-        self.loss_values.append(loss.item())
-        
-        if outputs is not None:
-            with torch.no_grad():  # Ensure no memory retained
-                min_val = outputs.min().item()
-                max_val = outputs.max().item()
-                self.activation_ranges.append((min_val, max_val))
-                
-                if targets is not None:
-                    pred_ratio = (outputs > 0).float().mean().item()
-                    target_ratio = (targets > 0).float().mean().item()
-                    self.prediction_ratios.append((pred_ratio, target_ratio))
-    
-    def report(self, epoch, batch_idx):
-        """Print current statistics"""
-        if len(self.gradient_norms) == 0:
-            return
-        
-        print(f"\nDebug Statistics (Epoch {epoch}, Batch {batch_idx}):")
-        print(f"Latest gradient norm: {self.gradient_norms[-1]:.4f}")
-        print(f"Latest loss value: {self.loss_values[-1]:.4f}")
-        
-        if self.activation_ranges:
-            min_val, max_val = self.activation_ranges[-1]
-            print(f"Output range: [{min_val:.4f}, {max_val:.4f}]")
-        
-        if self.prediction_ratios:
-            pred_ratio, target_ratio = self.prediction_ratios[-1]
-            print(f"Positive prediction ratio: {pred_ratio:.4f}")
-            print(f"Positive target ratio: {target_ratio:.4f}")
-
 class SegmentationTrainer:
     def __init__(self, config):
         self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
         
-        # Debug metrics
-        self.debug = DebugMetrics()
-        
         # Create checkpoint directory
         self.config.checkpoint_dir.mkdir(exist_ok=True)
         
         # Initialize model
         self.model = nnUNetv2(
-            in_channels=2,
-            out_channels=1,
+            in_channels=2,  # Image and kidney mask channels
+            out_channels=1,  # Tumor segmentation
             features=config.features
         ).to(self.device)
         
+        # Initialize weights with He initialization
         self._initialize_weights()
         
         # Initialize training components
         self.criterion = DC_and_BCE_loss()
         self.optimizer = torch.optim.Adam(
             self.model.parameters(),
-            lr=1e-4,
-            weight_decay=1e-5,
-            eps=1e-8
+            lr=1e-4,  # Lower learning rate
+            weight_decay=1e-5,  # L2 regularization
+            eps=1e-8  # For numerical stability
         )
         
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -163,7 +105,6 @@ class SegmentationTrainer:
         try:
             for epoch in range(self.start_epoch, self.config.num_epochs):
                 self.current_epoch = epoch
-                self.debug.reset()  # Reset debug metrics for new epoch
                 
                 # Training phase
                 self.model.train()
@@ -189,7 +130,7 @@ class SegmentationTrainer:
                                 align_corners=False
                             )
                         
-                        # Calculate loss without activation
+                        # Calculate loss without sigmoid activation
                         loss = self.criterion(outputs, targets)
                         
                         if torch.isnan(loss) or torch.isinf(loss):
@@ -201,13 +142,6 @@ class SegmentationTrainer:
                         self.optimizer.zero_grad()
                         loss.backward()
                         
-                        # Update debug metrics (before clipping)
-                        self.debug.update(self.model, loss, outputs, targets)
-                        
-                        # Print debug info periodically
-                        if batch_idx % 10 == 0:
-                            self.debug.report(epoch, batch_idx)
-                        
                         total_norm = torch.nn.utils.clip_grad_norm_(
                             self.model.parameters(),
                             self.max_grad_norm
@@ -215,7 +149,7 @@ class SegmentationTrainer:
                         
                         self.optimizer.step()
                         
-                        # Calculate metrics
+                        # Calculate metrics with sigmoid activation
                         with torch.no_grad():
                             outputs_sigmoid = torch.sigmoid(outputs)
                             dice = self._calculate_dice(outputs_sigmoid.detach(), targets)
@@ -224,6 +158,12 @@ class SegmentationTrainer:
                                 train_loss += loss.item()
                                 train_dice += dice
                                 valid_batches += 1
+                        
+                        # Logging
+                        if batch_idx % 10 == 0:
+                            print(f"\nGradient norm: {total_norm:.4f}")
+                            print(f"Loss: {loss.item():.4f}")
+                            print(f"Dice: {dice.item():.4f}")
                         
                         pbar.set_postfix({
                             'loss': f"{loss.item():.4f}",
