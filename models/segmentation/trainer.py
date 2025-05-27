@@ -55,6 +55,19 @@ class SegmentationTrainer:
 
     def _debug_tensor_info(self, name, tensor):
         """Helper function to print tensor debug information"""
+        if not isinstance(tensor, torch.Tensor):
+            print(f"\n{name} is not a tensor, type: {type(tensor)}")
+            if isinstance(tensor, (list, tuple)):
+                for i, t in enumerate(tensor):
+                    if isinstance(t, torch.Tensor):
+                        print(f"\n{name}[{i}] Debug Info:")
+                        print(f"Shape: {t.shape}")
+                        print(f"Type: {t.dtype}")
+                        print(f"Device: {t.device}")
+                        print(f"Min: {t.min().item():.4f}, Max: {t.max().item():.4f}")
+                        print(f"Memory: {t.element_size() * t.nelement() / 1024 / 1024:.2f} MB")
+            return
+
         print(f"\n{name} Debug Info:")
         print(f"Shape: {tensor.shape}")
         print(f"Type: {tensor.dtype}")
@@ -165,12 +178,19 @@ class SegmentationTrainer:
                         # Forward pass with mixed precision
                         with autocast():
                             outputs = self.model(images)
-                            if isinstance(outputs, tuple):
-                                outputs = outputs[0]
                             
                             # Debug model outputs
                             if batch_idx == 0 and epoch == 0:
-                                self._debug_tensor_info("Model outputs", outputs)
+                                self._debug_tensor_info("Raw model outputs", outputs)
+                                # Extract main output if it's a tuple/list
+                                if isinstance(outputs, (tuple, list)):
+                                    outputs = outputs[0]
+                                    print("\nUsing first output tensor from model outputs")
+                                    self._debug_tensor_info("Processed model outputs", outputs)
+                            else:
+                                # Extract main output for non-debug iterations
+                                if isinstance(outputs, (tuple, list)):
+                                    outputs = outputs[0]
                             
                             # Ensure outputs match target size
                             if outputs.shape[-3:] != targets.shape[-3:]:
@@ -235,6 +255,12 @@ class SegmentationTrainer:
             )
             print("Checkpoint saved. Exiting...")
             sys.exit(0)
+        except Exception as e:
+            print(f"\nError during training: {str(e)}")
+            print(f"Error type: {type(e).__name__}")
+            import traceback
+            traceback.print_exc()
+            raise
         
         self.writer.close()
         print("\nTraining completed!")
@@ -252,7 +278,7 @@ class SegmentationTrainer:
                 
                 with autocast():
                     outputs = self.model(images)
-                    if isinstance(outputs, tuple):
+                    if isinstance(outputs, (tuple, list)):
                         outputs = outputs[0]
                     
                     # Ensure outputs match target size
