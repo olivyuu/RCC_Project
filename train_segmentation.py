@@ -3,11 +3,16 @@ from pathlib import Path
 import torch
 import random
 import numpy as np
+import multiprocessing as mp
 from models.segmentation import SegmentationModel, SegmentationConfig
 from models.segmentation.trainer import SegmentationTrainer
 from dataset_volume import KiTS23VolumeDataset
 import pkg_resources
 import os
+
+# Set multiprocessing start method to 'spawn' for CUDA compatibility
+if __name__ == "__main__":
+    mp.set_start_method('spawn', force=True)
 
 def check_versions():
     """Verify that installed package versions match requirements"""
@@ -55,6 +60,9 @@ def set_reproducibility():
     print("Deterministic mode enabled for reproducibility")
 
 def main():
+    # Set reproducibility first, before any CUDA operations
+    set_reproducibility()
+    
     parser = argparse.ArgumentParser(description="Train tumor segmentation model")
     parser.add_argument("--data_dir", type=str, required=True, 
                        help="Path to KiTS23 dataset directory")
@@ -74,9 +82,6 @@ def main():
 
     # Check package versions
     check_versions()
-    
-    # Set up reproducibility
-    set_reproducibility()
 
     # Create output directories
     output_dir = Path(args.output_dir)
