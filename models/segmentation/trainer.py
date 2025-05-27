@@ -53,6 +53,15 @@ class SegmentationTrainer:
         if config.resume_training:
             self._load_checkpoint()
 
+    def _debug_tensor_info(self, name, tensor):
+        """Helper function to print tensor debug information"""
+        print(f"\n{name} Debug Info:")
+        print(f"Shape: {tensor.shape}")
+        print(f"Type: {tensor.dtype}")
+        print(f"Device: {tensor.device}")
+        print(f"Min: {tensor.min().item():.4f}, Max: {tensor.max().item():.4f}")
+        print(f"Memory: {tensor.element_size() * tensor.nelement() / 1024 / 1024:.2f} MB")
+
     def _save_checkpoint(self, epoch: int, metrics: dict, is_best: bool = False):
         checkpoint = {
             'epoch': epoch,
@@ -146,20 +155,28 @@ class SegmentationTrainer:
                 
                 with tqdm(train_loader, desc=f"Epoch {epoch+1}/{self.config.num_epochs}") as pbar:
                     for batch_idx, (images, targets) in enumerate(pbar):
-                        # Ensure inputs are tensors
-                        if isinstance(images, list):
-                            images = torch.stack(images)
-                        if isinstance(targets, list):
-                            targets = torch.stack(targets)
-                            
+                        # Debug first batch
+                        if batch_idx == 0 and epoch == 0:
+                            self._debug_tensor_info("Input images", images)
+                            self._debug_tensor_info("Target masks", targets)
+
                         images, targets = images.to(self.device), targets.to(self.device)
                         
                         # Forward pass with mixed precision
                         with autocast():
                             outputs = self.model(images)
-                            # Ensure output is a tensor, not a list
-                            if isinstance(outputs, (list, tuple)):
+                            if isinstance(outputs, tuple):
                                 outputs = outputs[0]
+                            
+                            # Debug model outputs
+                            if batch_idx == 0 and epoch == 0:
+                                self._debug_tensor_info("Model outputs", outputs)
+                            
+                            # Ensure outputs match target size
+                            if outputs.shape[-3:] != targets.shape[-3:]:
+                                print(f"\nSize mismatch - Output: {outputs.shape}, Target: {targets.shape}")
+                                outputs = F.interpolate(outputs, size=targets.shape[-3:], mode='trilinear', align_corners=False)
+                            
                             loss = self.criterion(outputs, targets)
                         
                         # Backward pass
@@ -169,9 +186,10 @@ class SegmentationTrainer:
                         self.scaler.update()
                         
                         # Calculate metrics
-                        dice = self._calculate_dice(outputs.detach(), targets)
-                        train_loss += loss.item()
-                        train_dice += dice
+                        with torch.no_grad():
+                            dice = self._calculate_dice(outputs.detach(), targets)
+                            train_loss += loss.item()
+                            train_dice += dice
                         
                         # Update progress bar
                         pbar.set_postfix({
@@ -230,19 +248,17 @@ class SegmentationTrainer:
         
         with tqdm(val_loader, desc="Validating") as pbar:
             for images, targets in pbar:
-                # Ensure inputs are tensors
-                if isinstance(images, list):
-                    images = torch.stack(images)
-                if isinstance(targets, list):
-                    targets = torch.stack(targets)
-                    
                 images, targets = images.to(self.device), targets.to(self.device)
                 
                 with autocast():
                     outputs = self.model(images)
-                    # Ensure output is a tensor, not a list
-                    if isinstance(outputs, (list, tuple)):
+                    if isinstance(outputs, tuple):
                         outputs = outputs[0]
+                    
+                    # Ensure outputs match target size
+                    if outputs.shape[-3:] != targets.shape[-3:]:
+                        outputs = F.interpolate(outputs, size=targets.shape[-3:], mode='trilinear', align_corners=False)
+                    
                     loss = self.criterion(outputs, targets)
                 
                 dice = self._calculate_dice(outputs, targets)
@@ -257,11 +273,21 @@ class SegmentationTrainer:
         return val_loss / len(val_loader), val_dice / len(val_loader)
 
     def _calculate_dice(self, outputs, targets):
-        # Convert logits to binary predictions
-        preds = (torch.sigmoid(outputs) > 0.5).float()
-        
-        # Calculate dice coefficient
-        intersection = (preds * targets).sum()
-        union = preds.sum() + targets.sum()
-        
-        return (2. * intersection + 1e-5) / (union + 1e-5)
+        with torch.no_grad():
+            # Debug tensor shapes if they don't match
+            if outputs.shape != targets.shape:
+                print(f"\nShape mismatch in dice calculation:")
+                print(f"Outputs shape: {outputs.shape}")
+                print(f"Targets shape: {targets.shape}")
+                
+                # Ensure outputs match target size
+                outputs = F.interpolate(outputs, size=targets.shape[-3:], mode='trilinear', align_corners=False)
+            
+            # Convert logits to binary predictions
+            preds = (torch.sigmoid(outputs) > 0.5).float()
+            
+            # Calculate dice coefficient
+            intersection = (preds * targets).sum()
+            union = preds.sum() + targets.sum()
+            
+            return (2. * intersection + 1e-5) / (union + 1e-5)
