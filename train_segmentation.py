@@ -12,20 +12,25 @@ import os
 def check_versions():
     """Verify that installed package versions match requirements"""
     required = {
-        "torch": "2.0.1",
         "numpy": "1.24.3",
         "nibabel": "5.1.0",
         "totalsegmentator": "1.5.5",
         "nnunetv2": "2.2.0"
     }
     
+    # Check PyTorch version - allow 2.x versions
+    torch_version = pkg_resources.get_distribution("torch").version
+    if not torch_version.startswith("2."):
+        print(f"Error: PyTorch major version mismatch. Have {torch_version}, need version 2.x")
+        raise ValueError("PyTorch version must be 2.x for reproducibility")
+    else:
+        print(f"Using PyTorch version {torch_version}")
+    
     for package, version in required.items():
         try:
             installed = pkg_resources.get_distribution(package).version
             if installed != version:
                 print(f"Warning: {package} version mismatch. Required: {version}, Installed: {installed}")
-                if package == "torch":  # Critical for reproducibility
-                    raise ValueError(f"PyTorch version must be exactly {version} for reproducibility")
         except pkg_resources.DistributionNotFound:
             print(f"Error: Required package {package} is not installed")
             raise
