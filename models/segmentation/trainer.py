@@ -175,47 +175,40 @@ class SegmentationTrainer:
                 
                 with tqdm(train_loader, desc=f"Epoch {epoch+1}/{self.config.num_epochs}") as pbar:
                     for batch_idx, (images, targets) in enumerate(pbar):
-                        # Debug first batch
+                        # Debug first batch - commented out for cleaner output
+                        """
                         if batch_idx == 0 and epoch == 0:
                             self._debug_tensor_info("Input images", images)
                             self._debug_tensor_info("Target masks", targets)
+                        """
 
-                        images, targets = images.to(self.device), targets.to(self.device)
+                        images = images.to(self.device)
+                        targets = targets.to(self.device)
                         
                         # Forward pass with mixed precision
                         with autocast():
                             outputs = self.model(images)
                             
-                            # Debug model outputs and interpolation
+                            """
+                            # Debug model outputs
                             if batch_idx == 0 and epoch == 0:
                                 self._debug_tensor_info("Raw model outputs", outputs)
+                            """
                             
-                            # Extract main output if it's a tuple/list
-                            if isinstance(outputs, (tuple, list)):
-                                self._debug_tensor_info("Last output in list", outputs[-1])
-                                outputs = outputs[-1]  # Use the last output (should be highest resolution)
+                            # Process outputs (handle list/tuple outputs)
+                            if isinstance(outputs, (list, tuple)):
+                                outputs = outputs[-1]
                             
-                            # Debug interpolation
+                            # Ensure outputs match target size
                             if outputs.shape[-3:] != targets.shape[-3:]:
-                                print(f"\nInterpolating output from {outputs.shape[-3:]} to {targets.shape[-3:]}")
-                                outputs_before_interp = outputs
                                 outputs = F.interpolate(
-                                    outputs.float(),  # Convert to float32 for interpolation
+                                    outputs.float(),
                                     size=targets.shape[-3:],
                                     mode='trilinear',
                                     align_corners=False
                                 )
-                                self._debug_tensor_info("Outputs after interpolation", outputs, 
-                                                      f"Scale factor: {outputs.shape[-1]/outputs_before_interp.shape[-1]:.2f}")
                             
-                            # Calculate and debug loss
                             loss = self.criterion(outputs, targets)
-                            if batch_idx == 0 and epoch == 0:
-                                print(f"\nLoss value: {loss.item():.4f}")
-                                if torch.isnan(loss):
-                                    print("WARNING: NaN loss detected!")
-                                    self._debug_tensor_info("Final outputs before loss", outputs)
-                                    self._debug_tensor_info("Targets used in loss", targets)
                         
                         # Backward pass
                         self.optimizer.zero_grad()
@@ -228,15 +221,11 @@ class SegmentationTrainer:
                             dice = self._calculate_dice(outputs.detach(), targets)
                             train_loss += loss.item()
                             train_dice += dice
-                            
-                            # Debug dice calculation for first batch
-                            if batch_idx == 0 and epoch == 0:
-                                print(f"\nDice score: {dice.item():.4f}")
                         
                         # Update progress bar
                         pbar.set_postfix({
-                            'loss': loss.item(),
-                            'dice': dice
+                            'loss': f"{loss.item():.4f}",
+                            'dice': f"{dice.item():.4f}"
                         })
                 
                 # Calculate epoch metrics
@@ -296,17 +285,22 @@ class SegmentationTrainer:
         
         with tqdm(val_loader, desc="Validating") as pbar:
             for images, targets in pbar:
-                images, targets = images.to(self.device), targets.to(self.device)
+                images = images.to(self.device)
+                targets = targets.to(self.device)
                 
                 with autocast():
                     outputs = self.model(images)
-                    if isinstance(outputs, (tuple, list)):
+                    if isinstance(outputs, (list, tuple)):
                         outputs = outputs[-1]
                     
                     # Ensure outputs match target size
                     if outputs.shape[-3:] != targets.shape[-3:]:
-                        outputs = F.interpolate(outputs.float(), size=targets.shape[-3:],
-                                             mode='trilinear', align_corners=False)
+                        outputs = F.interpolate(
+                            outputs.float(),
+                            size=targets.shape[-3:],
+                            mode='trilinear',
+                            align_corners=False
+                        )
                     
                     loss = self.criterion(outputs, targets)
                 
@@ -315,8 +309,8 @@ class SegmentationTrainer:
                 val_dice += dice
                 
                 pbar.set_postfix({
-                    'loss': loss.item(),
-                    'dice': dice
+                    'loss': f"{loss.item():.4f}",
+                    'dice': f"{dice.item():.4f}"
                 })
         
         return val_loss / len(val_loader), val_dice / len(val_loader)
