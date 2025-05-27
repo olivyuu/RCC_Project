@@ -1,26 +1,10 @@
-# Dataset
-kits23/
-
-# Python virtual environment
-myenv/
-venv/
-env/
-.env/
-
-# Preprocessed data
-preprocessed_patches/
-
-# Model checkpoints and runs
-checkpoints/
-runs/
-gradcam_results/
-
 # Python
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
+env/
 build/
 develop-eggs/
 dist/
@@ -36,13 +20,27 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-**/__pycache__/
 
-# IDE
+# Executables
+*.exe
+*.out
+*.app
+
+# Project specific
+diff.txt
+apply_diff.py
+preprocessed_patches/
+preprocessed_volumes/
+checkpoints/
+runs/
+outputs/
+*.pth
+
+# Editor
 .vscode/
-.idea/
 *.swp
 *.swo
+*~
 
 # OS
 .DS_Store
