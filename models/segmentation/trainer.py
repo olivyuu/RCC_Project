@@ -9,83 +9,66 @@ from tqdm import tqdm
 import signal
 import sys
 from torch.utils.tensorboard import SummaryWriter
-import matplotlib.pyplot as plt
-import gc
 
 from model import nnUNetv2
 from dataset_volume import KiTS23VolumeDataset
 from losses import DC_and_BCE_loss
 
-class DebugStats:
-    """Helper class to track and log training statistics"""
-    def __init__(self, log_dir):
-        self.log_dir = Path(log_dir) / "debug_logs"
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-        self.stats = {
-            'gradient_norms': [],
-            'weight_norms': [],
-            'activation_ranges': [],
-            'loss_values': [],
-            'dice_scores': []
-        }
+class DebugMetrics:
+    """Lightweight debug helper to track essential training metrics"""
+    def __init__(self):
+        self.reset()
     
-    def log_batch(self, epoch, batch_idx, model, loss, dice, outputs, targets):
-        grad_norm = 0
-        weight_norm = 0
-        for name, param in model.named_parameters():
-            if param.grad is not None:
-                grad_norm += param.grad.norm().item()
-            weight_norm += param.norm().item()
+    def reset(self):
+        """Reset statistics for new epoch"""
+        self.gradient_norms = []
+        self.loss_values = []
+        self.activation_ranges = []
+        self.prediction_ratios = []
+    
+    def update(self, model, loss, outputs=None, targets=None):
+        """Update metrics with minimal memory overhead"""
+        # Track gradient norm without storing gradients
+        total_norm = 0.0
+        param_norm = 0.0
+        for p in model.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2).item()
+                total_norm += param_norm * param_norm
+        total_norm = total_norm ** 0.5
+        self.gradient_norms.append(total_norm)
         
-        self.stats['gradient_norms'].append(grad_norm)
-        self.stats['weight_norms'].append(weight_norm)
+        # Track scalar metrics
+        self.loss_values.append(loss.item())
         
-        output_min = outputs.min().item()
-        output_max = outputs.max().item()
-        self.stats['activation_ranges'].append((output_min, output_max))
+        if outputs is not None:
+            with torch.no_grad():  # Ensure no memory retained
+                min_val = outputs.min().item()
+                max_val = outputs.max().item()
+                self.activation_ranges.append((min_val, max_val))
+                
+                if targets is not None:
+                    pred_ratio = (outputs > 0).float().mean().item()
+                    target_ratio = (targets > 0).float().mean().item()
+                    self.prediction_ratios.append((pred_ratio, target_ratio))
+    
+    def report(self, epoch, batch_idx):
+        """Print current statistics"""
+        if len(self.gradient_norms) == 0:
+            return
         
-        self.stats['loss_values'].append(loss.item())
-        self.stats['dice_scores'].append(dice.item())
+        print(f"\nDebug Statistics (Epoch {epoch}, Batch {batch_idx}):")
+        print(f"Latest gradient norm: {self.gradient_norms[-1]:.4f}")
+        print(f"Latest loss value: {self.loss_values[-1]:.4f}")
         
-        if batch_idx % 10 == 0:
-            self._save_batch_info(epoch, batch_idx, model, outputs, targets)
-            
-            # Log memory usage
-            print("\nGPU Memory Usage:")
-            print(f"Allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
-            print(f"Cached: {torch.cuda.memory_reserved() / 1e9:.2f} GB")
-            print(f"Max Allocated: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB")
-
-    def _save_batch_info(self, epoch, batch_idx, model, outputs, targets):
-        info_file = self.log_dir / f"batch_e{epoch}_b{batch_idx}.txt"
-        with open(info_file, "w") as f:
-            f.write(f"=== Batch Information ===\n")
-            f.write(f"Epoch: {epoch}, Batch: {batch_idx}\n\n")
-            
-            f.write("Recent Statistics:\n")
-            f.write(f"Last 5 gradient norms: {self.stats['gradient_norms'][-5:]}\n")
-            f.write(f"Last 5 weight norms: {self.stats['weight_norms'][-5:]}\n")
-            f.write(f"Last 5 loss values: {self.stats['loss_values'][-5:]}\n")
-            f.write(f"Last 5 dice scores: {self.stats['dice_scores'][-5:]}\n\n")
-            
-            f.write("Layer Information:\n")
-            for name, param in model.named_parameters():
-                if param.grad is not None:
-                    f.write(f"\n{name}:\n")
-                    f.write(f"Weight range: [{param.min().item():.4f}, {param.max().item():.4f}]\n")
-                    f.write(f"Weight mean: {param.mean().item():.4f}, std: {param.std().item():.4f}\n")
-                    if param.grad is not None:
-                        f.write(f"Gradient range: [{param.grad.min().item():.4f}, {param.grad.max().item():.4f}]\n")
-                        f.write(f"Gradient mean: {param.grad.mean().item():.4f}, std: {param.grad.std().item():.4f}\n")
-                    f.write(f"Weight norm: {param.norm().item():.4f}\n")
-            
-            f.write("\nPrediction Statistics:\n")
-            f.write(f"Output range: [{outputs.min().item():.4f}, {outputs.max().item():.4f}]\n")
-            f.write(f"Output mean: {outputs.mean().item():.4f}\n")
-            f.write(f"Output std: {outputs.std().item():.4f}\n")
-            f.write(f"Target range: [{targets.min().item():.4f}, {targets.max().item():.4f}]\n")
-            f.write(f"Target mean: {targets.mean().item():.4f}\n")
-            f.write(f"Positive target ratio: {(targets > 0).float().mean().item():.4f}\n")
+        if self.activation_ranges:
+            min_val, max_val = self.activation_ranges[-1]
+            print(f"Output range: [{min_val:.4f}, {max_val:.4f}]")
+        
+        if self.prediction_ratios:
+            pred_ratio, target_ratio = self.prediction_ratios[-1]
+            print(f"Positive prediction ratio: {pred_ratio:.4f}")
+            print(f"Positive target ratio: {target_ratio:.4f}")
 
 class SegmentationTrainer:
     def __init__(self, config):
@@ -93,8 +76,8 @@ class SegmentationTrainer:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
         
-        # Initialize debug stats
-        self.debug_stats = DebugStats(config.log_dir)
+        # Debug metrics
+        self.debug = DebugMetrics()
         
         # Create checkpoint directory
         self.config.checkpoint_dir.mkdir(exist_ok=True)
@@ -106,9 +89,7 @@ class SegmentationTrainer:
             features=config.features
         ).to(self.device)
         
-        # Enable gradient checkpointing
-        if hasattr(self.model, 'use_checkpointing'):
-            self.model.use_checkpointing()
+        self._initialize_weights()
         
         # Initialize training components
         self.criterion = DC_and_BCE_loss()
@@ -135,13 +116,18 @@ class SegmentationTrainer:
         if config.resume_training:
             self._load_checkpoint()
 
-    def _cleanup_memory(self):
-        """Clean up GPU memory"""
-        gc.collect()
-        torch.cuda.empty_cache()
-        if hasattr(torch.cuda, 'memory_summary'):
-            print("\nMemory Summary:")
-            print(torch.cuda.memory_summary())
+    def _initialize_weights(self):
+        """Initialize network weights using He initialization"""
+        for m in self.model.modules():
+            if isinstance(m, (torch.nn.Conv3d, torch.nn.ConvTranspose3d)):
+                torch.nn.init.kaiming_normal_(
+                    m.weight, mode='fan_out', nonlinearity='relu'
+                )
+                if m.bias is not None:
+                    torch.nn.init.zeros_(m.bias)
+            elif isinstance(m, torch.nn.BatchNorm3d):
+                torch.nn.init.constant_(m.weight, 1)
+                torch.nn.init.zeros_(m.bias)
 
     def train(self, dataset_path: str):
         dataset = KiTS23VolumeDataset(dataset_path, self.config, preprocess=self.config.preprocess)
@@ -157,7 +143,7 @@ class SegmentationTrainer:
             train_dataset,
             batch_size=self.config.batch_size,
             shuffle=True,
-            num_workers=2,  # Reduced from 4
+            num_workers=4,
             pin_memory=True,
             collate_fn=KiTS23VolumeDataset.collate_fn
         )
@@ -166,7 +152,7 @@ class SegmentationTrainer:
             val_dataset,
             batch_size=1,
             shuffle=False,
-            num_workers=2,  # Reduced from 4
+            num_workers=4,
             pin_memory=True,
             collate_fn=KiTS23VolumeDataset.collate_fn
         )
@@ -177,6 +163,9 @@ class SegmentationTrainer:
         try:
             for epoch in range(self.start_epoch, self.config.num_epochs):
                 self.current_epoch = epoch
+                self.debug.reset()  # Reset debug metrics for new epoch
+                
+                # Training phase
                 self.model.train()
                 train_loss = 0
                 train_dice = 0
@@ -184,11 +173,10 @@ class SegmentationTrainer:
                 
                 with tqdm(train_loader, desc=f"Epoch {epoch+1}/{self.config.num_epochs}") as pbar:
                     for batch_idx, (images, targets) in enumerate(pbar):
-                        # Move to GPU and free CPU memory
-                        images = images.to(self.device, non_blocking=True)
-                        targets = targets.to(self.device, non_blocking=True)
+                        images = images.to(self.device)
+                        targets = targets.to(self.device)
                         
-                        # Forward pass without mixed precision initially
+                        # Forward pass without sigmoid
                         outputs = self.model(images)
                         if isinstance(outputs, (list, tuple)):
                             outputs = outputs[-1]
@@ -201,6 +189,7 @@ class SegmentationTrainer:
                                 align_corners=False
                             )
                         
+                        # Calculate loss without activation
                         loss = self.criterion(outputs, targets)
                         
                         if torch.isnan(loss) or torch.isinf(loss):
@@ -208,12 +197,18 @@ class SegmentationTrainer:
                             print(f"Loss: {loss.item()}")
                             continue
                         
-                        # Backward pass
-                        self.optimizer.zero_grad(set_to_none=True)  # More memory efficient
+                        # Backward pass with gradient clipping
+                        self.optimizer.zero_grad()
                         loss.backward()
                         
-                        # Clip gradients
-                        torch.nn.utils.clip_grad_norm_(
+                        # Update debug metrics (before clipping)
+                        self.debug.update(self.model, loss, outputs, targets)
+                        
+                        # Print debug info periodically
+                        if batch_idx % 10 == 0:
+                            self.debug.report(epoch, batch_idx)
+                        
+                        total_norm = torch.nn.utils.clip_grad_norm_(
                             self.model.parameters(),
                             self.max_grad_norm
                         )
@@ -229,21 +224,12 @@ class SegmentationTrainer:
                                 train_loss += loss.item()
                                 train_dice += dice
                                 valid_batches += 1
-                                
-                                self.debug_stats.log_batch(
-                                    epoch, batch_idx, self.model,
-                                    loss, dice, outputs_sigmoid, targets
-                                )
                         
-                        # Update progress bar
                         pbar.set_postfix({
                             'loss': f"{loss.item():.4f}",
-                            'dice': f"{dice.item():.4f}"
+                            'dice': f"{dice.item():.4f}",
+                            'grad_norm': f"{total_norm:.4f}"
                         })
-                        
-                        # Clean up GPU memory after each batch
-                        del images, targets, outputs, outputs_sigmoid
-                        self._cleanup_memory()
                 
                 # Calculate epoch metrics
                 if valid_batches > 0:
@@ -284,9 +270,6 @@ class SegmentationTrainer:
                     is_best=is_best
                 )
                 
-                # Clean up between epochs
-                self._cleanup_memory()
-                
         except KeyboardInterrupt:
             print("\nTraining interrupted by user. Saving checkpoint...")
             self._save_checkpoint(
@@ -316,8 +299,8 @@ class SegmentationTrainer:
         
         with tqdm(val_loader, desc="Validating") as pbar:
             for images, targets in pbar:
-                images = images.to(self.device, non_blocking=True)
-                targets = targets.to(self.device, non_blocking=True)
+                images = images.to(self.device)
+                targets = targets.to(self.device)
                 
                 outputs = self.model(images)
                 if isinstance(outputs, (list, tuple)):
@@ -344,10 +327,6 @@ class SegmentationTrainer:
                     'loss': f"{loss.item():.4f}",
                     'dice': f"{dice.item():.4f}"
                 })
-                
-                # Clean up memory
-                del images, targets, outputs, outputs_sigmoid
-                self._cleanup_memory()
         
         if valid_batches > 0:
             return val_loss / valid_batches, val_dice / valid_batches
@@ -366,8 +345,6 @@ class SegmentationTrainer:
             print(f"Targets sum: {targets.sum().item()}")
             print(f"Intersection: {intersection.item()}")
             print(f"Union: {union.item()}")
-            print(f"Prediction stats - Mean: {outputs.mean().item():.4f}, Std: {outputs.std().item():.4f}")
-            print(f"Target stats - Mean: {targets.mean().item():.4f}, Std: {targets.std().item():.4f}")
         
         return dice
 
