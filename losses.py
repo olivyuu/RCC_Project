@@ -164,14 +164,20 @@ class RobustCrossEntropyLoss(nn.Module):
         if input.shape[-3:] != target.shape[-3:]:
             input = F.interpolate(input, size=target.shape[-3:], mode='trilinear', align_corners=False)
         
-        target = target.long()
+        # Ensure target values are valid (0 or 1)
+        target = (target > 0).long()
+        
+        # Handle dimensions
         if len(target.shape) == len(input.shape) - 1:
             target = target.unsqueeze(1)
         elif len(target.shape) < len(input.shape) - 1:
             for _ in range(len(input.shape) - len(target.shape) - 1):
                 target = target.unsqueeze(1)
         
+        num_classes = input.shape[1]
         target_one_hot = torch.zeros_like(input)
+        # Clamp target values to valid class indices
+        target = torch.clamp(target, 0, num_classes - 1)
         target_one_hot.scatter_(1, target, 1)
         
         log_softmax = F.log_softmax(input, dim=1)
@@ -195,13 +201,18 @@ class SoftDiceLoss(nn.Module):
             net_output = F.interpolate(net_output, size=target.shape[-3:], mode='trilinear', align_corners=False)
             
         shp_x = net_output.shape
-        target = target.long()
+        num_classes = shp_x[1]
+        # Ensure target values are valid (0 or 1)
+        target = (target > 0).long()
         
+        # Create one-hot encoding
         target_one_hot = torch.zeros_like(net_output)
         target_indices = target.long()
         if len(target_indices.shape) < len(target_one_hot.shape):
             target_indices = target_indices.unsqueeze(1)
             
+        # Clamp target values to valid class indices
+        target_indices = torch.clamp(target_indices, 0, num_classes - 1)
         target_one_hot.scatter_(1, target_indices, 1)
         
         pc = net_output.softmax(1)
