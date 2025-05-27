@@ -41,23 +41,17 @@ def check_versions():
             raise
 
 def set_reproducibility():
-    """Set up complete reproducibility"""
-    # Python RNG
+    """Record reproducibility settings without enforcing deterministic behavior"""
+    # Set seeds for reproducibility, but don't enforce deterministic ops
     random.seed(42)
-    # Numpy RNG
     np.random.seed(42)
-    # PyTorch RNGs
     torch.manual_seed(42)
     torch.cuda.manual_seed_all(42)
     
-    # Force deterministic operations
-    os.environ['PYTHONHASHSEED'] = '42'
-    os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'  # Needed for CUDA >= 10.2
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    torch.use_deterministic_algorithms(True)
+    # Record CUDA settings
+    torch.backends.cudnn.benchmark = True  # Enable autotuner
     
-    print("Deterministic mode enabled for reproducibility")
+    print("Training will use non-deterministic operations with fixed random seeds")
 
 def main():
     # Set reproducibility first, before any CUDA operations
@@ -111,6 +105,10 @@ def main():
         if torch.cuda.is_available():
             f.write(f"CUDA Version: {torch.version.cuda}\n")
             f.write(f"GPU Device: {torch.cuda.get_device_name(0)}\n")
+        f.write("\nReproducibility Settings:\n")
+        f.write("Random Seeds: 42\n")
+        f.write(f"CUDA Benchmark: {torch.backends.cudnn.benchmark}\n")
+        f.write(f"Using Deterministic Algorithms: False\n")
         f.write("\nConfiguration:\n")
         for key, value in vars(config).items():
             f.write(f"{key}: {value}\n")
