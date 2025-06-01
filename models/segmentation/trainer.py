@@ -159,8 +159,11 @@ class SegmentationTrainer:
                                 train_dice += dice
                                 valid_batches += 1
                         
-                        # Logging
-                        if batch_idx % 10 == 0:
+                        # Clear GPU cache periodically during training
+                        if batch_idx % 10 == 0:  # Every 10 batches
+                            torch.cuda.empty_cache()
+                            
+                            # Logging
                             print(f"\nGradient norm: {total_norm:.4f}")
                             print(f"Loss: {loss.item():.4f}")
                             print(f"Dice: {dice.item():.4f}")
@@ -179,8 +182,14 @@ class SegmentationTrainer:
                     print("Warning: No valid batches in epoch!")
                     continue
                 
+                # Clear cache before validation
+                torch.cuda.empty_cache()
+                
                 # Validation phase
                 val_loss, val_dice = self._validate(val_loader)
+                
+                # Clear cache after validation
+                torch.cuda.empty_cache()
                 
                 # Learning rate scheduling
                 self.scheduler.step(val_dice)
@@ -238,7 +247,7 @@ class SegmentationTrainer:
         valid_batches = 0
         
         with tqdm(val_loader, desc="Validating") as pbar:
-            for images, targets in pbar:
+            for batch_idx, (images, targets) in enumerate(pbar):
                 images = images.to(self.device)
                 targets = targets.to(self.device)
                 
@@ -262,6 +271,10 @@ class SegmentationTrainer:
                     val_loss += loss.item()
                     val_dice += dice
                     valid_batches += 1
+                
+                # Clear GPU cache periodically during validation
+                if batch_idx % 5 == 0:  # Every 5 batches during validation
+                    torch.cuda.empty_cache()
                 
                 pbar.set_postfix({
                     'loss': f"{loss.item():.4f}",
