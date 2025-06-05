@@ -11,7 +11,7 @@ import signal
 import sys
 from torch.utils.tensorboard import SummaryWriter
 
-from models.segmentation.model import SegmentationModel  # Updated import
+from models.segmentation.model import SegmentationModel
 from dataset_volume import KiTS23VolumeDataset
 from losses import DC_and_BCE_loss
 
@@ -21,19 +21,14 @@ class SegmentationTrainer:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
         
-        # Configure CUDA memory allocator
+        # Configure CUDA memory management
         if torch.cuda.is_available():
-            # Set memory allocator for better fragmentation handling
-            torch.cuda.set_per_process_memory_fraction(0.95)  # Reserve some memory for system
+            # Clear cache initially
             torch.cuda.empty_cache()
-            # Set allocation config for better memory management
-            torch.cuda.set_allocator_settings(
-                max_split_size_mb=128,  # Reduce fragmentation
-                garbage_collection_threshold=0.8  # More aggressive GC
-            )
-            # Set deterministic mode for better memory behavior
-            torch.backends.cudnn.deterministic = True
-            torch.backends.cudnn.benchmark = False
+            # Set memory fraction to use
+            torch.cuda.set_per_process_memory_fraction(0.95)
+            # Enable memory caching for faster training
+            torch.backends.cudnn.benchmark = True
         
         # Create checkpoint directory
         self.config.checkpoint_dir.mkdir(exist_ok=True)
@@ -45,7 +40,7 @@ class SegmentationTrainer:
             features=config.features
         ).to(self.device)
         
-        # Enable gradient checkpointing for memory efficiency
+        # Enable gradient checkpointing
         self.model.enable_checkpointing()
         
         # Initialize weights with He initialization
@@ -73,6 +68,9 @@ class SegmentationTrainer:
         self.current_epoch = 0
         self.max_grad_norm = 1.0
         
+        # Gradient accumulation steps
+        self.accum_steps = getattr(config, 'vol_gradient_accumulation_steps', 4)
+        
         if config.resume_training:
             self._load_checkpoint()
 
@@ -99,9 +97,10 @@ class SegmentationTrainer:
             generator=torch.Generator().manual_seed(42)
         )
         
+        # Use vol_batch_size for full-volume training
         train_loader = DataLoader(
             train_dataset,
-            batch_size=self.config.batch_size,
+            batch_size=getattr(self.config, 'vol_batch_size', 1),  # Default to 1 for full volumes
             shuffle=True,
             num_workers=4,
             pin_memory=True,
@@ -110,7 +109,7 @@ class SegmentationTrainer:
         
         val_loader = DataLoader(
             val_dataset,
-            batch_size=1,
+            batch_size=1,  # Always use batch size 1 for validation
             shuffle=False,
             num_workers=4,
             pin_memory=True,
@@ -119,6 +118,7 @@ class SegmentationTrainer:
         
         print(f"\nTraining on {len(train_dataset)} volumes")
         print(f"Validating on {len(val_dataset)} volumes")
+        print(f"Using gradient accumulation steps: {self.accum_steps}")
         
         try:
             for epoch in range(self.start_epoch, self.config.num_epochs):
@@ -130,13 +130,13 @@ class SegmentationTrainer:
                 train_dice = 0
                 valid_batches = 0
                 
+                # Zero gradients at the start of each epoch
+                self.optimizer.zero_grad()
+                
                 with tqdm(train_loader, desc=f"Epoch {epoch+1}/{self.config.num_epochs}") as pbar:
                     for batch_idx, (images, targets) in enumerate(pbar):
                         images = images.to(self.device)
                         targets = targets.to(self.device)
-                        
-                        # Clear gradients
-                        self.optimizer.zero_grad()
                         
                         # Forward pass with mixed precision
                         with autocast():
@@ -152,8 +152,8 @@ class SegmentationTrainer:
                                     align_corners=False
                                 )
                             
-                            # Calculate loss
-                            loss = self.criterion(outputs, targets)
+                            # Scale loss by accumulation steps
+                            loss = self.criterion(outputs, targets) / self.accum_steps
                         
                         if torch.isnan(loss) or torch.isinf(loss):
                             print("\nWarning: Invalid loss value detected!")
@@ -163,16 +163,22 @@ class SegmentationTrainer:
                         # Backward pass with gradient scaling
                         self.scaler.scale(loss).backward()
                         
-                        # Unscale before gradient clipping
-                        self.scaler.unscale_(self.optimizer)
-                        total_norm = torch.nn.utils.clip_grad_norm_(
-                            self.model.parameters(),
-                            self.max_grad_norm
-                        )
-                        
-                        # Optimizer step with scaling
-                        self.scaler.step(self.optimizer)
-                        self.scaler.update()
+                        # Update weights if we've accumulated enough steps
+                        if (batch_idx + 1) % self.accum_steps == 0:
+                            # Unscale before gradient clipping
+                            self.scaler.unscale_(self.optimizer)
+                            total_norm = torch.nn.utils.clip_grad_norm_(
+                                self.model.parameters(),
+                                self.max_grad_norm
+                            )
+                            
+                            # Optimizer step with scaling
+                            self.scaler.step(self.optimizer)
+                            self.scaler.update()
+                            self.optimizer.zero_grad()
+                            
+                            # Clear GPU cache after optimization step
+                            torch.cuda.empty_cache()
                         
                         # Calculate metrics
                         with torch.no_grad():
@@ -180,7 +186,7 @@ class SegmentationTrainer:
                             dice = self._calculate_dice(outputs_sigmoid.detach(), targets)
                             
                             if not torch.isnan(dice) and not torch.isinf(dice):
-                                train_loss += loss.item()
+                                train_loss += loss.item() * self.accum_steps  # Scale loss back up for logging
                                 train_dice += dice
                                 valid_batches += 1
                         
@@ -190,16 +196,16 @@ class SegmentationTrainer:
                             
                             # Logging
                             print(f"\nGradient norm: {total_norm:.4f}")
-                            print(f"Loss: {loss.item():.4f}")
+                            print(f"Loss: {loss.item() * self.accum_steps:.4f}")  # Scale loss back up for logging
                             print(f"Dice: {dice.item():.4f}")
                             
                             # Log GPU memory
                             if torch.cuda.is_available():
                                 print(f"GPU memory allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
-                                print(f"GPU memory cached: {torch.cuda.memory_reserved() / 1e9:.2f} GB")
+                                print(f"GPU memory reserved: {torch.cuda.memory_reserved() / 1e9:.2f} GB")
                         
                         pbar.set_postfix({
-                            'loss': f"{loss.item():.4f}",
+                            'loss': f"{loss.item() * self.accum_steps:.4f}",  # Scale loss back up for logging
                             'dice': f"{dice.item():.4f}",
                             'grad_norm': f"{total_norm:.4f}"
                         })
