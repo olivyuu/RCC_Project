@@ -124,14 +124,20 @@ class SegmentationTrainer:
                 
                 with tqdm(train_loader, desc=f"Epoch {epoch+1}/{self.config.num_epochs}") as pbar:
                     for batch_idx, (images, targets) in enumerate(pbar):
-                        # Split input into CT and kidney mask
-                        ct_images = images[:, 0:1].to(dtype=torch.float32, device=self.device)  # CT channel
-                        kidney_masks = images[:, 1:2].to(dtype=torch.float32, device=self.device)  # Kidney mask
-                        targets = targets.to(dtype=torch.float32, device=self.device)
+                        # Move data to device first, then convert to float32
+                        images = images.to(device=self.device)
+                        targets = targets.to(device=self.device)
                         
-                        # Input validation
-                        if torch.isnan(ct_images).any() or torch.isinf(ct_images).any():
-                            print(f"\nWarning: Found NaN/Inf in CT images at epoch {epoch}, batch {batch_idx}")
+                        # Split input into CT and kidney mask and convert to float32
+                        ct_images = images[:, 0:1].to(dtype=torch.float32)
+                        kidney_masks = images[:, 1:2].to(dtype=torch.float32)
+                        targets = targets.to(dtype=torch.float32)
+                        
+                        # Recombine channels
+                        images = torch.cat([ct_images, kidney_masks], dim=1)
+                        
+                        if torch.isnan(images).any() or torch.isinf(images).any():
+                            print(f"\nWarning: Found NaN/Inf in input images at epoch {epoch}, batch {batch_idx}")
                             continue
                             
                         if torch.isnan(targets).any() or torch.isinf(targets).any():
@@ -139,21 +145,21 @@ class SegmentationTrainer:
                             continue
                         
                         try:
-                            with autocast():
-                                outputs = self.model(images)  # Model still takes full input (CT + kidney)
-                                if isinstance(outputs, (list, tuple)):
-                                    outputs = outputs[-1]
-                                
-                                if outputs.shape[-3:] != targets.shape[-3:]:
-                                    outputs = F.interpolate(
-                                        outputs,
-                                        size=targets.shape[-3:],
-                                        mode='trilinear',
-                                        align_corners=False
-                                    )
-                                
-                                # Pass kidney mask to loss computation
-                                loss = self.criterion(outputs, targets, kidney_masks) / self.accum_steps
+                            # Temporarily disable autocast
+                            # with autocast():
+                            outputs = self.model(images)
+                            if isinstance(outputs, (list, tuple)):
+                                outputs = outputs[-1]
+                            
+                            if outputs.shape[-3:] != targets.shape[-3:]:
+                                outputs = F.interpolate(
+                                    outputs,
+                                    size=targets.shape[-3:],
+                                    mode='trilinear',
+                                    align_corners=False
+                                )
+                            
+                            loss = self.criterion(outputs, targets, kidney_masks) / self.accum_steps
                             
                             if torch.isnan(loss) or torch.isinf(loss):
                                 print("\nWarning: Invalid loss value detected!")
@@ -183,7 +189,6 @@ class SegmentationTrainer:
                             
                             with torch.no_grad():
                                 probs = torch.softmax(outputs, dim=1)[:, 1:]
-                                # Calculate metrics within kidney mask only
                                 hard_dice = self._calculate_dice(probs > 0.5, targets, kidney_masks)
                                 stats = self.model.compute_soft_dice(outputs, targets, kidney_masks)
                                 soft_dice = stats['soft_dice']
@@ -302,12 +307,19 @@ class SegmentationTrainer:
         
         with tqdm(val_loader, desc="Validating") as pbar:
             for batch_idx, (images, targets) in enumerate(pbar):
-                # Split input into CT and kidney mask
-                ct_images = images[:, 0:1].to(dtype=torch.float32, device=self.device)
-                kidney_masks = images[:, 1:2].to(dtype=torch.float32, device=self.device)
-                targets = targets.to(dtype=torch.float32, device=self.device)
+                # Move data to device first, then convert to float32
+                images = images.to(device=self.device)
+                targets = targets.to(device=self.device)
                 
-                if torch.isnan(ct_images).any() or torch.isinf(ct_images).any():
+                # Split input into CT and kidney mask and convert to float32
+                ct_images = images[:, 0:1].to(dtype=torch.float32)
+                kidney_masks = images[:, 1:2].to(dtype=torch.float32)
+                targets = targets.to(dtype=torch.float32)
+                
+                # Recombine channels
+                images = torch.cat([ct_images, kidney_masks], dim=1)
+                
+                if torch.isnan(images).any() or torch.isinf(images).any():
                     print(f"\nWarning: Found NaN/Inf in validation images, batch {batch_idx}")
                     continue
                     
@@ -316,20 +328,20 @@ class SegmentationTrainer:
                     continue
                 
                 try:
-                    with autocast():
-                        outputs = self.model(images)
-                        if isinstance(outputs, (list, tuple)):
-                            outputs = outputs[-1]
-                        
-                        if outputs.shape[-3:] != targets.shape[-3:]:
-                            outputs = F.interpolate(
-                                outputs,
-                                size=targets.shape[-3:],
-                                mode='trilinear',
-                                align_corners=False
-                            )
-                        
-                        loss = self.criterion(outputs, targets, kidney_masks)
+                    # with autocast():
+                    outputs = self.model(images)
+                    if isinstance(outputs, (list, tuple)):
+                        outputs = outputs[-1]
+                    
+                    if outputs.shape[-3:] != targets.shape[-3:]:
+                        outputs = F.interpolate(
+                            outputs,
+                            size=targets.shape[-3:],
+                            mode='trilinear',
+                            align_corners=False
+                        )
+                    
+                    loss = self.criterion(outputs, targets, kidney_masks)
                     
                     # Monitor predictions periodically during validation
                     if batch_idx % 10 == 0:
