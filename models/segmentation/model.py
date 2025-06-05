@@ -184,8 +184,8 @@ class SegmentationModel(nn.Module):
         # Final convolution always outputs 2 channels (background + tumor)
         self.final_conv = nn.Conv3d(features[-1], 2, 1)
         
-        # Initialize final conv bias for very conservative tumor predictions
-        torch.nn.init.constant_(self.final_conv.bias, -5.0)  # sigmoid(-5) ≈ 0.0067
+        # Initialize final conv bias for moderately conservative tumor predictions
+        torch.nn.init.constant_(self.final_conv.bias, -3.5)  # sigmoid(-3.5) ≈ 0.03
         
         # Progressive learning weights for deep supervision
         self.progressive_weights = nn.Parameter(torch.tensor([1.0, 0.8, 0.6, 0.4, 0.2]))
@@ -211,6 +211,49 @@ class SegmentationModel(nn.Module):
             target_layer.register_forward_hook(self._get_activation)
             target_layer.register_full_backward_hook(self._get_gradient)
             self.target_layer = target_layer
+
+    def get_output_stats(self, x):
+        """Get statistics about model outputs for monitoring"""
+        with torch.no_grad():
+            outputs = self.forward(x)
+            if isinstance(outputs, (list, tuple)):
+                outputs = outputs[-1]
+            
+            probs = torch.softmax(outputs, dim=1)
+            tumor_probs = probs[:, 1]  # Get tumor channel probabilities
+            
+            stats = {
+                'logits_min': outputs.min().item(),
+                'logits_max': outputs.max().item(),
+                'tumor_prob_min': tumor_probs.min().item(),
+                'tumor_prob_max': tumor_probs.max().item(),
+                'tumor_prob_mean': tumor_probs.mean().item(),
+                'tumor_prob_std': tumor_probs.std().item(),
+                'tumor_voxels_gt_50': (tumor_probs > 0.5).float().sum().item(),
+                'tumor_voxels_gt_10': (tumor_probs > 0.1).float().sum().item(),
+            }
+            return stats
+
+    def compute_soft_dice(self, outputs, targets):
+        """Compute soft Dice score without thresholding"""
+        with torch.no_grad():
+            probs = torch.softmax(outputs, dim=1)[:, 1:]  # Get tumor probabilities
+            
+            # Ensure correct dimensions
+            if len(targets.shape) == len(probs.shape) - 1:
+                targets = targets.unsqueeze(1)
+            
+            # Compute soft Dice
+            intersection = (probs * targets).sum()
+            union = probs.sum() + targets.sum()
+            soft_dice = (2. * intersection + 1e-5) / (union + 1e-5)
+            
+            return {
+                'soft_dice': soft_dice.item(),
+                'avg_tumor_prob': probs.mean().item(),
+                'intersection': intersection.item(),
+                'union': union.item()
+            }
 
     @autocast()
     def forward(self, x):
@@ -273,25 +316,3 @@ class SegmentationModel(nn.Module):
     def disable_checkpointing(self):
         """Disable gradient checkpointing"""
         self.use_checkpointing = False
-
-    def get_output_stats(self, x):
-        """Get statistics about model outputs for monitoring"""
-        with torch.no_grad():
-            outputs = self.forward(x)
-            if isinstance(outputs, (list, tuple)):
-                outputs = outputs[-1]
-            
-            probs = F.softmax(outputs, dim=1)
-            tumor_probs = probs[:, 1]  # Get tumor channel probabilities
-            
-            stats = {
-                'logits_min': outputs.min().item(),
-                'logits_max': outputs.max().item(),
-                'tumor_prob_min': tumor_probs.min().item(),
-                'tumor_prob_max': tumor_probs.max().item(),
-                'tumor_prob_mean': tumor_probs.mean().item(),
-                'tumor_prob_std': tumor_probs.std().item(),
-                'tumor_voxels_gt_50': (tumor_probs > 0.5).float().sum().item(),
-                'tumor_voxels_gt_10': (tumor_probs > 0.1).float().sum().item(),
-            }
-            return stats
