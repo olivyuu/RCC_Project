@@ -176,11 +176,13 @@ class SegmentationModel(nn.Module):
         scales = [8, 4, 2, 1]  # Scale factors for deep supervision
         for i in range(len(features) - 1):
             self.up_blocks.append(UpBlock(features[i], features[i + 1]))
+            # Always output 2 channels (background + tumor) for deep supervision
             self.deep_supervision.append(
-                DeepSupervisionHead(features[i + 1], out_channels, scales[i])
+                DeepSupervisionHead(features[i + 1], 2, scales[i])
             )
 
-        self.final_conv = nn.Conv3d(features[-1], out_channels, 1)
+        # Final convolution always outputs 2 channels (background + tumor)
+        self.final_conv = nn.Conv3d(features[-1], 2, 1)
         
         # Progressive learning weights
         self.progressive_weights = nn.Parameter(torch.ones(len(self.deep_supervision) + 1))
@@ -209,7 +211,7 @@ class SegmentationModel(nn.Module):
 
     @autocast()
     def forward(self, x):
-        # Ensure input is float32 and requires gradient
+        # Ensure input is float32
         if x.dtype != torch.float32:
             x = x.float()
 
