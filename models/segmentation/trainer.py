@@ -38,7 +38,6 @@ class SegmentationTrainer:
         ).to(self.device)
         
         self.model.enable_checkpointing()
-        self._initialize_weights()
         
         # Initialize training components
         self.criterion = DC_and_BCE_loss()
@@ -65,28 +64,6 @@ class SegmentationTrainer:
         
         if config.resume_training:
             self._load_checkpoint()
-
-    def _monitor_predictions(self, outputs, targets):
-        """Monitor prediction statistics"""
-        with torch.no_grad():
-            # Get model statistics
-            stats = self.model.get_output_stats(outputs)
-            
-            # Compute soft Dice
-            soft_dice_stats = self.model.compute_soft_dice(outputs, targets)
-            
-            # Combine all stats
-            stats.update(soft_dice_stats)
-            
-            # Log detailed statistics
-            print("\nPrediction Statistics:")
-            print(f"  Soft Dice: {stats['soft_dice']:.4f}")
-            print(f"  Average tumor probability: {stats['avg_tumor_prob']:.4f}")
-            print(f"  Tumor probability range: [{stats['tumor_prob_min']:.4f}, {stats['tumor_prob_max']:.4f}]")
-            print(f"  Voxels > 0.5: {stats['tumor_voxels_gt_50']}")
-            print(f"  Voxels > 0.1: {stats['tumor_voxels_gt_10']}")
-            
-            return stats
 
     def train(self, dataset_path: str):
         # Set multiprocessing method to spawn
@@ -127,10 +104,13 @@ class SegmentationTrainer:
         print(f"\nTraining on {len(train_dataset)} volumes")
         print(f"Validating on {len(val_dataset)} volumes")
         print(f"Using gradient accumulation steps: {self.accum_steps}")
-        
+
         try:
             for epoch in range(self.start_epoch, self.config.num_epochs):
                 self.current_epoch = epoch
+                
+                # Update loss weights for current epoch
+                self.criterion.update_weights(epoch)
                 
                 # Training phase
                 self.model.train()
@@ -144,11 +124,14 @@ class SegmentationTrainer:
                 
                 with tqdm(train_loader, desc=f"Epoch {epoch+1}/{self.config.num_epochs}") as pbar:
                     for batch_idx, (images, targets) in enumerate(pbar):
-                        images = images.to(dtype=torch.float32, device=self.device)
+                        # Split input into CT and kidney mask
+                        ct_images = images[:, 0:1].to(dtype=torch.float32, device=self.device)  # CT channel
+                        kidney_masks = images[:, 1:2].to(dtype=torch.float32, device=self.device)  # Kidney mask
                         targets = targets.to(dtype=torch.float32, device=self.device)
                         
-                        if torch.isnan(images).any() or torch.isinf(images).any():
-                            print(f"\nWarning: Found NaN/Inf in input images at epoch {epoch}, batch {batch_idx}")
+                        # Input validation
+                        if torch.isnan(ct_images).any() or torch.isinf(ct_images).any():
+                            print(f"\nWarning: Found NaN/Inf in CT images at epoch {epoch}, batch {batch_idx}")
                             continue
                             
                         if torch.isnan(targets).any() or torch.isinf(targets).any():
@@ -157,7 +140,7 @@ class SegmentationTrainer:
                         
                         try:
                             with autocast():
-                                outputs = self.model(images)
+                                outputs = self.model(images)  # Model still takes full input (CT + kidney)
                                 if isinstance(outputs, (list, tuple)):
                                     outputs = outputs[-1]
                                 
@@ -169,7 +152,8 @@ class SegmentationTrainer:
                                         align_corners=False
                                     )
                                 
-                                loss = self.criterion(outputs, targets) / self.accum_steps
+                                # Pass kidney mask to loss computation
+                                loss = self.criterion(outputs, targets, kidney_masks) / self.accum_steps
                             
                             if torch.isnan(loss) or torch.isinf(loss):
                                 print("\nWarning: Invalid loss value detected!")
@@ -178,7 +162,7 @@ class SegmentationTrainer:
                             
                             # Monitor predictions periodically
                             if batch_idx % 50 == 0:
-                                stats = self._monitor_predictions(outputs, targets)
+                                stats = self._monitor_predictions(outputs, targets, kidney_masks)
                                 self.writer.add_scalar('Training/SoftDice', stats['soft_dice'], epoch * len(train_loader) + batch_idx)
                                 self.writer.add_scalar('Training/AvgTumorProb', stats['avg_tumor_prob'], epoch * len(train_loader) + batch_idx)
                             
@@ -199,8 +183,9 @@ class SegmentationTrainer:
                             
                             with torch.no_grad():
                                 probs = torch.softmax(outputs, dim=1)[:, 1:]
-                                hard_dice = self._calculate_dice(probs > 0.5, targets)
-                                stats = self.model.compute_soft_dice(outputs, targets)
+                                # Calculate metrics within kidney mask only
+                                hard_dice = self._calculate_dice(probs > 0.5, targets, kidney_masks)
+                                stats = self.model.compute_soft_dice(outputs, targets, kidney_masks)
                                 soft_dice = stats['soft_dice']
                                 
                                 if not torch.isnan(hard_dice) and not torch.isinf(hard_dice):
@@ -286,7 +271,7 @@ class SegmentationTrainer:
                     },
                     is_best=is_best
                 )
-                
+
         except KeyboardInterrupt:
             print("\nTraining interrupted by user. Saving checkpoint...")
             self._save_checkpoint(
@@ -317,10 +302,12 @@ class SegmentationTrainer:
         
         with tqdm(val_loader, desc="Validating") as pbar:
             for batch_idx, (images, targets) in enumerate(pbar):
-                images = images.to(dtype=torch.float32, device=self.device)
+                # Split input into CT and kidney mask
+                ct_images = images[:, 0:1].to(dtype=torch.float32, device=self.device)
+                kidney_masks = images[:, 1:2].to(dtype=torch.float32, device=self.device)
                 targets = targets.to(dtype=torch.float32, device=self.device)
                 
-                if torch.isnan(images).any() or torch.isinf(images).any():
+                if torch.isnan(ct_images).any() or torch.isinf(ct_images).any():
                     print(f"\nWarning: Found NaN/Inf in validation images, batch {batch_idx}")
                     continue
                     
@@ -342,15 +329,15 @@ class SegmentationTrainer:
                                 align_corners=False
                             )
                         
-                        loss = self.criterion(outputs, targets)
-                        
+                        loss = self.criterion(outputs, targets, kidney_masks)
+                    
                     # Monitor predictions periodically during validation
                     if batch_idx % 10 == 0:
-                        self._monitor_predictions(outputs, targets)
+                        self._monitor_predictions(outputs, targets, kidney_masks)
                     
                     probs = torch.softmax(outputs, dim=1)[:, 1:]
-                    hard_dice = self._calculate_dice(probs > 0.5, targets)
-                    stats = self.model.compute_soft_dice(outputs, targets)
+                    hard_dice = self._calculate_dice(probs > 0.5, targets, kidney_masks)
+                    stats = self.model.compute_soft_dice(outputs, targets, kidney_masks)
                     soft_dice = stats['soft_dice']
                     
                     if not torch.isnan(hard_dice) and not torch.isinf(hard_dice):
@@ -384,8 +371,12 @@ class SegmentationTrainer:
         else:
             return float('inf'), 0, 0
 
-    def _calculate_dice(self, outputs, targets, smooth=1e-5):
-        """Calculate hard Dice score using thresholded predictions"""
+    def _calculate_dice(self, outputs, targets, kidney_masks, smooth=1e-5):
+        """Calculate hard Dice score within kidney regions only"""
+        # Apply kidney mask to both predictions and targets
+        outputs = outputs * kidney_masks
+        targets = targets * kidney_masks
+        
         intersection = (outputs * targets).sum()
         union = outputs.sum() + targets.sum()
         dice = (2. * intersection + smooth) / (union + smooth)
@@ -396,8 +387,42 @@ class SegmentationTrainer:
             print(f"Targets sum: {targets.sum().item()}")
             print(f"Intersection: {intersection.item()}")
             print(f"Union: {union.item()}")
+            print(f"Active kidney voxels: {kidney_masks.sum().item()}")
         
         return dice
+
+    def _monitor_predictions(self, outputs, targets, kidney_masks):
+        """Monitor prediction statistics within kidney regions"""
+        with torch.no_grad():
+            # Get model statistics
+            stats = self.model.get_output_stats(outputs)
+            
+            # Compute soft Dice
+            soft_dice_stats = self.model.compute_soft_dice(outputs, targets, kidney_masks)
+            
+            # Combine all stats
+            stats.update(soft_dice_stats)
+            
+            # Calculate kidney-specific statistics
+            tumor_probs = torch.softmax(outputs, dim=1)[:, 1:]
+            kidney_tumor_probs = tumor_probs * kidney_masks
+            
+            stats.update({
+                'kidney_tumor_mean': kidney_tumor_probs[kidney_masks > 0].mean().item() if (kidney_masks > 0).any() else 0,
+                'kidney_volume': kidney_masks.sum().item(),
+                'tumor_volume': targets.sum().item(),
+                'tumor_in_kidney_ratio': (targets * kidney_masks).sum().item() / (kidney_masks.sum().item() + 1e-5)
+            })
+            
+            # Log detailed statistics
+            print("\nPrediction Statistics:")
+            print(f"  Soft Dice (kidney only): {stats['soft_dice']:.4f}")
+            print(f"  Mean tumor prob in kidney: {stats['kidney_tumor_mean']:.4f}")
+            print(f"  Tumor/Kidney volume ratio: {stats['tumor_in_kidney_ratio']:.4f}")
+            print(f"  Active voxels > 0.5: {stats['tumor_voxels_gt_50']}")
+            print(f"  Active voxels > 0.1: {stats['tumor_voxels_gt_10']}")
+            
+            return stats
 
     def _save_checkpoint(self, epoch: int, metrics: dict, is_best: bool = False):
         checkpoint = {

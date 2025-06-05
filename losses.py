@@ -27,39 +27,168 @@ class LossWeights:
             self.dice = 2.0
             self.focal_tversky = 1.0
 
+class SoftDiceLoss(nn.Module):
+    def __init__(self, batch_dice=True, smooth=1e-5, do_bg=False):
+        super().__init__()
+        self.batch_dice = batch_dice
+        self.smooth = smooth
+        self.do_bg = do_bg
+
+    def forward(self, net_output: torch.Tensor,
+                target: torch.Tensor,
+                kidney_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Compute Dice loss only within kidney regions
+        Args:
+            net_output: [B, 2, D, H, W] logits
+            target: [B, D, H, W] or [B, 1, D, H, W] tumor masks
+            kidney_mask: [B, D, H, W] or [B, 1, D, H, W] kidney masks
+        """
+        # Get probability map
+        pc = net_output.softmax(dim=1)
+        
+        # For binary case, focus on tumor class
+        if not self.do_bg and pc.shape[1] == 2:
+            pc = pc[:, 1:]
+        
+        # Ensure target and kidney_mask are proper shape
+        if len(target.shape) == len(pc.shape) - 1:
+            target = target.unsqueeze(1)
+        target = target.float()
+        
+        if len(kidney_mask.shape) == len(pc.shape) - 1:
+            kidney_mask = kidney_mask.unsqueeze(1)
+        mask = (kidney_mask > 0).float()
+        
+        # Apply kidney mask to both predictions and targets
+        pc = pc * mask
+        target = target * mask
+        
+        # Interpolate if needed
+        if pc.shape[-3:] != target.shape[-3:]:
+            pc = F.interpolate(pc, size=target.shape[-3:],
+                             mode='trilinear', align_corners=False)
+            
+        # Flatten kidney regions
+        pc_flat = pc.flatten(2)
+        tgt_flat = target.flatten(2)
+        
+        # Calculate Dice score
+        intersection = (pc_flat * tgt_flat).sum(dim=2)
+        union = pc_flat.sum(dim=2) + tgt_flat.sum(dim=2)
+        dice_score = (2 * intersection + self.smooth) / (union + self.smooth)
+        dice_loss = 1 - dice_score.mean()
+        
+        return dice_loss
+
+    def compute_soft_dice_score(self, net_output: torch.Tensor, 
+                              target: torch.Tensor,
+                              kidney_mask: torch.Tensor) -> float:
+        """Compute soft Dice score without thresholding"""
+        with torch.no_grad():
+            pc = net_output.softmax(dim=1)
+            if pc.shape[1] == 2:
+                pc = pc[:, 1:]
+            
+            if len(target.shape) == len(pc.shape) - 1:
+                target = target.unsqueeze(1)
+            
+            if len(kidney_mask.shape) == len(pc.shape) - 1:
+                kidney_mask = kidney_mask.unsqueeze(1)
+            mask = (kidney_mask > 0).float()
+            
+            # Apply kidney mask
+            pc = pc * mask
+            target = target * mask
+            
+            pc_flat = pc.flatten(2)
+            tgt_flat = target.flatten(2)
+            
+            intersection = (pc_flat * tgt_flat).sum(dim=2)
+            union = pc_flat.sum(dim=2) + tgt_flat.sum(dim=2)
+            
+            dice_score = (2 * intersection + self.smooth) / (union + self.smooth)
+            return dice_score.mean().item()
+
+class RobustCrossEntropyLoss(nn.Module):
+    def __init__(self, reduction='mean'):
+        super().__init__()
+        self.reduction = reduction
+
+    def forward(self, input: torch.Tensor, 
+                target: torch.Tensor,
+                kidney_mask: torch.Tensor) -> torch.Tensor:
+        if input.shape[-3:] != target.shape[-3:]:
+            input = F.interpolate(input, size=target.shape[-3:], 
+                                mode='trilinear', align_corners=False)
+        
+        # Ensure target values are valid (0 or 1)
+        target = (target > 0).long()
+        
+        # Handle dimensions
+        if len(target.shape) == len(input.shape) - 1:
+            target = target.unsqueeze(1)
+            
+        if len(kidney_mask.shape) == len(input.shape) - 1:
+            kidney_mask = kidney_mask.unsqueeze(1)
+        mask = (kidney_mask > 0).float()
+        
+        num_classes = input.shape[1]
+        target_one_hot = torch.zeros_like(input)
+        target = torch.clamp(target, 0, num_classes - 1)
+        target_one_hot.scatter_(1, target, 1)
+        
+        # Apply kidney mask to one-hot target
+        target_one_hot = target_one_hot * mask
+        
+        log_softmax = F.log_softmax(input, dim=1)
+        loss = -(target_one_hot * log_softmax).sum(dim=1)
+        
+        # Apply kidney mask to loss
+        loss = loss * mask.squeeze(1)
+        
+        # Average only over kidney voxels
+        if self.reduction == 'mean':
+            num_kidney_voxels = mask.sum()
+            return loss.sum() / (num_kidney_voxels + 1e-5)
+        elif self.reduction == 'sum':
+            return loss.sum()
+        return loss
+
 class BoundaryLoss(nn.Module):
-    """
-    Boundary loss to emphasize tumor edges
-    Based on: https://arxiv.org/abs/1812.07032
-    """
     def __init__(self, sigma=1.0):
         super().__init__()
         self.sigma = sigma
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(self, pred: torch.Tensor, 
+                target: torch.Tensor,
+                kidney_mask: torch.Tensor) -> torch.Tensor:
         # Get probability map
         pred = pred.softmax(dim=1)
         
-        # For binary case, we only care about tumor class (channel 1)
+        # For binary case, focus on tumor class
         if pred.shape[1] == 2:
             pred = pred[:, 1:]
         
-        # Ensure target is in correct format
+        # Ensure proper dimensions
         if len(target.shape) == len(pred.shape) - 1:
             target = target.unsqueeze(1)
-        
         target = (target > 0).float()
         
-        # Interpolate pred to match target size
-        if pred.shape[-3:] != target.shape[-3:]:
-            pred = F.interpolate(pred, size=target.shape[-3:], mode='trilinear', align_corners=False)
+        if len(kidney_mask.shape) == len(pred.shape) - 1:
+            kidney_mask = kidney_mask.unsqueeze(1)
+        mask = (kidney_mask > 0).float()
+        
+        # Apply kidney mask
+        pred = pred * mask
+        target = target * mask
         
         # Calculate gradients
         grad_pred = self._compute_gradient(pred)
         grad_target = self._compute_gradient(target)
         
-        # Calculate boundary loss
-        boundary_loss = F.mse_loss(grad_pred, grad_target)
+        # Calculate boundary loss only within kidney
+        boundary_loss = F.mse_loss(grad_pred * mask, grad_target * mask)
         return boundary_loss
 
     def _compute_gradient(self, x):
@@ -100,9 +229,6 @@ class BoundaryLoss(nn.Module):
         return kernel.unsqueeze(0).unsqueeze(0).float()
 
 class FocalTverskyLoss(nn.Module):
-    """
-    Focal Tversky Loss for improved small tumor segmentation
-    """
     def __init__(self, alpha=0.3, beta=0.7, gamma=0.75, smooth=1e-5):
         super().__init__()
         self.alpha = alpha
@@ -110,7 +236,9 @@ class FocalTverskyLoss(nn.Module):
         self.gamma = gamma
         self.smooth = smooth
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(self, pred: torch.Tensor, 
+                target: torch.Tensor,
+                kidney_mask: torch.Tensor) -> torch.Tensor:
         # Get probability map
         pred = pred.softmax(dim=1)
         
@@ -118,15 +246,18 @@ class FocalTverskyLoss(nn.Module):
         if pred.shape[1] == 2:
             pred = pred[:, 1:]
         
-        # Ensure target is in correct format
+        # Ensure target and kidney_mask dimensions
         if len(target.shape) == len(pred.shape) - 1:
             target = target.unsqueeze(1)
-        
         target = (target > 0).float()
         
-        # Interpolate predictions to match target size if needed
-        if pred.shape[-3:] != target.shape[-3:]:
-            pred = F.interpolate(pred, size=target.shape[-3:], mode='trilinear', align_corners=False)
+        if len(kidney_mask.shape) == len(pred.shape) - 1:
+            kidney_mask = kidney_mask.unsqueeze(1)
+        mask = (kidney_mask > 0).float()
+        
+        # Apply kidney mask
+        pred = pred * mask
+        target = target * mask
         
         # Flatten predictions and targets
         pred = pred.flatten(2)
@@ -147,97 +278,6 @@ class FocalTverskyLoss(nn.Module):
         
         return focal_tversky.mean()
 
-class SoftDiceLoss(nn.Module):
-    def __init__(self, batch_dice=True, smooth=1e-5, do_bg=False):
-        super().__init__()
-        self.batch_dice = batch_dice
-        self.smooth = smooth
-        self.do_bg = do_bg
-
-    def forward(self, net_output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        # Get probabilities using softmax
-        pc = net_output.softmax(dim=1)
-        
-        # For binary case, focus on tumor class
-        if not self.do_bg and pc.shape[1] == 2:
-            pc = pc[:, 1:]
-        
-        # Ensure target is in correct format and float type
-        if len(target.shape) == len(pc.shape) - 1:
-            target = target.unsqueeze(1)
-        target = target.float()
-        
-        # Interpolate predictions to match target size if needed
-        if pc.shape[-3:] != target.shape[-3:]:
-            pc = F.interpolate(pc, size=target.shape[-3:], mode='trilinear', align_corners=False)
-            
-        # Flatten spatial dimensions
-        pc_flat = pc.flatten(2)
-        tgt_flat = target.flatten(2)
-        
-        # Calculate intersection and union
-        intersection = (pc_flat * tgt_flat).sum(dim=2)
-        union = pc_flat.sum(dim=2) + tgt_flat.sum(dim=2)
-        
-        # Calculate Dice score
-        dice_score = (2 * intersection + self.smooth) / (union + self.smooth)
-        dice_loss = 1 - dice_score.mean()
-        
-        return dice_loss
-
-    def compute_soft_dice_score(self, net_output: torch.Tensor, target: torch.Tensor) -> float:
-        """Compute soft Dice score without thresholding for monitoring"""
-        with torch.no_grad():
-            pc = net_output.softmax(dim=1)
-            if pc.shape[1] == 2:
-                pc = pc[:, 1:]
-            
-            if len(target.shape) == len(pc.shape) - 1:
-                target = target.unsqueeze(1)
-            
-            pc_flat = pc.flatten(2)
-            tgt_flat = target.flatten(2)
-            
-            intersection = (pc_flat * tgt_flat).sum(dim=2)
-            union = pc_flat.sum(dim=2) + tgt_flat.sum(dim=2)
-            
-            dice_score = (2 * intersection + self.smooth) / (union + self.smooth)
-            return dice_score.mean().item()
-
-class RobustCrossEntropyLoss(nn.Module):
-    def __init__(self, reduction='mean'):
-        super().__init__()
-        self.reduction = reduction
-
-    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        if input.shape[-3:] != target.shape[-3:]:
-            input = F.interpolate(input, size=target.shape[-3:], mode='trilinear', align_corners=False)
-        
-        # Ensure target values are valid (0 or 1)
-        target = (target > 0).long()
-        
-        # Handle dimensions
-        if len(target.shape) == len(input.shape) - 1:
-            target = target.unsqueeze(1)
-        elif len(target.shape) < len(input.shape) - 1:
-            for _ in range(len(input.shape) - len(target.shape) - 1):
-                target = target.unsqueeze(1)
-        
-        num_classes = input.shape[1]
-        target_one_hot = torch.zeros_like(input)
-        # Clamp target values to valid class indices
-        target = torch.clamp(target, 0, num_classes - 1)
-        target_one_hot.scatter_(1, target, 1)
-        
-        log_softmax = F.log_softmax(input, dim=1)
-        loss = -(target_one_hot * log_softmax).sum(dim=1)
-        
-        if self.reduction == 'mean':
-            return loss.mean()
-        elif self.reduction == 'sum':
-            return loss.sum()
-        return loss
-
 class DC_and_BCE_loss(nn.Module):
     def __init__(self, bce_kwargs: dict = None, soft_dice_kwargs: dict = None):
         super().__init__()
@@ -253,33 +293,27 @@ class DC_and_BCE_loss(nn.Module):
         self.boundary = BoundaryLoss()
         self.focal_tversky = FocalTverskyLoss()
 
-    def forward(self, net_output: torch.Tensor, target: torch.Tensor, deep_supervision: bool = False) -> torch.Tensor:
-        if deep_supervision:
-            # Handle deep supervision outputs
-            total_loss = 0
-            for output in net_output:
-                dc_loss = self.dc(output, target)
-                ce_loss = self.ce(output, target)
-                boundary_loss = self.boundary(output, target)
-                focal_tversky_loss = self.focal_tversky(output, target)
-                
-                loss = (self.weights.ce * ce_loss + 
-                       self.weights.dice * dc_loss +
-                       self.weights.boundary * boundary_loss + 
-                       self.weights.focal_tversky * focal_tversky_loss)
-                total_loss += loss
-            return total_loss / len(net_output)
-        else:
-            # Single output
-            dc_loss = self.dc(net_output, target)
-            ce_loss = self.ce(net_output, target)
-            boundary_loss = self.boundary(net_output, target)
-            focal_tversky_loss = self.focal_tversky(net_output, target)
-            
-            return (self.weights.ce * ce_loss + 
-                   self.weights.dice * dc_loss +
-                   self.weights.boundary * boundary_loss + 
-                   self.weights.focal_tversky * focal_tversky_loss)
+    def forward(self, net_output: torch.Tensor, target: torch.Tensor, kidney_mask: torch.Tensor = None) -> torch.Tensor:
+        """
+        Compute combined loss with kidney masking
+        Args:
+            net_output: Model output logits
+            target: Ground truth tumor mask
+            kidney_mask: Optional kidney mask to focus loss computation
+        """
+        # Default kidney mask to all ones if not provided
+        if kidney_mask is None:
+            kidney_mask = torch.ones_like(target)
+        
+        dc_loss = self.dc(net_output, target, kidney_mask)
+        ce_loss = self.ce(net_output, target, kidney_mask)
+        boundary_loss = self.boundary(net_output, target, kidney_mask)
+        focal_tversky_loss = self.focal_tversky(net_output, target, kidney_mask)
+        
+        return (self.weights.ce * ce_loss + 
+                self.weights.dice * dc_loss +
+                self.weights.boundary * boundary_loss + 
+                self.weights.focal_tversky * focal_tversky_loss)
 
     def update_weights(self, epoch: int):
         """Update loss weights based on training epoch"""
