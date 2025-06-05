@@ -1,7 +1,7 @@
 import multiprocessing as mp
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset, random_split
 from torch.cuda.amp import GradScaler, autocast
 import torch.cuda
 from pathlib import Path
@@ -9,6 +9,7 @@ import numpy as np
 from tqdm import tqdm
 import signal
 import sys
+import random
 from torch.utils.tensorboard import SummaryWriter
 
 from models.segmentation.model import SegmentationModel
@@ -62,27 +63,53 @@ class SegmentationTrainer:
         self.max_grad_norm = 1.0
         self.accum_steps = getattr(config, 'vol_gradient_accumulation_steps', 4)
         
+        # Phased training settings
+        self.tumor_only_epochs = 5  # Number of epochs for tumor-only warmup
+        self.pos_train_idx = []
+        self.neg_train_idx = []
+        
         if config.resume_training:
             self._load_checkpoint()
 
-    def train(self, dataset_path: str):
-        # Set multiprocessing method to spawn
-        try:
-            mp.set_start_method('spawn')
-        except RuntimeError:
-            pass
+    def _split_pos_neg_indices(self, dataset, train_indices):
+        """Split training indices into positive (tumor) and negative (no tumor) cases"""
+        pos_indices = []
+        neg_indices = []
+        
+        print("Separating positive and negative cases...")
+        for idx in tqdm(train_indices):
+            _, target = dataset[idx]
+            if target.float().sum() > 0:
+                pos_indices.append(idx)
+            else:
+                neg_indices.append(idx)
+        
+        # Shuffle negative indices
+        random.seed(42)
+        random.shuffle(neg_indices)
+        
+        return pos_indices, neg_indices
 
-        dataset = KiTS23VolumeDataset(dataset_path, self.config, preprocess=self.config.preprocess)
+    def _make_epoch_loader(self, dataset, epoch, total_epochs):
+        """Create DataLoader for current epoch based on training phase"""
+        if epoch < self.tumor_only_epochs:
+            # Tumor-only warmup phase
+            this_epoch_idx = self.pos_train_idx.copy()
+            phase = "tumor-only warmup"
+        else:
+            # Gradual introduction of negative cases
+            frac = float(epoch - self.tumor_only_epochs) / float(max(1, total_epochs - self.tumor_only_epochs))
+            frac = min(max(frac, 0.0), 1.0)  # Clamp to [0,1]
+            k = int(frac * len(self.neg_train_idx))
+            this_epoch_idx = self.pos_train_idx + self.neg_train_idx[:k]
+            phase = f"mixed (including {k}/{len(self.neg_train_idx)} negative cases)"
         
-        val_size = int(len(dataset) * 0.2)
-        train_size = len(dataset) - val_size
-        train_dataset, val_dataset = random_split(
-            dataset, [train_size, val_size],
-            generator=torch.Generator().manual_seed(42)
-        )
+        print(f"\nEpoch {epoch + 1}: {phase}")
+        print(f"Training on {len(this_epoch_idx)} volumes")
         
-        train_loader = DataLoader(
-            train_dataset,
+        subset_epoch = Subset(dataset, this_epoch_idx)
+        return DataLoader(
+            subset_epoch,
             batch_size=getattr(self.config, 'vol_batch_size', 1),
             shuffle=True,
             num_workers=2,
@@ -90,7 +117,32 @@ class SegmentationTrainer:
             persistent_workers=True,
             collate_fn=KiTS23VolumeDataset.collate_fn
         )
+
+    def train(self, dataset_path: str):
+        try:
+            mp.set_start_method('spawn')
+        except RuntimeError:
+            pass
+
+        # Load dataset
+        dataset = KiTS23VolumeDataset(dataset_path, self.config, preprocess=self.config.preprocess)
         
+        # Split into train/val
+        val_size = int(len(dataset) * 0.2)
+        train_size = len(dataset) - val_size
+        train_dataset, val_dataset = random_split(
+            dataset, [train_size, val_size],
+            generator=torch.Generator().manual_seed(42)
+        )
+        
+        # Split training set into positive and negative cases
+        self.pos_train_idx, self.neg_train_idx = self._split_pos_neg_indices(dataset, train_dataset.indices)
+        
+        print(f"\nFound {len(self.pos_train_idx)} positive and {len(self.neg_train_idx)} negative training volumes")
+        print(f"First {self.tumor_only_epochs} epochs will train on positives only")
+        print(f"Then gradually introducing negatives over remaining {self.config.num_epochs - self.tumor_only_epochs} epochs")
+        
+        # Create validation loader
         val_loader = DataLoader(
             val_dataset,
             batch_size=1,
@@ -100,10 +152,6 @@ class SegmentationTrainer:
             persistent_workers=True,
             collate_fn=KiTS23VolumeDataset.collate_fn
         )
-        
-        print(f"\nTraining on {len(train_dataset)} volumes")
-        print(f"Validating on {len(val_dataset)} volumes")
-        print(f"Using gradient accumulation steps: {self.accum_steps}")
 
         try:
             for epoch in range(self.start_epoch, self.config.num_epochs):
@@ -111,6 +159,9 @@ class SegmentationTrainer:
                 
                 # Update loss weights for current epoch
                 self.criterion.update_weights(epoch)
+                
+                # Create epoch-specific training loader
+                train_loader = self._make_epoch_loader(dataset, epoch, self.config.num_epochs)
                 
                 # Training phase
                 self.model.train()
@@ -145,8 +196,6 @@ class SegmentationTrainer:
                             continue
                         
                         try:
-                            # Temporarily disable autocast
-                            # with autocast():
                             outputs = self.model(images)
                             if isinstance(outputs, (list, tuple)):
                                 outputs = outputs[-1]
@@ -328,7 +377,6 @@ class SegmentationTrainer:
                     continue
                 
                 try:
-                    # with autocast():
                     outputs = self.model(images)
                     if isinstance(outputs, (list, tuple)):
                         outputs = outputs[-1]
@@ -444,7 +492,9 @@ class SegmentationTrainer:
             'scheduler_state_dict': self.scheduler.state_dict(),
             'scaler_state_dict': self.scaler.state_dict(),
             'best_val_dice': self.best_val_dice,
-            'metrics': metrics
+            'metrics': metrics,
+            'pos_train_idx': self.pos_train_idx,
+            'neg_train_idx': self.neg_train_idx
         }
         
         latest_path = self.config.checkpoint_dir / "latest.pth"
@@ -470,6 +520,11 @@ class SegmentationTrainer:
         self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
         self.start_epoch = checkpoint['epoch'] + 1
         self.best_val_dice = checkpoint['best_val_dice']
+        
+        # Load phased training state if available
+        if 'pos_train_idx' in checkpoint and 'neg_train_idx' in checkpoint:
+            self.pos_train_idx = checkpoint['pos_train_idx']
+            self.neg_train_idx = checkpoint['neg_train_idx']
         
         print(f"Resuming training from epoch {self.start_epoch}")
 
