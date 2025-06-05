@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 from torch.cuda.amp import GradScaler, autocast
+import torch.cuda
 from pathlib import Path
 import numpy as np
 from tqdm import tqdm
@@ -10,7 +11,7 @@ import signal
 import sys
 from torch.utils.tensorboard import SummaryWriter
 
-from model import nnUNetv2
+from models.segmentation.model import SegmentationModel  # Updated import
 from dataset_volume import KiTS23VolumeDataset
 from losses import DC_and_BCE_loss
 
@@ -20,15 +21,32 @@ class SegmentationTrainer:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
         
+        # Configure CUDA memory allocator
+        if torch.cuda.is_available():
+            # Set memory allocator for better fragmentation handling
+            torch.cuda.set_per_process_memory_fraction(0.95)  # Reserve some memory for system
+            torch.cuda.empty_cache()
+            # Set allocation config for better memory management
+            torch.cuda.set_allocator_settings(
+                max_split_size_mb=128,  # Reduce fragmentation
+                garbage_collection_threshold=0.8  # More aggressive GC
+            )
+            # Set deterministic mode for better memory behavior
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+        
         # Create checkpoint directory
         self.config.checkpoint_dir.mkdir(exist_ok=True)
         
         # Initialize model
-        self.model = nnUNetv2(
+        self.model = SegmentationModel(
             in_channels=2,  # Image and kidney mask channels
             out_channels=1,  # Tumor segmentation
             features=config.features
         ).to(self.device)
+        
+        # Enable gradient checkpointing for memory efficiency
+        self.model.enable_checkpointing()
         
         # Initialize weights with He initialization
         self._initialize_weights()
@@ -46,7 +64,7 @@ class SegmentationTrainer:
             self.optimizer, mode='max', factor=0.5, patience=10, verbose=True
         )
         
-        self.scaler = GradScaler()
+        self.scaler = GradScaler()  # For mixed precision training
         self.writer = SummaryWriter(log_dir=config.log_dir)
         
         # Training state
@@ -117,39 +135,46 @@ class SegmentationTrainer:
                         images = images.to(self.device)
                         targets = targets.to(self.device)
                         
-                        # Forward pass without sigmoid
-                        outputs = self.model(images)
-                        if isinstance(outputs, (list, tuple)):
-                            outputs = outputs[-1]
+                        # Clear gradients
+                        self.optimizer.zero_grad()
                         
-                        if outputs.shape[-3:] != targets.shape[-3:]:
-                            outputs = F.interpolate(
-                                outputs.float(),
-                                size=targets.shape[-3:],
-                                mode='trilinear',
-                                align_corners=False
-                            )
-                        
-                        # Calculate loss without sigmoid activation
-                        loss = self.criterion(outputs, targets)
+                        # Forward pass with mixed precision
+                        with autocast():
+                            outputs = self.model(images)
+                            if isinstance(outputs, (list, tuple)):
+                                outputs = outputs[-1]
+                            
+                            if outputs.shape[-3:] != targets.shape[-3:]:
+                                outputs = F.interpolate(
+                                    outputs,
+                                    size=targets.shape[-3:],
+                                    mode='trilinear',
+                                    align_corners=False
+                                )
+                            
+                            # Calculate loss
+                            loss = self.criterion(outputs, targets)
                         
                         if torch.isnan(loss) or torch.isinf(loss):
                             print("\nWarning: Invalid loss value detected!")
                             print(f"Loss: {loss.item()}")
                             continue
                         
-                        # Backward pass with gradient clipping
-                        self.optimizer.zero_grad()
-                        loss.backward()
+                        # Backward pass with gradient scaling
+                        self.scaler.scale(loss).backward()
                         
+                        # Unscale before gradient clipping
+                        self.scaler.unscale_(self.optimizer)
                         total_norm = torch.nn.utils.clip_grad_norm_(
                             self.model.parameters(),
                             self.max_grad_norm
                         )
                         
-                        self.optimizer.step()
+                        # Optimizer step with scaling
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
                         
-                        # Calculate metrics with sigmoid activation
+                        # Calculate metrics
                         with torch.no_grad():
                             outputs_sigmoid = torch.sigmoid(outputs)
                             dice = self._calculate_dice(outputs_sigmoid.detach(), targets)
@@ -159,14 +184,19 @@ class SegmentationTrainer:
                                 train_dice += dice
                                 valid_batches += 1
                         
-                        # Clear GPU cache periodically during training
-                        if batch_idx % 10 == 0:  # Every 10 batches
+                        # Clear GPU cache periodically
+                        if batch_idx % 10 == 0:
                             torch.cuda.empty_cache()
                             
                             # Logging
                             print(f"\nGradient norm: {total_norm:.4f}")
                             print(f"Loss: {loss.item():.4f}")
                             print(f"Dice: {dice.item():.4f}")
+                            
+                            # Log GPU memory
+                            if torch.cuda.is_available():
+                                print(f"GPU memory allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+                                print(f"GPU memory cached: {torch.cuda.memory_reserved() / 1e9:.2f} GB")
                         
                         pbar.set_postfix({
                             'loss': f"{loss.item():.4f}",
@@ -251,29 +281,31 @@ class SegmentationTrainer:
                 images = images.to(self.device)
                 targets = targets.to(self.device)
                 
-                outputs = self.model(images)
-                if isinstance(outputs, (list, tuple)):
-                    outputs = outputs[-1]
-                
-                if outputs.shape[-3:] != targets.shape[-3:]:
-                    outputs = F.interpolate(
-                        outputs.float(),
-                        size=targets.shape[-3:],
-                        mode='trilinear',
-                        align_corners=False
-                    )
-                
-                loss = self.criterion(outputs, targets)
-                outputs_sigmoid = torch.sigmoid(outputs)
-                dice = self._calculate_dice(outputs_sigmoid, targets)
+                # Forward pass with mixed precision
+                with autocast():
+                    outputs = self.model(images)
+                    if isinstance(outputs, (list, tuple)):
+                        outputs = outputs[-1]
+                    
+                    if outputs.shape[-3:] != targets.shape[-3:]:
+                        outputs = F.interpolate(
+                            outputs,
+                            size=targets.shape[-3:],
+                            mode='trilinear',
+                            align_corners=False
+                        )
+                    
+                    loss = self.criterion(outputs, targets)
+                    outputs_sigmoid = torch.sigmoid(outputs)
+                    dice = self._calculate_dice(outputs_sigmoid, targets)
                 
                 if not torch.isnan(dice) and not torch.isinf(dice):
                     val_loss += loss.item()
                     val_dice += dice
                     valid_batches += 1
                 
-                # Clear GPU cache periodically during validation
-                if batch_idx % 5 == 0:  # Every 5 batches during validation
+                # Clear GPU cache periodically
+                if batch_idx % 5 == 0:
                     torch.cuda.empty_cache()
                 
                 pbar.set_postfix({

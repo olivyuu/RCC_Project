@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.cuda.amp import autocast
 
 class ConvDropoutNormNonlin(nn.Module):
     def __init__(self, in_channels, out_channels, 
@@ -92,12 +93,19 @@ class UpBlock(nn.Module):
         self.spatial_attention = SpatialAttention(out_channels)
 
     def forward(self, x, skip):
+        # Memory efficient upsampling
         x = self.upconv(x)
         if x.shape != skip.shape:
-            x = F.interpolate(x, skip.shape[2:])
+            x = F.interpolate(x, skip.shape[2:], mode='trilinear', align_corners=False)
+        
+        # Process skip connection
         skip = self.reduce_skip(skip)
         skip = self.attention_gate(x, skip)
+        
+        # Concatenate and process
         x = torch.cat((skip, x), dim=1)
+        del skip  # Free memory
+        
         x = self.expand_concat(x)
         x = self.conv_block(x)
         x = self.channel_attention(x)
@@ -178,6 +186,9 @@ class SegmentationModel(nn.Module):
         self.progressive_weights = nn.Parameter(torch.ones(len(self.deep_supervision) + 1))
         self.softmax = nn.Softmax(dim=0)
         
+        # Enable gradient checkpointing by default
+        self.use_checkpointing = True
+        
         # For Grad-CAM
         self.target_layer = None
         self.gradients = None
@@ -196,29 +207,46 @@ class SegmentationModel(nn.Module):
             target_layer.register_full_backward_hook(self._get_gradient)
             self.target_layer = target_layer
 
+    @autocast()
     def forward(self, x):
         # Get normalized progressive weights
         if self.training:
             weights = self.softmax(self.progressive_weights)
         
-        # Encoder
+        # Encoder with gradient checkpointing
         skip_connections = []
         for i, down_block in enumerate(self.down_blocks[:-1]):
-            x, skip = down_block(x)
+            if self.use_checkpointing and self.training:
+                x, skip = torch.utils.checkpoint.checkpoint(down_block, x)
+            else:
+                x, skip = down_block(x)
             skip_connections.append(skip)
         
-        x, skip = self.down_blocks[-1](x)
-        x = self.bottleneck(x)
+        # Last down block and bottleneck
+        if self.use_checkpointing and self.training:
+            x, skip = torch.utils.checkpoint.checkpoint(self.down_blocks[-1], x)
+            x = torch.utils.checkpoint.checkpoint(self.bottleneck, x)
+        else:
+            x, skip = self.down_blocks[-1](x)
+            x = self.bottleneck(x)
+            
         skip_connections.append(skip)
         skip_connections = skip_connections[::-1]  # Reverse for decoder
 
-        # Decoder with deep supervision
+        # Decoder with deep supervision and gradient checkpointing
         deep_outputs = []
         for i, up_block in enumerate(self.up_blocks):
-            x = up_block(x, skip_connections[i])
+            if self.use_checkpointing and self.training:
+                x = torch.utils.checkpoint.checkpoint(up_block, x, skip_connections[i])
+            else:
+                x = up_block(x, skip_connections[i])
+                
             if self.training:
                 deep_out = self.deep_supervision[i](x)
                 deep_outputs.append(deep_out)
+
+            # Clear skip connection after use
+            skip_connections[i] = None
 
         output = self.final_conv(x)
 
@@ -227,3 +255,11 @@ class SegmentationModel(nn.Module):
             weighted_outputs = [out * weight for out, weight in zip(outputs, weights)]
             return weighted_outputs
         return output
+
+    def enable_checkpointing(self):
+        """Enable gradient checkpointing for memory efficiency"""
+        self.use_checkpointing = True
+
+    def disable_checkpointing(self):
+        """Disable gradient checkpointing"""
+        self.use_checkpointing = False
