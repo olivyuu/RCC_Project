@@ -73,6 +73,25 @@ class SegmentationTrainer:
         
         if config.resume_training:
             self._load_checkpoint()
+            
+    def _check_tensor_values(self, tensor, name, epoch, batch_idx):
+        """Check tensor for NaN and Inf values."""
+        if torch.isnan(tensor).any():
+            raise RuntimeError(f"Found NaN in {name} at epoch {epoch}, batch {batch_idx}")
+        if torch.isinf(tensor).any():
+            raise RuntimeError(f"Found Inf in {name} at epoch {epoch}, batch {batch_idx}")
+
+    def _process_batch(self, images, targets, epoch, batch_idx):
+        """Process batch with value checks and proper device placement."""
+        # Convert to float32 and move to device
+        images = images.to(dtype=torch.float32, device=self.device)
+        targets = targets.to(dtype=torch.float32, device=self.device)
+        
+        # Check for NaN/Inf values
+        self._check_tensor_values(images, "input images", epoch, batch_idx)
+        self._check_tensor_values(targets, "target masks", epoch, batch_idx)
+        
+        return images, targets
 
     def _initialize_weights(self):
         """Initialize network weights using He initialization"""
@@ -135,8 +154,8 @@ class SegmentationTrainer:
                 
                 with tqdm(train_loader, desc=f"Epoch {epoch+1}/{self.config.num_epochs}") as pbar:
                     for batch_idx, (images, targets) in enumerate(pbar):
-                        images = images.to(self.device)
-                        targets = targets.to(self.device)
+                        # Process batch and check values
+                        images, targets = self._process_batch(images, targets, epoch, batch_idx)
                         
                         # Forward pass with mixed precision
                         with autocast():
@@ -284,8 +303,8 @@ class SegmentationTrainer:
         
         with tqdm(val_loader, desc="Validating") as pbar:
             for batch_idx, (images, targets) in enumerate(pbar):
-                images = images.to(self.device)
-                targets = targets.to(self.device)
+                # Process batch and check values
+                images, targets = self._process_batch(images, targets, 'val', batch_idx)
                 
                 # Forward pass with mixed precision
                 with autocast():

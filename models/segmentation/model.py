@@ -209,6 +209,10 @@ class SegmentationModel(nn.Module):
 
     @autocast()
     def forward(self, x):
+        # Ensure input is float32 and requires gradient
+        if x.dtype != torch.float32:
+            x = x.float()
+
         # Get normalized progressive weights
         if self.training:
             weights = self.softmax(self.progressive_weights)
@@ -217,15 +221,15 @@ class SegmentationModel(nn.Module):
         skip_connections = []
         for i, down_block in enumerate(self.down_blocks[:-1]):
             if self.use_checkpointing and self.training:
-                x, skip = torch.utils.checkpoint.checkpoint(down_block, x)
+                x, skip = torch.utils.checkpoint.checkpoint(down_block, x, use_reentrant=False)
             else:
                 x, skip = down_block(x)
             skip_connections.append(skip)
         
         # Last down block and bottleneck
         if self.use_checkpointing and self.training:
-            x, skip = torch.utils.checkpoint.checkpoint(self.down_blocks[-1], x)
-            x = torch.utils.checkpoint.checkpoint(self.bottleneck, x)
+            x, skip = torch.utils.checkpoint.checkpoint(self.down_blocks[-1], x, use_reentrant=False)
+            x = torch.utils.checkpoint.checkpoint(self.bottleneck, x, use_reentrant=False)
         else:
             x, skip = self.down_blocks[-1](x)
             x = self.bottleneck(x)
@@ -237,7 +241,7 @@ class SegmentationModel(nn.Module):
         deep_outputs = []
         for i, up_block in enumerate(self.up_blocks):
             if self.use_checkpointing and self.training:
-                x = torch.utils.checkpoint.checkpoint(up_block, x, skip_connections[i])
+                x = torch.utils.checkpoint.checkpoint(up_block, x, skip_connections[i], use_reentrant=False)
             else:
                 x = up_block(x, skip_connections[i])
                 
