@@ -73,25 +73,68 @@ class SegmentationTrainer:
         
         if config.resume_training:
             self._load_checkpoint()
-            
-    def _check_tensor_values(self, tensor, name, epoch, batch_idx):
-        """Check tensor for NaN and Inf values."""
-        if torch.isnan(tensor).any():
-            raise RuntimeError(f"Found NaN in {name} at epoch {epoch}, batch {batch_idx}")
-        if torch.isinf(tensor).any():
-            raise RuntimeError(f"Found Inf in {name} at epoch {epoch}, batch {batch_idx}")
 
-    def _process_batch(self, images, targets, epoch, batch_idx):
-        """Process batch with value checks and proper device placement."""
-        # Convert to float32 and move to device
-        images = images.to(dtype=torch.float32, device=self.device)
-        targets = targets.to(dtype=torch.float32, device=self.device)
+    def _debug_loss_components(self, dataloader):
+        """Debug individual loss components on a single batch."""
+        print("\nDebugging loss components on first batch:")
         
-        # Check for NaN/Inf values
-        self._check_tensor_values(images, "input images", epoch, batch_idx)
-        self._check_tensor_values(targets, "target masks", epoch, batch_idx)
+        # Get a single batch
+        images, targets = next(iter(dataloader))
+        images = images.to(self.device)
+        targets = targets.to(self.device)
         
-        return images, targets
+        with torch.no_grad(), autocast():
+            # Forward pass
+            outputs = self.model(images)
+            if isinstance(outputs, (list, tuple)):
+                outputs = outputs[-1]
+            
+            print("\nModel output stats:")
+            print(f"  Shape: {outputs.shape}")
+            print(f"  Range: [{outputs.min():.4f}, {outputs.max():.4f}]")
+            print(f"  Has NaN: {torch.isnan(outputs).any().item()}")
+            print(f"  Has Inf: {torch.isinf(outputs).any().item()}")
+            
+            # Check each loss component
+            print("\nLoss components:")
+            dc_loss = self.criterion.dc(outputs, targets)
+            print(f"  Dice Loss: {dc_loss.item():.4f}")
+            print(f"    Has NaN: {torch.isnan(dc_loss).any().item()}")
+            print(f"    Has Inf: {torch.isinf(dc_loss).any().item()}")
+            
+            ce_loss = self.criterion.ce(outputs, targets)
+            print(f"  CE Loss: {ce_loss.item():.4f}")
+            print(f"    Has NaN: {torch.isnan(ce_loss).any().item()}")
+            print(f"    Has Inf: {torch.isinf(ce_loss).any().item()}")
+            
+            boundary_loss = self.criterion.boundary(outputs, targets)
+            print(f"  Boundary Loss: {boundary_loss.item():.4f}")
+            print(f"    Has NaN: {torch.isnan(boundary_loss).any().item()}")
+            print(f"    Has Inf: {torch.isinf(boundary_loss).any().item()}")
+            
+            ft_loss = self.criterion.focal_tversky(outputs, targets)
+            print(f"  Focal Tversky Loss: {ft_loss.item():.4f}")
+            print(f"    Has NaN: {torch.isnan(ft_loss).any().item()}")
+            print(f"    Has Inf: {torch.isinf(ft_loss).any().item()}")
+            
+            # Combined loss
+            combined = (self.criterion.weight_dice * dc_loss + 
+                       self.criterion.weight_ce * ce_loss +
+                       self.criterion.weight_boundary * boundary_loss + 
+                       self.criterion.weight_focal_tversky * ft_loss)
+            
+            print(f"\nCombined weighted loss: {combined.item():.4f}")
+            print(f"  Has NaN: {torch.isnan(combined).any().item()}")
+            print(f"  Has Inf: {torch.isinf(combined).any().item()}")
+            
+            print("\nLoss weights:")
+            print(f"  Dice: {self.criterion.weight_dice}")
+            print(f"  CE: {self.criterion.weight_ce}")
+            print(f"  Boundary: {self.criterion.weight_boundary}")
+            print(f"  Focal Tversky: {self.criterion.weight_focal_tversky}")
+            
+            del outputs
+            torch.cuda.empty_cache()
 
     def _initialize_weights(self):
         """Initialize network weights using He initialization"""
@@ -139,6 +182,9 @@ class SegmentationTrainer:
         print(f"Validating on {len(val_dataset)} volumes")
         print(f"Using gradient accumulation steps: {self.accum_steps}")
         
+        # Debug loss components before training
+        self._debug_loss_components(train_loader)
+        
         try:
             for epoch in range(self.start_epoch, self.config.num_epochs):
                 self.current_epoch = epoch
@@ -155,7 +201,17 @@ class SegmentationTrainer:
                 with tqdm(train_loader, desc=f"Epoch {epoch+1}/{self.config.num_epochs}") as pbar:
                     for batch_idx, (images, targets) in enumerate(pbar):
                         # Process batch and check values
-                        images, targets = self._process_batch(images, targets, epoch, batch_idx)
+                        images = images.to(dtype=torch.float32, device=self.device)
+                        targets = targets.to(dtype=torch.float32, device=self.device)
+                        
+                        # Check for NaN/Inf values
+                        if torch.isnan(images).any() or torch.isinf(images).any():
+                            print(f"\nWarning: Found NaN/Inf in input images at epoch {epoch}, batch {batch_idx}")
+                            continue
+                            
+                        if torch.isnan(targets).any() or torch.isinf(targets).any():
+                            print(f"\nWarning: Found NaN/Inf in target masks at epoch {epoch}, batch {batch_idx}")
+                            continue
                         
                         # Forward pass with mixed precision
                         with autocast():
@@ -304,7 +360,17 @@ class SegmentationTrainer:
         with tqdm(val_loader, desc="Validating") as pbar:
             for batch_idx, (images, targets) in enumerate(pbar):
                 # Process batch and check values
-                images, targets = self._process_batch(images, targets, 'val', batch_idx)
+                images = images.to(dtype=torch.float32, device=self.device)
+                targets = targets.to(dtype=torch.float32, device=self.device)
+                
+                # Check for NaN/Inf values
+                if torch.isnan(images).any() or torch.isinf(images).any():
+                    print(f"\nWarning: Found NaN/Inf in validation images, batch {batch_idx}")
+                    continue
+                    
+                if torch.isnan(targets).any() or torch.isinf(targets).any():
+                    print(f"\nWarning: Found NaN/Inf in validation targets, batch {batch_idx}")
+                    continue
                 
                 # Forward pass with mixed precision
                 with autocast():
