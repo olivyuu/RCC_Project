@@ -36,7 +36,7 @@ class SegmentationTrainer:
         # Initialize model
         self.model = SegmentationModel(
             in_channels=2,  # Image and kidney mask channels
-            out_channels=1,  # Tumor segmentation
+            out_channels=2,  # Two channels for background + tumor
             features=config.features
         ).to(self.device)
         
@@ -79,62 +79,67 @@ class SegmentationTrainer:
         print("\nDebugging loss components on first batch:")
         
         # Get a single batch
-        images, targets = next(iter(dataloader))
-        images = images.to(self.device)
-        targets = targets.to(self.device)
-        
-        with torch.no_grad(), autocast():
-            # Forward pass
-            outputs = self.model(images)
-            if isinstance(outputs, (list, tuple)):
-                outputs = outputs[-1]
+        try:
+            images, targets = next(iter(dataloader))
+            images = images.to(self.device)
+            targets = targets.to(self.device)
             
-            print("\nModel output stats:")
-            print(f"  Shape: {outputs.shape}")
-            print(f"  Range: [{outputs.min():.4f}, {outputs.max():.4f}]")
-            print(f"  Has NaN: {torch.isnan(outputs).any().item()}")
-            print(f"  Has Inf: {torch.isinf(outputs).any().item()}")
-            
-            # Check each loss component
-            print("\nLoss components:")
-            dc_loss = self.criterion.dc(outputs, targets)
-            print(f"  Dice Loss: {dc_loss.item():.4f}")
-            print(f"    Has NaN: {torch.isnan(dc_loss).any().item()}")
-            print(f"    Has Inf: {torch.isinf(dc_loss).any().item()}")
-            
-            ce_loss = self.criterion.ce(outputs, targets)
-            print(f"  CE Loss: {ce_loss.item():.4f}")
-            print(f"    Has NaN: {torch.isnan(ce_loss).any().item()}")
-            print(f"    Has Inf: {torch.isinf(ce_loss).any().item()}")
-            
-            boundary_loss = self.criterion.boundary(outputs, targets)
-            print(f"  Boundary Loss: {boundary_loss.item():.4f}")
-            print(f"    Has NaN: {torch.isnan(boundary_loss).any().item()}")
-            print(f"    Has Inf: {torch.isinf(boundary_loss).any().item()}")
-            
-            ft_loss = self.criterion.focal_tversky(outputs, targets)
-            print(f"  Focal Tversky Loss: {ft_loss.item():.4f}")
-            print(f"    Has NaN: {torch.isnan(ft_loss).any().item()}")
-            print(f"    Has Inf: {torch.isinf(ft_loss).any().item()}")
-            
-            # Combined loss
-            combined = (self.criterion.weight_dice * dc_loss + 
-                       self.criterion.weight_ce * ce_loss +
-                       self.criterion.weight_boundary * boundary_loss + 
-                       self.criterion.weight_focal_tversky * ft_loss)
-            
-            print(f"\nCombined weighted loss: {combined.item():.4f}")
-            print(f"  Has NaN: {torch.isnan(combined).any().item()}")
-            print(f"  Has Inf: {torch.isinf(combined).any().item()}")
-            
-            print("\nLoss weights:")
-            print(f"  Dice: {self.criterion.weight_dice}")
-            print(f"  CE: {self.criterion.weight_ce}")
-            print(f"  Boundary: {self.criterion.weight_boundary}")
-            print(f"  Focal Tversky: {self.criterion.weight_focal_tversky}")
-            
-            del outputs
-            torch.cuda.empty_cache()
+            with torch.no_grad(), autocast():
+                # Forward pass
+                outputs = self.model(images)
+                if isinstance(outputs, (list, tuple)):
+                    outputs = outputs[-1]
+                
+                print("\nModel output stats:")
+                print(f"  Shape: {outputs.shape}")
+                print(f"  Range: [{outputs.min():.4f}, {outputs.max():.4f}]")
+                print(f"  Has NaN: {torch.isnan(outputs).any().item()}")
+                print(f"  Has Inf: {torch.isinf(outputs).any().item()}")
+                
+                # Check each loss component
+                print("\nLoss components:")
+                dc_loss = self.criterion.dc(outputs, targets)
+                print(f"  Dice Loss: {dc_loss.item():.4f}")
+                print(f"    Has NaN: {torch.isnan(dc_loss).any().item()}")
+                print(f"    Has Inf: {torch.isinf(dc_loss).any().item()}")
+                
+                ce_loss = self.criterion.ce(outputs, targets)
+                print(f"  CE Loss: {ce_loss.item():.4f}")
+                print(f"    Has NaN: {torch.isnan(ce_loss).any().item()}")
+                print(f"    Has Inf: {torch.isinf(ce_loss).any().item()}")
+                
+                boundary_loss = self.criterion.boundary(outputs, targets)
+                print(f"  Boundary Loss: {boundary_loss.item():.4f}")
+                print(f"    Has NaN: {torch.isnan(boundary_loss).any().item()}")
+                print(f"    Has Inf: {torch.isinf(boundary_loss).any().item()}")
+                
+                ft_loss = self.criterion.focal_tversky(outputs, targets)
+                print(f"  Focal Tversky Loss: {ft_loss.item():.4f}")
+                print(f"    Has NaN: {torch.isnan(ft_loss).any().item()}")
+                print(f"    Has Inf: {torch.isinf(ft_loss).any().item()}")
+                
+                # Combined loss
+                combined = (self.criterion.weight_dice * dc_loss + 
+                          self.criterion.weight_ce * ce_loss +
+                          self.criterion.weight_boundary * boundary_loss + 
+                          self.criterion.weight_focal_tversky * ft_loss)
+                
+                print(f"\nCombined weighted loss: {combined.item():.4f}")
+                print(f"  Has NaN: {torch.isnan(combined).any().item()}")
+                print(f"  Has Inf: {torch.isinf(combined).any().item()}")
+                
+                print("\nLoss weights:")
+                print(f"  Dice: {self.criterion.weight_dice}")
+                print(f"  CE: {self.criterion.weight_ce}")
+                print(f"  Boundary: {self.criterion.weight_boundary}")
+                print(f"  Focal Tversky: {self.criterion.weight_focal_tversky}")
+                
+                del outputs
+                torch.cuda.empty_cache()
+        except Exception as e:
+            print(f"Error during loss debugging: {str(e)}")
+            import traceback
+            traceback.print_exc()
 
     def _initialize_weights(self):
         """Initialize network weights using He initialization"""
@@ -150,6 +155,12 @@ class SegmentationTrainer:
                 torch.nn.init.zeros_(m.bias)
 
     def train(self, dataset_path: str):
+        # Set multiprocessing method to spawn
+        try:
+            mp.set_start_method('spawn')
+        except RuntimeError:
+            pass
+
         dataset = KiTS23VolumeDataset(dataset_path, self.config, preprocess=self.config.preprocess)
         
         val_size = int(len(dataset) * 0.2)
@@ -164,8 +175,9 @@ class SegmentationTrainer:
             train_dataset,
             batch_size=getattr(self.config, 'vol_batch_size', 1),  # Default to 1 for full volumes
             shuffle=True,
-            num_workers=4,
+            num_workers=2,  # Reduced worker count for stability
             pin_memory=True,
+            persistent_workers=True,  # Keep workers alive between epochs
             collate_fn=KiTS23VolumeDataset.collate_fn
         )
         
@@ -173,8 +185,9 @@ class SegmentationTrainer:
             val_dataset,
             batch_size=1,  # Always use batch size 1 for validation
             shuffle=False,
-            num_workers=4,
+            num_workers=2,  # Reduced worker count for stability
             pin_memory=True,
+            persistent_workers=True,  # Keep workers alive between epochs
             collate_fn=KiTS23VolumeDataset.collate_fn
         )
         
@@ -194,6 +207,7 @@ class SegmentationTrainer:
                 train_loss = 0
                 train_dice = 0
                 valid_batches = 0
+                total_norm = 0  # Initialize gradient norm
                 
                 # Zero gradients at the start of each epoch
                 self.optimizer.zero_grad()
@@ -213,77 +227,88 @@ class SegmentationTrainer:
                             print(f"\nWarning: Found NaN/Inf in target masks at epoch {epoch}, batch {batch_idx}")
                             continue
                         
-                        # Forward pass with mixed precision
-                        with autocast():
-                            outputs = self.model(images)
-                            if isinstance(outputs, (list, tuple)):
-                                outputs = outputs[-1]
+                        try:
+                            # Forward pass with mixed precision
+                            with autocast():
+                                outputs = self.model(images)
+                                if isinstance(outputs, (list, tuple)):
+                                    outputs = outputs[-1]
+                                
+                                if outputs.shape[-3:] != targets.shape[-3:]:
+                                    outputs = F.interpolate(
+                                        outputs,
+                                        size=targets.shape[-3:],
+                                        mode='trilinear',
+                                        align_corners=False
+                                    )
+                                
+                                # Scale loss by accumulation steps
+                                loss = self.criterion(outputs, targets) / self.accum_steps
                             
-                            if outputs.shape[-3:] != targets.shape[-3:]:
-                                outputs = F.interpolate(
-                                    outputs,
-                                    size=targets.shape[-3:],
-                                    mode='trilinear',
-                                    align_corners=False
+                            if torch.isnan(loss) or torch.isinf(loss):
+                                print("\nWarning: Invalid loss value detected!")
+                                print(f"Loss: {loss.item()}")
+                                continue
+                            
+                            # Backward pass with gradient scaling
+                            self.scaler.scale(loss).backward()
+                            
+                            # Update weights if we've accumulated enough steps
+                            if (batch_idx + 1) % self.accum_steps == 0:
+                                # Unscale before gradient clipping
+                                self.scaler.unscale_(self.optimizer)
+                                total_norm = torch.nn.utils.clip_grad_norm_(
+                                    self.model.parameters(),
+                                    self.max_grad_norm
                                 )
+                                
+                                # Optimizer step with scaling
+                                self.scaler.step(self.optimizer)
+                                self.scaler.update()
+                                self.optimizer.zero_grad()
+                                
+                                # Clear GPU cache after optimization step
+                                torch.cuda.empty_cache()
                             
-                            # Scale loss by accumulation steps
-                            loss = self.criterion(outputs, targets) / self.accum_steps
-                        
-                        if torch.isnan(loss) or torch.isinf(loss):
-                            print("\nWarning: Invalid loss value detected!")
-                            print(f"Loss: {loss.item()}")
-                            continue
-                        
-                        # Backward pass with gradient scaling
-                        self.scaler.scale(loss).backward()
-                        
-                        # Update weights if we've accumulated enough steps
-                        if (batch_idx + 1) % self.accum_steps == 0:
-                            # Unscale before gradient clipping
-                            self.scaler.unscale_(self.optimizer)
-                            total_norm = torch.nn.utils.clip_grad_norm_(
-                                self.model.parameters(),
-                                self.max_grad_norm
-                            )
+                            # Calculate metrics
+                            with torch.no_grad():
+                                outputs_sigmoid = torch.softmax(outputs, dim=1)[:, 1:]  # Get tumor class probability
+                                dice = self._calculate_dice(outputs_sigmoid.detach(), targets)
+                                
+                                if not torch.isnan(dice) and not torch.isinf(dice):
+                                    train_loss += loss.item() * self.accum_steps  # Scale loss back up for logging
+                                    train_dice += dice
+                                    valid_batches += 1
                             
-                            # Optimizer step with scaling
-                            self.scaler.step(self.optimizer)
-                            self.scaler.update()
-                            self.optimizer.zero_grad()
+                            # Clear GPU cache periodically
+                            if batch_idx % 10 == 0:
+                                torch.cuda.empty_cache()
+                                
+                                # Logging
+                                if total_norm > 0:  # Only log if we've performed an optimization step
+                                    print(f"\nGradient norm: {total_norm:.4f}")
+                                print(f"Loss: {loss.item() * self.accum_steps:.4f}")  # Scale loss back up for logging
+                                print(f"Dice: {dice.item():.4f}")
+                                
+                                # Log GPU memory
+                                if torch.cuda.is_available():
+                                    print(f"GPU memory allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+                                    print(f"GPU memory reserved: {torch.cuda.memory_reserved() / 1e9:.2f} GB")
                             
-                            # Clear GPU cache after optimization step
-                            torch.cuda.empty_cache()
-                        
-                        # Calculate metrics
-                        with torch.no_grad():
-                            outputs_sigmoid = torch.sigmoid(outputs)
-                            dice = self._calculate_dice(outputs_sigmoid.detach(), targets)
+                            pbar.set_postfix({
+                                'loss': f"{loss.item() * self.accum_steps:.4f}",  # Scale loss back up for logging
+                                'dice': f"{dice.item():.4f}",
+                                'grad_norm': f"{total_norm:.4f}" if total_norm > 0 else "N/A"
+                            })
                             
-                            if not torch.isnan(dice) and not torch.isinf(dice):
-                                train_loss += loss.item() * self.accum_steps  # Scale loss back up for logging
-                                train_dice += dice
-                                valid_batches += 1
-                        
-                        # Clear GPU cache periodically
-                        if batch_idx % 10 == 0:
-                            torch.cuda.empty_cache()
-                            
-                            # Logging
-                            print(f"\nGradient norm: {total_norm:.4f}")
-                            print(f"Loss: {loss.item() * self.accum_steps:.4f}")  # Scale loss back up for logging
-                            print(f"Dice: {dice.item():.4f}")
-                            
-                            # Log GPU memory
-                            if torch.cuda.is_available():
-                                print(f"GPU memory allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
-                                print(f"GPU memory reserved: {torch.cuda.memory_reserved() / 1e9:.2f} GB")
-                        
-                        pbar.set_postfix({
-                            'loss': f"{loss.item() * self.accum_steps:.4f}",  # Scale loss back up for logging
-                            'dice': f"{dice.item():.4f}",
-                            'grad_norm': f"{total_norm:.4f}"
-                        })
+                        except RuntimeError as e:
+                            if "out of memory" in str(e):
+                                print(f"\nCUDA OOM in batch {batch_idx}. Attempting recovery...")
+                                if hasattr(torch.cuda, 'empty_cache'):
+                                    torch.cuda.empty_cache()
+                                continue
+                            else:
+                                raise e
                 
                 # Calculate epoch metrics
                 if valid_batches > 0:
@@ -372,37 +397,46 @@ class SegmentationTrainer:
                     print(f"\nWarning: Found NaN/Inf in validation targets, batch {batch_idx}")
                     continue
                 
-                # Forward pass with mixed precision
-                with autocast():
-                    outputs = self.model(images)
-                    if isinstance(outputs, (list, tuple)):
-                        outputs = outputs[-1]
+                try:
+                    # Forward pass with mixed precision
+                    with autocast():
+                        outputs = self.model(images)
+                        if isinstance(outputs, (list, tuple)):
+                            outputs = outputs[-1]
+                        
+                        if outputs.shape[-3:] != targets.shape[-3:]:
+                            outputs = F.interpolate(
+                                outputs,
+                                size=targets.shape[-3:],
+                                mode='trilinear',
+                                align_corners=False
+                            )
+                        
+                        loss = self.criterion(outputs, targets)
+                        outputs_sigmoid = torch.softmax(outputs, dim=1)[:, 1:]  # Get tumor class probability
+                        dice = self._calculate_dice(outputs_sigmoid, targets)
                     
-                    if outputs.shape[-3:] != targets.shape[-3:]:
-                        outputs = F.interpolate(
-                            outputs,
-                            size=targets.shape[-3:],
-                            mode='trilinear',
-                            align_corners=False
-                        )
+                    if not torch.isnan(dice) and not torch.isinf(dice):
+                        val_loss += loss.item()
+                        val_dice += dice
+                        valid_batches += 1
                     
-                    loss = self.criterion(outputs, targets)
-                    outputs_sigmoid = torch.sigmoid(outputs)
-                    dice = self._calculate_dice(outputs_sigmoid, targets)
-                
-                if not torch.isnan(dice) and not torch.isinf(dice):
-                    val_loss += loss.item()
-                    val_dice += dice
-                    valid_batches += 1
-                
-                # Clear GPU cache periodically
-                if batch_idx % 5 == 0:
-                    torch.cuda.empty_cache()
-                
-                pbar.set_postfix({
-                    'loss': f"{loss.item():.4f}",
-                    'dice': f"{dice.item():.4f}"
-                })
+                    # Clear GPU cache periodically
+                    if batch_idx % 5 == 0:
+                        torch.cuda.empty_cache()
+                    
+                    pbar.set_postfix({
+                        'loss': f"{loss.item():.4f}",
+                        'dice': f"{dice.item():.4f}"
+                    })
+                except RuntimeError as e:
+                    if "out of memory" in str(e):
+                        print(f"\nCUDA OOM in validation batch {batch_idx}. Attempting recovery...")
+                        if hasattr(torch.cuda, 'empty_cache'):
+                            torch.cuda.empty_cache()
+                        continue
+                    else:
+                        raise e
         
         if valid_batches > 0:
             return val_loss / valid_batches, val_dice / valid_batches
