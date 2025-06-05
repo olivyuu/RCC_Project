@@ -131,11 +131,11 @@ class DC_and_BCE_loss(nn.Module):
         if bce_kwargs is None:
             bce_kwargs = {}
 
-        # More conservative weights
-        self.weight_ce = 0.5          # Increased from 0.3
-        self.weight_dice = 1.0        # Unchanged
-        self.weight_boundary = 0.3    # Reduced from 0.8
-        self.weight_focal_tversky = 0.3  # Reduced from 1.0
+        # Updated loss weights based on recommendations
+        self.weight_ce = 0.2          # Reduced from 0.5
+        self.weight_dice = 2.0        # Increased from 1.0
+        self.weight_boundary = 0.2    # Reduced from 0.3
+        self.weight_focal_tversky = 1.0  # Increased from 0.3
         
         self.ce = RobustCrossEntropyLoss(**bce_kwargs)
         self.dc = SoftDiceLoss(**soft_dice_kwargs)
@@ -197,45 +197,32 @@ class SoftDiceLoss(nn.Module):
         self.do_bg = do_bg
         
     def forward(self, net_output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        if net_output.shape[-3:] != target.shape[-3:]:
-            net_output = F.interpolate(net_output, size=target.shape[-3:], mode='trilinear', align_corners=False)
-            
-        shp_x = net_output.shape
-        num_classes = shp_x[1]
-        # Ensure target values are valid (0 or 1)
-        target = (target > 0).long()
+        # Get probabilities using softmax
+        pc = net_output.softmax(dim=1)
         
-        # Create one-hot encoding
-        target_one_hot = torch.zeros_like(net_output)
-        target_indices = target.long()
-        if len(target_indices.shape) < len(target_one_hot.shape):
-            target_indices = target_indices.unsqueeze(1)
-            
-        # Clamp target values to valid class indices
-        target_indices = torch.clamp(target_indices, 0, num_classes - 1)
-        target_one_hot.scatter_(1, target_indices, 1)
+        # For binary case, focus on tumor class
+        if not self.do_bg and pc.shape[1] == 2:
+            pc = pc[:, 1:]
         
-        pc = net_output.softmax(1)
+        # Ensure target is in correct format and float type
+        if len(target.shape) == len(pc.shape) - 1:
+            target = target.unsqueeze(1)
+        target = target.float()
         
-        if not self.do_bg:
-            target_one_hot = target_one_hot[:, 1:, ...]
-            pc = pc[:, 1:, ...]
+        # Interpolate predictions to match target size if needed
+        if pc.shape[-3:] != target.shape[-3:]:
+            pc = F.interpolate(pc, size=target.shape[-3:], mode='trilinear', align_corners=False)
+            
+        # Flatten spatial dimensions
+        pc_flat = pc.flatten(2)
+        tgt_flat = target.flatten(2)
         
-        if self.batch_dice:
-            if len(pc.shape) > 3:
-                pc = pc.flatten(start_dim=2)
-                target_one_hot = target_one_hot.flatten(start_dim=2)
-            else:
-                pc = pc.reshape(shp_x[0], shp_x[1], -1)
-                target_one_hot = target_one_hot.reshape(shp_x[0], shp_x[1], -1)
-            
-            tp = (pc * target_one_hot).sum(-1)
-            fp = pc.sum(-1) - tp
-            fn = target_one_hot.sum(-1) - tp
-            
-            dice = (2 * tp + self.smooth) / (2 * tp + fp + fn + self.smooth)
-            loss = (1 - dice).mean()
-        else:
-            raise NotImplementedError("Only batch dice supported")
-            
-        return loss
+        # Calculate intersection and union
+        intersection = (pc_flat * tgt_flat).sum(dim=2)
+        union = pc_flat.sum(dim=2) + tgt_flat.sum(dim=2)
+        
+        # Calculate Dice score
+        dice_score = (2 * intersection + self.smooth) / (union + self.smooth)
+        dice_loss = 1 - dice_score.mean()
+        
+        return dice_loss

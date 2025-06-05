@@ -184,6 +184,9 @@ class SegmentationModel(nn.Module):
         # Final convolution always outputs 2 channels (background + tumor)
         self.final_conv = nn.Conv3d(features[-1], 2, 1)
         
+        # Initialize final conv bias to start with low tumor probability
+        torch.nn.init.constant_(self.final_conv.bias, -2.0)  # sigmoid(-2) ≈ 0.12
+        
         # Progressive learning weights
         self.progressive_weights = nn.Parameter(torch.ones(len(self.deep_supervision) + 1))
         self.softmax = nn.Softmax(dim=0)
