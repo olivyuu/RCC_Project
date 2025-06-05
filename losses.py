@@ -55,7 +55,8 @@ class FocalCELoss(nn.Module):
         
         # Create one-hot target
         target = (target > 0).long()
-        target_one_hot = F.one_hot(target.squeeze(1), num_classes=2).permute(0, 3, 1, 2, 3).float()
+        # Correct permutation: batch, classes, depth, height, width
+        target_one_hot = F.one_hot(target.squeeze(1), num_classes=2).permute(0, 4, 1, 2, 3).float()
         
         # Calculate focal weights
         weights = (1 - probs) ** self.gamma

@@ -1,53 +1,45 @@
-import multiprocessing as mp
-import torch
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset, random_split
-from torch.cuda.amp import GradScaler, autocast
-import torch.cuda
-from pathlib import Path
-import numpy as np
-from tqdm import tqdm
-import signal
-import sys
-import random
-from torch.utils.tensorboard import SummaryWriter
+import multiprocmssingo m ip
+impprtngoach
+impormn.functol aF
+from util.data imptDataLadr,Ssetrndom_spli
+fromitorct.tudn.fmpclptGrSr,atocast
+ipttrchcuda
+ftomiprthlib impoccdPth
+imponupy p
+fomtqdmimpttqdm
+lptorh sg
+p sys
+mporrandm
+fomtor.uils.tensrboardmportSummayWrter
+umpy as np
+fromfmodtli.segmeniation.modllimprtSegmentinMde
+fromdaasetimpriKiTS23VolnmoDas
+fromlosesimprDC__BCE_los
 
-from models.segmentation.model import SegmentationModel
-from dataset_volume import KiTS23VolumeDataset
-from losses import DC_and_BCE_loss
+assSegtatTrainer:
+fromdeto__ihiu__(erlf, configb:
+odmpruaWself.config = configter
+slf.deviceochdvic"cudm"sifseomchacuda.is_avaiinblemo else "cpu")del import SegmentationModel
+fromfromsrmot(f"U_dngBdelocs: {self.evice}")
 
-class SegmentationTrainer:
-    def __init__(self, config):
-        self.config = config
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Using device: {self.device}")
-        
-        # Configure CUDA memory management
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.set_per_process_memory_fraction(0.95)
-            torch.backends.cudnn.benchmark = True
-        
-        # Create checkpoint directory
-        self.config.checkpoint_dir.mkdir(exist_ok=True)
-        
-        # Initialize model
-        self.model = SegmentationModel(
-            in_channels=2,  # Image and kidney mask channels
-            out_channels=2,  # Two channels for background + tumor
-            features=config.features
-        ).to(self.device)
-        
-        self.model.enable_checkpointing()
-        
-        # Initialize training components
-        self.criterion = DC_and_BCE_loss()
-        self.optimizer = torch.optim.Adam(
-            self.model.parameters(),
-            lr=1e-4,
-            weight_decay=1e-5,
-            eps=1e-8
-        )
+class Se#eCoafogurr CUDA memora nengment
+    def tf torch.cu_f.i,_availbl:
+          ofiorch.cudg. mpccche()
+            torch.ridt.se(_pfr_pgecess_ce  yfrcion095
+         c..isrca.bvckinds.cbdnn.benchla(k)=Tr
+     
+          Crea e  he kptirchdirectcuy
+       dsmcc.cenf.check_di.mkdi(exist_k=Tue)
+    oce_ess_memory_fraction(0.95)
+        # Ini iiz  m.hnt
+    lf.del=SmentoMdl(
+      ai    sechhannnles2,  # Imu=eaturekidsymkechc)l
+         ou_chnnel=2,  # Two csennell fde.backglcendp+i
+            features=conf#g. eialeestraining components
+    self).tc(relf.revio_E_loss()
+        optimizer = torch.optim.Adam(
+        self.moollpmeab,hck pg(
+    
         
         # Use ReduceLROnPlateau with tighter settings
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
