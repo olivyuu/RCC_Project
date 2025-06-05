@@ -49,8 +49,14 @@ class SegmentationTrainer:
             eps=1e-8
         )
         
+        # Use ReduceLROnPlateau with tighter settings
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='max', factor=0.5, patience=10, verbose=True
+            self.optimizer, 
+            mode='max',
+            factor=0.5,     # Halve the LR when plateauing
+            patience=5,     # Wait 5 epochs before reducing
+            verbose=True,
+            min_lr=1e-6    # Don't go below this LR
         )
         
         self.scaler = GradScaler()
@@ -60,7 +66,7 @@ class SegmentationTrainer:
         self.start_epoch = 0
         self.best_val_dice = float('-inf')
         self.current_epoch = 0
-        self.max_grad_norm = 1.0
+        self.max_grad_norm = 5.0  # Reduced from default 1.0
         self.accum_steps = getattr(config, 'vol_gradient_accumulation_steps', 4)
         
         # Phased training settings
@@ -75,14 +81,27 @@ class SegmentationTrainer:
         """Split training indices into positive (tumor) and negative (no tumor) cases"""
         pos_indices = []
         neg_indices = []
+        zero_volume_cases = []
         
         print("Separating positive and negative cases...")
         for idx in tqdm(train_indices):
             _, target = dataset[idx]
-            if target.float().sum() > 0:
+            tumor_volume = target.float().sum().item()
+            if tumor_volume > 0:
                 pos_indices.append(idx)
             else:
                 neg_indices.append(idx)
+                zero_volume_cases.append(idx)
+        
+        print(f"\nCase distribution:")
+        print(f"Positive cases (with tumor): {len(pos_indices)}")
+        print(f"Negative cases (no tumor): {len(neg_indices)}")
+        
+        if len(zero_volume_cases) > 0:
+            print("\nZero volume cases found:")
+            for idx in zero_volume_cases[:5]:  # Print first 5 cases
+                sample_id = dataset.get_sample_id(idx) if hasattr(dataset, 'get_sample_id') else idx
+                print(f"Sample ID: {sample_id}")
         
         # Shuffle negative indices
         random.seed(42)
@@ -93,19 +112,35 @@ class SegmentationTrainer:
     def _make_epoch_loader(self, dataset, epoch, total_epochs):
         """Create DataLoader for current epoch based on training phase"""
         if epoch < self.tumor_only_epochs:
-            # Tumor-only warmup phase
+            # Tumor-only warmup phase - use only positive cases
             this_epoch_idx = self.pos_train_idx.copy()
-            phase = "tumor-only warmup"
+            phase = f"tumor-only warmup (training on {len(this_epoch_idx)} positive cases)"
+            
+            # Verify all selected cases have tumors
+            print("\nVerifying tumor-only phase cases...")
+            invalid_cases = []
+            for idx in this_epoch_idx:
+                _, target = dataset[idx]
+                tumor_volume = target.float().sum().item()
+                if tumor_volume == 0:
+                    sample_id = dataset.get_sample_id(idx) if hasattr(dataset, 'get_sample_id') else idx
+                    invalid_cases.append((idx, sample_id))
+            
+            if invalid_cases:
+                print("\nWARNING: Found cases with no tumor in tumor-only phase:")
+                for idx, sample_id in invalid_cases[:5]:  # Print first 5 cases
+                    print(f"Index {idx}, Sample ID: {sample_id}")
+                raise ValueError("Invalid cases found in tumor-only phase")
+                
         else:
-            # Gradual introduction of negative cases
-            frac = float(epoch - self.tumor_only_epochs) / float(max(1, total_epochs - self.tumor_only_epochs))
-            frac = min(max(frac, 0.0), 1.0)  # Clamp to [0,1]
-            k = int(frac * len(self.neg_train_idx))
+            # More gradual introduction of negative cases using quadratic ramp
+            progress = float(epoch - self.tumor_only_epochs) / float(max(1, total_epochs - self.tumor_only_epochs))
+            progress = min(max(progress * progress, 0.0), 1.0)  # Square for slower ramp
+            k = int(progress * len(self.neg_train_idx))
             this_epoch_idx = self.pos_train_idx + self.neg_train_idx[:k]
-            phase = f"mixed (including {k}/{len(self.neg_train_idx)} negative cases)"
+            phase = f"mixed (training on {len(self.pos_train_idx)} positive + {k}/{len(self.neg_train_idx)} negative cases)"
         
         print(f"\nEpoch {epoch + 1}: {phase}")
-        print(f"Training on {len(this_epoch_idx)} volumes")
         
         subset_epoch = Subset(dataset, this_epoch_idx)
         return DataLoader(
@@ -184,6 +219,13 @@ class SegmentationTrainer:
                         kidney_masks = images[:, 1:2].to(dtype=torch.float32)
                         targets = targets.to(dtype=torch.float32)
                         
+                        # Verify tumor presence in tumor-only phase
+                        if epoch < self.tumor_only_epochs:
+                            tumor_volume = (targets * kidney_masks).sum().item()
+                            if tumor_volume == 0:
+                                print(f"\nWARNING: Zero tumor volume in tumor-only phase (batch {batch_idx})")
+                                continue
+                        
                         # Recombine channels
                         images = torch.cat([ct_images, kidney_masks], dim=1)
                         
@@ -219,12 +261,15 @@ class SegmentationTrainer:
                             if batch_idx % 50 == 0:
                                 stats = self._monitor_predictions(outputs, targets, kidney_masks)
                                 self.writer.add_scalar('Training/SoftDice', stats['soft_dice'], epoch * len(train_loader) + batch_idx)
-                                self.writer.add_scalar('Training/AvgTumorProb', stats['avg_tumor_prob'], epoch * len(train_loader) + batch_idx)
+                                self.writer.add_scalar('Training/AvgTumorProb', stats['mean_prob'], epoch * len(train_loader) + batch_idx)
                             
                             self.scaler.scale(loss).backward()
                             
                             if (batch_idx + 1) % self.accum_steps == 0:
+                                # Unscale gradients for proper clipping
                                 self.scaler.unscale_(self.optimizer)
+                                
+                                # Clip gradients
                                 total_norm = torch.nn.utils.clip_grad_norm_(
                                     self.model.parameters(),
                                     self.max_grad_norm
@@ -237,8 +282,7 @@ class SegmentationTrainer:
                                 torch.cuda.empty_cache()
                             
                             with torch.no_grad():
-                                probs = torch.softmax(outputs, dim=1)[:, 1:]
-                                hard_dice = self._calculate_dice(probs > 0.5, targets, kidney_masks)
+                                hard_dice = self._calculate_dice(outputs, targets, kidney_masks)
                                 stats = self.model.compute_soft_dice(outputs, targets, kidney_masks)
                                 soft_dice = stats['soft_dice']
                                 
@@ -293,8 +337,8 @@ class SegmentationTrainer:
                 
                 torch.cuda.empty_cache()
                 
-                # Learning rate scheduling
-                self.scheduler.step(val_soft_dice)  # Use soft Dice for scheduling
+                # Learning rate scheduling based on validation soft Dice
+                self.scheduler.step(val_soft_dice)
                 current_lr = self.optimizer.param_groups[0]['lr']
                 
                 # Log metrics
@@ -395,8 +439,7 @@ class SegmentationTrainer:
                     if batch_idx % 10 == 0:
                         self._monitor_predictions(outputs, targets, kidney_masks)
                     
-                    probs = torch.softmax(outputs, dim=1)[:, 1:]
-                    hard_dice = self._calculate_dice(probs > 0.5, targets, kidney_masks)
+                    hard_dice = self._calculate_dice(outputs, targets, kidney_masks)
                     stats = self.model.compute_soft_dice(outputs, targets, kidney_masks)
                     soft_dice = stats['soft_dice']
                     
@@ -432,55 +475,96 @@ class SegmentationTrainer:
             return float('inf'), 0, 0
 
     def _calculate_dice(self, outputs, targets, kidney_masks, smooth=1e-5):
-        """Calculate hard Dice score within kidney regions only"""
-        # Apply kidney mask to both predictions and targets
-        outputs = outputs * kidney_masks
-        targets = targets * kidney_masks
-        
-        intersection = (outputs * targets).sum()
-        union = outputs.sum() + targets.sum()
-        dice = (2. * intersection + smooth) / (union + smooth)
-        
-        if dice < 0.1:
-            print("\nLow dice score detected!")
-            print(f"Predictions sum: {outputs.sum().item()}")
-            print(f"Targets sum: {targets.sum().item()}")
-            print(f"Intersection: {intersection.item()}")
-            print(f"Union: {union.item()}")
-            print(f"Active kidney voxels: {kidney_masks.sum().item()}")
-        
-        return dice
+        """Calculate hard Dice score using thresholded probabilities"""
+        with torch.no_grad():
+            # Get probabilities for tumor class
+            probs = outputs.softmax(dim=1)[:, 1:]
+            
+            # Threshold probabilities to get binary predictions
+            pred_mask = (probs > 0.5).float()
+            
+            # Apply kidney mask to both predictions and targets
+            pred_mask = pred_mask * kidney_masks
+            targets = targets * kidney_masks
+            
+            # Calculate Dice score
+            intersection = (pred_mask * targets).sum()
+            union = pred_mask.sum() + targets.sum()
+            dice = (2. * intersection + smooth) / (union + smooth)
+            
+            if dice < 0.1:
+                print("\nLow dice score detected!")
+                print(f"Mean tumor probability: {probs.mean().item():.4f}")
+                print(f"Active predictions: {pred_mask.sum().item()}")
+                print(f"Target tumor voxels: {targets.sum().item()}")
+                print(f"Intersection: {intersection.item()}")
+                print(f"Union: {union.item()}")
+                print(f"Active kidney voxels: {kidney_masks.sum().item()}")
+            
+            return dice
 
     def _monitor_predictions(self, outputs, targets, kidney_masks):
         """Monitor prediction statistics within kidney regions"""
         with torch.no_grad():
-            # Get model statistics
-            stats = self.model.get_output_stats(outputs)
+            # Get probability map
+            probs = torch.softmax(outputs, dim=1)
+            tumor_probs = probs[:, 1]
             
-            # Compute soft Dice
+            # Apply kidney mask
+            kidney_tumor_probs = tumor_probs * kidney_masks.squeeze(1)
+            active_mask = kidney_masks.squeeze(1) > 0
+            
+            # Calculate tumor volume
+            tumor_volume = (targets * kidney_masks).sum().item()
+            if tumor_volume == 0:
+                print("\nWARNING: Zero tumor volume detected in batch!")
+                if self.current_epoch < self.tumor_only_epochs:
+                    print("This should not happen during tumor-only phase!")
+            
+            if active_mask.any():
+                tumor_stats = {
+                    'mean_prob': kidney_tumor_probs[active_mask].mean().item(),
+                    'max_prob': kidney_tumor_probs[active_mask].max().item(),
+                    'min_prob': kidney_tumor_probs[active_mask].min().item(),
+                    'std_prob': kidney_tumor_probs[active_mask].std().item(),
+                    'voxels_gt_50': (kidney_tumor_probs > 0.5).sum().item(),
+                    'voxels_gt_10': (kidney_tumor_probs > 0.1).sum().item(),
+                    'kidney_volume': active_mask.sum().item(),
+                    'target_volume': tumor_volume,
+                    'has_tumor': tumor_volume > 0
+                }
+            else:
+                tumor_stats = {
+                    'mean_prob': 0,
+                    'max_prob': 0,
+                    'min_prob': 0,
+                    'std_prob': 0,
+                    'voxels_gt_50': 0,
+                    'voxels_gt_10': 0,
+                    'kidney_volume': 0,
+                    'target_volume': 0,
+                    'has_tumor': False
+                }
+            
+            # Compute soft Dice score
             soft_dice_stats = self.model.compute_soft_dice(outputs, targets, kidney_masks)
             
             # Combine all stats
-            stats.update(soft_dice_stats)
-            
-            # Calculate kidney-specific statistics
-            tumor_probs = torch.softmax(outputs, dim=1)[:, 1:]
-            kidney_tumor_probs = tumor_probs * kidney_masks
-            
-            stats.update({
-                'kidney_tumor_mean': kidney_tumor_probs[kidney_masks > 0].mean().item() if (kidney_masks > 0).any() else 0,
-                'kidney_volume': kidney_masks.sum().item(),
-                'tumor_volume': targets.sum().item(),
-                'tumor_in_kidney_ratio': (targets * kidney_masks).sum().item() / (kidney_masks.sum().item() + 1e-5)
-            })
+            stats = {**tumor_stats, **soft_dice_stats}
             
             # Log detailed statistics
             print("\nPrediction Statistics:")
-            print(f"  Soft Dice (kidney only): {stats['soft_dice']:.4f}")
-            print(f"  Mean tumor prob in kidney: {stats['kidney_tumor_mean']:.4f}")
-            print(f"  Tumor/Kidney volume ratio: {stats['tumor_in_kidney_ratio']:.4f}")
-            print(f"  Active voxels > 0.5: {stats['tumor_voxels_gt_50']}")
-            print(f"  Active voxels > 0.1: {stats['tumor_voxels_gt_10']}")
+            print(f"  Soft Dice: {stats['soft_dice']:.4f}")
+            print(f"  Mean tumor prob in kidney: {stats['mean_prob']:.4f}")
+            print(f"  Tumor prob range: [{stats['min_prob']:.4f}, {stats['max_prob']:.4f}]")
+            print(f"  Active voxels > 0.5: {stats['voxels_gt_50']}")
+            print(f"  Active voxels > 0.1: {stats['voxels_gt_10']}")
+            print(f"  Kidney volume: {stats['kidney_volume']}")
+            print(f"  Target tumor volume: {stats['target_volume']}")
+            print(f"  Has tumor: {stats['has_tumor']}")
+            
+            if not stats['has_tumor'] and self.current_epoch < self.tumor_only_epochs:
+                print("WARNING: No tumor in batch during tumor-only phase!")
             
             return stats
 
