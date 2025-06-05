@@ -13,6 +13,8 @@ class ConvDropoutNormNonlin(nn.Module):
         self.dropout = nn.Dropout3d(p=0.1)
 
     def forward(self, x):
+        # Ensure input is float32
+        x = x.to(dtype=torch.float32)
         x = self.conv(x)
         x = self.norm(x)
         x = self.nonlin(x)
@@ -154,6 +156,9 @@ class SegmentationModel(nn.Module):
                  features=(32, 64, 128, 256, 320)):
         super().__init__()
         
+        # Ensure model is initialized in float32
+        torch.set_default_dtype(torch.float32)
+        
         # Encoder
         self.down_blocks = nn.ModuleList()
         current_channels = in_channels
@@ -185,10 +190,11 @@ class SegmentationModel(nn.Module):
         self.final_conv = nn.Conv3d(features[-1], 2, 1)
         
         # Initialize final conv bias for moderately conservative tumor predictions
+        self.final_conv.bias.data = self.final_conv.bias.data.to(torch.float32)
         torch.nn.init.constant_(self.final_conv.bias, -3.5)  # sigmoid(-3.5) ≈ 0.03
         
         # Progressive learning weights for deep supervision
-        self.progressive_weights = nn.Parameter(torch.tensor([1.0, 0.8, 0.6, 0.4, 0.2]))
+        self.progressive_weights = nn.Parameter(torch.tensor([1.0, 0.8, 0.6, 0.4, 0.2], dtype=torch.float32))
         self.softmax = nn.Softmax(dim=0)
         
         # Enable gradient checkpointing by default
@@ -198,6 +204,10 @@ class SegmentationModel(nn.Module):
         self.target_layer = None
         self.gradients = None
         self.activations = None
+        
+        # Convert all parameters to float32
+        for param in self.parameters():
+            param.data = param.data.to(torch.float32)
     
     def _get_activation(self, module, input, output):
         self.activations = output
@@ -234,7 +244,7 @@ class SegmentationModel(nn.Module):
             }
             return stats
 
-    def compute_soft_dice(self, outputs, targets):
+    def compute_soft_dice(self, outputs, targets, kidney_masks):
         """Compute soft Dice score without thresholding"""
         with torch.no_grad():
             probs = torch.softmax(outputs, dim=1)[:, 1:]  # Get tumor probabilities
@@ -242,6 +252,13 @@ class SegmentationModel(nn.Module):
             # Ensure correct dimensions
             if len(targets.shape) == len(probs.shape) - 1:
                 targets = targets.unsqueeze(1)
+            
+            if len(kidney_masks.shape) == len(probs.shape) - 1:
+                kidney_masks = kidney_masks.unsqueeze(1)
+            
+            # Apply kidney mask
+            probs = probs * kidney_masks
+            targets = targets * kidney_masks
             
             # Compute soft Dice
             intersection = (probs * targets).sum()
@@ -258,14 +275,11 @@ class SegmentationModel(nn.Module):
     @autocast()
     def forward(self, x):
         # Ensure input is float32
-        if x.dtype != torch.float32:
-            x = x.float()
-
-        # Get normalized progressive weights for deep supervision
+        x = x.to(dtype=torch.float32)
+        
         if self.training:
             weights = self.softmax(self.progressive_weights)
         
-        # Encoder with gradient checkpointing
         skip_connections = []
         for i, down_block in enumerate(self.down_blocks[:-1]):
             if self.use_checkpointing and self.training:
@@ -274,7 +288,6 @@ class SegmentationModel(nn.Module):
                 x, skip = down_block(x)
             skip_connections.append(skip)
         
-        # Last down block and bottleneck
         if self.use_checkpointing and self.training:
             x, skip = torch.utils.checkpoint.checkpoint(self.down_blocks[-1], x, use_reentrant=False)
             x = torch.utils.checkpoint.checkpoint(self.bottleneck, x, use_reentrant=False)
@@ -285,7 +298,6 @@ class SegmentationModel(nn.Module):
         skip_connections.append(skip)
         skip_connections = skip_connections[::-1]  # Reverse for decoder
 
-        # Decoder with deep supervision and gradient checkpointing
         deep_outputs = []
         for i, up_block in enumerate(self.up_blocks):
             if self.use_checkpointing and self.training:
@@ -297,15 +309,13 @@ class SegmentationModel(nn.Module):
                 deep_out = self.deep_supervision[i](x)
                 deep_outputs.append(deep_out)
 
-            # Clear skip connection after use
             skip_connections[i] = None
 
         output = self.final_conv(x)
 
         if self.training:
             outputs = [output] + deep_outputs
-            # Apply progressive weights to deep supervision outputs
-            weighted_outputs = [out * w for out, w in zip(outputs, weights)]
+            weighted_outputs = [out * weight for out, weight in zip(outputs, weights)]
             return weighted_outputs
         return output
 
