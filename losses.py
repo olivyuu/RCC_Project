@@ -2,6 +2,30 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Union, Tuple
+from dataclasses import dataclass
+
+@dataclass
+class LossWeights:
+    """Class to store and update loss weights during training"""
+    ce: float = 1.0  # Start with high CE weight
+    dice: float = 0.5  # Start with lower Dice weight
+    boundary: float = 0.2
+    focal_tversky: float = 0.5
+
+    def update_for_epoch(self, epoch: int):
+        """Gradually adjust weights as training progresses"""
+        if epoch < 5:  # First 5 epochs: emphasize CE
+            self.ce = 1.0
+            self.dice = 0.5
+            self.focal_tversky = 0.5
+        elif 5 <= epoch < 10:  # Next 5 epochs: transition
+            self.ce = 0.5
+            self.dice = 1.0
+            self.focal_tversky = 0.75
+        else:  # Later epochs: tumor-focused weights
+            self.ce = 0.2
+            self.dice = 2.0
+            self.focal_tversky = 1.0
 
 class BoundaryLoss(nn.Module):
     """
@@ -123,79 +147,13 @@ class FocalTverskyLoss(nn.Module):
         
         return focal_tversky.mean()
 
-class DC_and_BCE_loss(nn.Module):
-    def __init__(self, bce_kwargs: dict = None, soft_dice_kwargs: dict = None):
-        super().__init__()
-        if soft_dice_kwargs is None:
-            soft_dice_kwargs = {'batch_dice': True, 'smooth': 1e-5, 'do_bg': False}
-        if bce_kwargs is None:
-            bce_kwargs = {}
-
-        # Updated loss weights based on recommendations
-        self.weight_ce = 0.2          # Reduced from 0.5
-        self.weight_dice = 2.0        # Increased from 1.0
-        self.weight_boundary = 0.2    # Reduced from 0.3
-        self.weight_focal_tversky = 1.0  # Increased from 0.3
-        
-        self.ce = RobustCrossEntropyLoss(**bce_kwargs)
-        self.dc = SoftDiceLoss(**soft_dice_kwargs)
-        self.boundary = BoundaryLoss()
-        self.focal_tversky = FocalTverskyLoss()
-
-    def forward(self, net_output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        dc_loss = self.dc(net_output, target) if self.weight_dice != 0 else 0
-        ce_loss = self.ce(net_output, target) if self.weight_ce != 0 else 0
-        boundary_loss = self.boundary(net_output, target) if self.weight_boundary != 0 else 0
-        focal_tversky_loss = self.focal_tversky(net_output, target) if self.weight_focal_tversky != 0 else 0
-        
-        result = (self.weight_ce * ce_loss + 
-                 self.weight_dice * dc_loss +
-                 self.weight_boundary * boundary_loss + 
-                 self.weight_focal_tversky * focal_tversky_loss)
-                 
-        return result
-
-class RobustCrossEntropyLoss(nn.Module):
-    def __init__(self, reduction='none'):
-        super().__init__()
-        self.reduction = reduction
-
-    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        if input.shape[-3:] != target.shape[-3:]:
-            input = F.interpolate(input, size=target.shape[-3:], mode='trilinear', align_corners=False)
-        
-        # Ensure target values are valid (0 or 1)
-        target = (target > 0).long()
-        
-        # Handle dimensions
-        if len(target.shape) == len(input.shape) - 1:
-            target = target.unsqueeze(1)
-        elif len(target.shape) < len(input.shape) - 1:
-            for _ in range(len(input.shape) - len(target.shape) - 1):
-                target = target.unsqueeze(1)
-        
-        num_classes = input.shape[1]
-        target_one_hot = torch.zeros_like(input)
-        # Clamp target values to valid class indices
-        target = torch.clamp(target, 0, num_classes - 1)
-        target_one_hot.scatter_(1, target, 1)
-        
-        log_softmax = F.log_softmax(input, dim=1)
-        loss = -(target_one_hot * log_softmax).sum(dim=1)
-        
-        if self.reduction == 'mean':
-            return loss.mean()
-        elif self.reduction == 'sum':
-            return loss.sum()
-        return loss.mean()
-
 class SoftDiceLoss(nn.Module):
     def __init__(self, batch_dice=True, smooth=1e-5, do_bg=False):
         super().__init__()
         self.batch_dice = batch_dice
         self.smooth = smooth
         self.do_bg = do_bg
-        
+
     def forward(self, net_output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         # Get probabilities using softmax
         pc = net_output.softmax(dim=1)
@@ -226,3 +184,103 @@ class SoftDiceLoss(nn.Module):
         dice_loss = 1 - dice_score.mean()
         
         return dice_loss
+
+    def compute_soft_dice_score(self, net_output: torch.Tensor, target: torch.Tensor) -> float:
+        """Compute soft Dice score without thresholding for monitoring"""
+        with torch.no_grad():
+            pc = net_output.softmax(dim=1)
+            if pc.shape[1] == 2:
+                pc = pc[:, 1:]
+            
+            if len(target.shape) == len(pc.shape) - 1:
+                target = target.unsqueeze(1)
+            
+            pc_flat = pc.flatten(2)
+            tgt_flat = target.flatten(2)
+            
+            intersection = (pc_flat * tgt_flat).sum(dim=2)
+            union = pc_flat.sum(dim=2) + tgt_flat.sum(dim=2)
+            
+            dice_score = (2 * intersection + self.smooth) / (union + self.smooth)
+            return dice_score.mean().item()
+
+class RobustCrossEntropyLoss(nn.Module):
+    def __init__(self, reduction='mean'):
+        super().__init__()
+        self.reduction = reduction
+
+    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        if input.shape[-3:] != target.shape[-3:]:
+            input = F.interpolate(input, size=target.shape[-3:], mode='trilinear', align_corners=False)
+        
+        # Ensure target values are valid (0 or 1)
+        target = (target > 0).long()
+        
+        # Handle dimensions
+        if len(target.shape) == len(input.shape) - 1:
+            target = target.unsqueeze(1)
+        elif len(target.shape) < len(input.shape) - 1:
+            for _ in range(len(input.shape) - len(target.shape) - 1):
+                target = target.unsqueeze(1)
+        
+        num_classes = input.shape[1]
+        target_one_hot = torch.zeros_like(input)
+        # Clamp target values to valid class indices
+        target = torch.clamp(target, 0, num_classes - 1)
+        target_one_hot.scatter_(1, target, 1)
+        
+        log_softmax = F.log_softmax(input, dim=1)
+        loss = -(target_one_hot * log_softmax).sum(dim=1)
+        
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        return loss
+
+class DC_and_BCE_loss(nn.Module):
+    def __init__(self, bce_kwargs: dict = None, soft_dice_kwargs: dict = None):
+        super().__init__()
+        if soft_dice_kwargs is None:
+            soft_dice_kwargs = {'batch_dice': True, 'smooth': 1e-5, 'do_bg': False}
+        if bce_kwargs is None:
+            bce_kwargs = {}
+
+        self.weights = LossWeights()
+        
+        self.ce = RobustCrossEntropyLoss(**bce_kwargs)
+        self.dc = SoftDiceLoss(**soft_dice_kwargs)
+        self.boundary = BoundaryLoss()
+        self.focal_tversky = FocalTverskyLoss()
+
+    def forward(self, net_output: torch.Tensor, target: torch.Tensor, deep_supervision: bool = False) -> torch.Tensor:
+        if deep_supervision:
+            # Handle deep supervision outputs
+            total_loss = 0
+            for output in net_output:
+                dc_loss = self.dc(output, target)
+                ce_loss = self.ce(output, target)
+                boundary_loss = self.boundary(output, target)
+                focal_tversky_loss = self.focal_tversky(output, target)
+                
+                loss = (self.weights.ce * ce_loss + 
+                       self.weights.dice * dc_loss +
+                       self.weights.boundary * boundary_loss + 
+                       self.weights.focal_tversky * focal_tversky_loss)
+                total_loss += loss
+            return total_loss / len(net_output)
+        else:
+            # Single output
+            dc_loss = self.dc(net_output, target)
+            ce_loss = self.ce(net_output, target)
+            boundary_loss = self.boundary(net_output, target)
+            focal_tversky_loss = self.focal_tversky(net_output, target)
+            
+            return (self.weights.ce * ce_loss + 
+                   self.weights.dice * dc_loss +
+                   self.weights.boundary * boundary_loss + 
+                   self.weights.focal_tversky * focal_tversky_loss)
+
+    def update_weights(self, epoch: int):
+        """Update loss weights based on training epoch"""
+        self.weights.update_for_epoch(epoch)

@@ -184,11 +184,11 @@ class SegmentationModel(nn.Module):
         # Final convolution always outputs 2 channels (background + tumor)
         self.final_conv = nn.Conv3d(features[-1], 2, 1)
         
-        # Initialize final conv bias to start with low tumor probability
-        torch.nn.init.constant_(self.final_conv.bias, -2.0)  # sigmoid(-2) ≈ 0.12
+        # Initialize final conv bias for very conservative tumor predictions
+        torch.nn.init.constant_(self.final_conv.bias, -5.0)  # sigmoid(-5) ≈ 0.0067
         
-        # Progressive learning weights
-        self.progressive_weights = nn.Parameter(torch.ones(len(self.deep_supervision) + 1))
+        # Progressive learning weights for deep supervision
+        self.progressive_weights = nn.Parameter(torch.tensor([1.0, 0.8, 0.6, 0.4, 0.2]))
         self.softmax = nn.Softmax(dim=0)
         
         # Enable gradient checkpointing by default
@@ -218,7 +218,7 @@ class SegmentationModel(nn.Module):
         if x.dtype != torch.float32:
             x = x.float()
 
-        # Get normalized progressive weights
+        # Get normalized progressive weights for deep supervision
         if self.training:
             weights = self.softmax(self.progressive_weights)
         
@@ -261,7 +261,8 @@ class SegmentationModel(nn.Module):
 
         if self.training:
             outputs = [output] + deep_outputs
-            weighted_outputs = [out * weight for out, weight in zip(outputs, weights)]
+            # Apply progressive weights to deep supervision outputs
+            weighted_outputs = [out * w for out, w in zip(outputs, weights)]
             return weighted_outputs
         return output
 
@@ -272,3 +273,25 @@ class SegmentationModel(nn.Module):
     def disable_checkpointing(self):
         """Disable gradient checkpointing"""
         self.use_checkpointing = False
+
+    def get_output_stats(self, x):
+        """Get statistics about model outputs for monitoring"""
+        with torch.no_grad():
+            outputs = self.forward(x)
+            if isinstance(outputs, (list, tuple)):
+                outputs = outputs[-1]
+            
+            probs = F.softmax(outputs, dim=1)
+            tumor_probs = probs[:, 1]  # Get tumor channel probabilities
+            
+            stats = {
+                'logits_min': outputs.min().item(),
+                'logits_max': outputs.max().item(),
+                'tumor_prob_min': tumor_probs.min().item(),
+                'tumor_prob_max': tumor_probs.max().item(),
+                'tumor_prob_mean': tumor_probs.mean().item(),
+                'tumor_prob_std': tumor_probs.std().item(),
+                'tumor_voxels_gt_50': (tumor_probs > 0.5).float().sum().item(),
+                'tumor_voxels_gt_10': (tumor_probs > 0.1).float().sum().item(),
+            }
+            return stats
