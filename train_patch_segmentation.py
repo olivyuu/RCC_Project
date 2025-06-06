@@ -11,7 +11,7 @@ from models.segmentation.config import SegmentationConfig
 
 # Default paths
 DEFAULT_DATA_DIR = "/workspace/RCC_Project/preprocessed_volumes"
-DEFAULT_OUTPUT_DIR = "experiments/patch_training_phase1"
+DEFAULT_OUTPUT_DIR = "experiments/patch_training"
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train tumor segmentation model using patches')
@@ -24,13 +24,21 @@ def parse_args():
     parser.add_argument('--checkpoint_path', type=str, default=None,
                       help='Path to checkpoint to resume training from')
     
+    # Phase control
+    parser.add_argument('--use_kidney_mask', action='store_true',
+                      help='Enable kidney-aware training (Phase 2)')
+    parser.add_argument('--min_kidney_voxels', type=int, default=100,
+                      help='Minimum kidney voxels required in patch (Phase 2)')
+    parser.add_argument('--kidney_overlap', type=float, default=0.5,
+                      help='Required tumor-kidney overlap ratio (Phase 2)')
+    
     # Training settings
     parser.add_argument('--patch_size', type=str, default='64,128,128',
                       help='Patch dimensions as D,H,W (default: 64,128,128)')
     parser.add_argument('--batch_size', type=int, default=2,
                       help='Batch size for patch training (default: 2)')
-    parser.add_argument('--epochs', type=int, default=10,
-                      help='Number of epochs to train (default: 10)')
+    parser.add_argument('--epochs', type=int, default=50,
+                      help='Number of epochs to train (default: 50)')
     parser.add_argument('--tumor_prob', type=float, default=0.7,
                       help='Probability of sampling tumor-centered patches (default: 0.7)')
     
@@ -87,7 +95,7 @@ def main():
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     
-    print("\nTraining Configuration (Phase 1)")
+    print("\nTraining Configuration (Phase {})".format(2 if args.use_kidney_mask else 1))
     print("-----------------------")
     print(f"PyTorch version: {torch.__version__}")
     print(f"Using device: {torch.device('cuda' if torch.cuda.is_available() else 'cpu')}")
@@ -99,10 +107,15 @@ def main():
     config.checkpoint_dir = config.output_dir / 'checkpoints'
     config.log_dir = config.output_dir / 'logs'
     config.num_epochs = args.epochs
-    config.resume_training = bool(args.checkpoint_path)
     config.checkpoint_path = args.checkpoint_path
     config.debug = args.debug
     config.preprocess = False
+    
+    # Phase 2 settings
+    config.use_kidney_mask = args.use_kidney_mask
+    config.min_kidney_voxels = args.min_kidney_voxels
+    config.kidney_patch_overlap = args.kidney_overlap
+    config.training_phase = 2 if args.use_kidney_mask else 1
     
     # Create output directories
     config.output_dir.mkdir(exist_ok=True, parents=True)
@@ -149,6 +162,11 @@ def main():
     print("\nOptimizer Configuration:")
     print(f"Learning rate: {args.learning_rate}")
     print(f"Weight decay: {args.weight_decay}")
+    
+    if args.use_kidney_mask:
+        print("\nPhase 2 Configuration:")
+        print(f"Minimum kidney voxels: {args.min_kidney_voxels}")
+        print(f"Required kidney overlap: {args.kidney_overlap:.1%}")
     
     if args.checkpoint_path:
         print(f"\nResuming from checkpoint: {args.checkpoint_path}")
