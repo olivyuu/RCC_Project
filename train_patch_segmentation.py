@@ -14,20 +14,22 @@ DEFAULT_DATA_DIR = "/workspace/RCC_Project/preprocessed_volumes"
 DEFAULT_OUTPUT_DIR = "experiments/patch_training_phase1"
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Train tumor segmentation model using patches (Phase 1: Smoke Test)')
+    parser = argparse.ArgumentParser(description='Train tumor segmentation model using patches')
     
     # Data paths
     parser.add_argument('--data_dir', type=str, default=DEFAULT_DATA_DIR,
                       help=f'Path to preprocessed volume data (default: {DEFAULT_DATA_DIR})')
     parser.add_argument('--output_dir', type=str, default=DEFAULT_OUTPUT_DIR,
                       help=f'Directory to save checkpoints and logs (default: {DEFAULT_OUTPUT_DIR})')
+    parser.add_argument('--checkpoint_path', type=str, default=None,
+                      help='Path to checkpoint to resume training from')
     
     # Training settings
     parser.add_argument('--patch_size', type=str, default='64,128,128',
                       help='Patch dimensions as D,H,W (default: 64,128,128)')
     parser.add_argument('--batch_size', type=int, default=2,
                       help='Batch size for patch training (default: 2)')
-    parser.add_argument('--epochs', type=int, default=10,  # Reduced for Phase 1
+    parser.add_argument('--epochs', type=int, default=10,
                       help='Number of epochs to train (default: 10)')
     parser.add_argument('--tumor_prob', type=float, default=0.7,
                       help='Probability of sampling tumor-centered patches (default: 0.7)')
@@ -51,8 +53,6 @@ def parse_args():
     # Runtime settings
     parser.add_argument('--num_workers', type=int, default=4,
                       help='Number of data loading workers (default: 4)')
-    parser.add_argument('--resume', action='store_true',
-                      help='Resume training from last checkpoint')
     parser.add_argument('--debug', action='store_true',
                       help='Enable debug output and visualizations')
     parser.add_argument('--seed', type=int, default=42,
@@ -63,6 +63,8 @@ def parse_args():
     # Convert paths to absolute paths
     args.data_dir = str(Path(args.data_dir).resolve())
     args.output_dir = str(Path(args.output_dir).resolve())
+    if args.checkpoint_path:
+        args.checkpoint_path = str(Path(args.checkpoint_path).resolve())
     
     # Verify data directory exists and contains .pt files
     data_path = Path(args.data_dir)
@@ -85,7 +87,7 @@ def main():
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     
-    print("\nTraining Configuration (Phase 1: Smoke Test)")
+    print("\nTraining Configuration (Phase 1)")
     print("-----------------------")
     print(f"PyTorch version: {torch.__version__}")
     print(f"Using device: {torch.device('cuda' if torch.cuda.is_available() else 'cpu')}")
@@ -97,9 +99,10 @@ def main():
     config.checkpoint_dir = config.output_dir / 'checkpoints'
     config.log_dir = config.output_dir / 'logs'
     config.num_epochs = args.epochs
-    config.resume_training = args.resume
+    config.resume_training = bool(args.checkpoint_path)
+    config.checkpoint_path = args.checkpoint_path
     config.debug = args.debug
-    config.preprocess = False  # Skip preprocessing for Phase 1
+    config.preprocess = False
     
     # Create output directories
     config.output_dir.mkdir(exist_ok=True, parents=True)
@@ -147,11 +150,8 @@ def main():
     print(f"Learning rate: {args.learning_rate}")
     print(f"Weight decay: {args.weight_decay}")
     
-    print("\nPhase 1 Notes:")
-    print("- Using dummy (all-ones) kidney masks")
-    print("- CT channel only (1-channel input)")
-    print("- Running smoke test for gradient flow")
-    print("- Monitoring loss and Dice scores")
+    if args.checkpoint_path:
+        print(f"\nResuming from checkpoint: {args.checkpoint_path}")
     
     if args.debug:
         print("\nDebug mode enabled - will show additional output and visualizations")
@@ -164,6 +164,7 @@ def main():
         sys.exit(0)
     except Exception as e:
         print(f"\nError during training: {str(e)}")
+        print(f"Error type: {type(e).__name__}")
         raise
 
 if __name__ == '__main__':
