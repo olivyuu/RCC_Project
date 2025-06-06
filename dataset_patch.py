@@ -94,12 +94,12 @@ class KiTS23PatchDataset(Dataset):
             tumor_coords = (tumor > 0).nonzero(as_tuple=False)[:, 1:]
             
             if self.use_kidney_mask:
-                # Include cyst label (3) in kidney mask
-                kidney_mask = (kidney > 0) | (kidney == 3)  # Add cysts
-                # Get all kidney voxels (including cysts)
-                kidney_coords = kidney_mask.nonzero(as_tuple=False)[:, 1:]
+                # Include tumor regions in kidney mask
+                full_kidney = (kidney > 0) | (tumor > 0)  # Include tumor in kidney mask
+                # Get all kidney voxels (including tumor)
+                kidney_coords = full_kidney.nonzero(as_tuple=False)[:, 1:]
                 # Get kidney background (no tumor)
-                kidney_bg = kidney_mask & (tumor == 0)
+                kidney_bg = full_kidney & (tumor == 0)  # Update to use full kidney
                 bg_coords = kidney_bg.nonzero(as_tuple=False)[:, 1:]
                 
                 if len(kidney_coords) == 0:
@@ -287,9 +287,9 @@ class KiTS23PatchDataset(Dataset):
             tumor_patch = self._extract_patch(tumor, center, pad_value=0)
             
             if self.use_kidney_mask:
-                # Include cyst label in kidney mask
-                kidney_mask = (kidney > 0) | (kidney == 3)  # Add cysts
-                kidney_patch = self._extract_patch(kidney_mask.float(), center, pad_value=0)
+                # Create combined kidney mask including tumor
+                full_kidney = (kidney > 0) | (tumor > 0)  # Add this line
+                kidney_patch = self._extract_patch(full_kidney.float(), center, pad_value=0)
                 # Validate patch
                 if self._validate_kidney_patch(kidney_patch, tumor_patch if use_tumor else None):
                     self.kidney_valid_patches += 1
@@ -306,8 +306,9 @@ class KiTS23PatchDataset(Dataset):
             image_patch = self._extract_patch(image, center, pad_value=0)
             tumor_patch = self._extract_patch(tumor, center, pad_value=0)
             if self.use_kidney_mask:
-                kidney_mask = (kidney > 0) | (kidney == 3)  # Add cysts to fallback
-                kidney_patch = self._extract_patch(kidney_mask.float(), center, pad_value=0)
+                # Use combined kidney mask in fallback too
+                full_kidney = (kidney > 0) | (tumor > 0)  # Add this line
+                kidney_patch = self._extract_patch(full_kidney.float(), center, pad_value=0)
             else:
                 kidney_patch = torch.ones_like(tumor_patch)
         
