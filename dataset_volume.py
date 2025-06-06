@@ -1,205 +1,127 @@
 import torch
-from torch.utils.data import Dataset
-from pathlib import Path
-from preprocessing.preprocessor import KiTS23Preprocessor
-from augmentations import KiTS23Augmenter
-from typing import List, Tuple
-import gc
+from pathlib import Path 
+from typing import Tuple, Optional, List
 import numpy as np
-from contextlib import nullcontext
-
-from tools.debug_utils import DebugLogger, validate_volume_shapes, debug_data_sample, gpu_memory_check
+from torch.utils.data import Dataset
+import torch.nn.functional as F
+from tqdm import tqdm
 
 class KiTS23VolumeDataset(Dataset):
-    """Dataset class for handling full volume data in KiTS23."""
+    """Dataset for loading preprocessed KiTS23 volumes"""
     
-    def __init__(self, root_dir: str, config, preprocessor: KiTS23Preprocessor = None,
-                 train: bool = True, preprocess: bool = True, debug: bool = False):
+    def __init__(self, 
+                root_dir: str,
+                config: object,
+                preprocess: bool = True):
         """
-        Initialize the volume dataset.
-        
         Args:
-            root_dir (str): Path to the raw dataset directory
+            root_dir: Path to preprocessed volumes directory
             config: Configuration object
-            preprocessor (KiTS23Preprocessor, optional): Pre-initialized preprocessor
-            train (bool): Whether this is training set
-            preprocess (bool): Whether to preprocess volumes
+            preprocess: Whether to preprocess volumes (or load preprocessed)
         """
         self.root_dir = Path(root_dir)
         self.config = config
-        self.preprocessor = preprocessor or KiTS23Preprocessor(config)
-        self.augmenter = KiTS23Augmenter(config) if train else None
+        self.preprocess = preprocess
         
-        # Define path for preprocessed volumes
-        self.preprocessed_dir = Path(config.preprocessed_volumes_dir)
-        self.preprocessed_dir.mkdir(exist_ok=True)
-        
-        # Setup debug logging if requested
-        self.debug = debug
-        if debug:
-            self.debug_logger = DebugLogger(self.preprocessed_dir, debug=True)
-        else:
-            self.debug_logger = None
+        if not self.root_dir.exists():
+            raise FileNotFoundError(f"Directory not found: {self.root_dir}")
             
-        # Store case paths for loading
-        self.case_paths: List[Path] = []
+        # Find all preprocessed .pt files
+        self.volume_paths = sorted([
+            f for f in self.root_dir.glob('*.pt')
+            if f.name.startswith('case_') and f.name.endswith('_volume.pt')
+        ])
         
-        if preprocess:
-            print(f"Preprocessing volumes from {self.root_dir}")
-            all_case_paths = sorted([d for d in self.root_dir.iterdir() if d.is_dir() and d.name.startswith('case_')])
+        if not self.volume_paths:
+            raise RuntimeError(f"No preprocessed volumes found in {self.root_dir}")
             
-            for case_path in all_case_paths:
-                output_file = self.preprocessed_dir / f"{case_path.name}_volume.pt"
-                
-                if output_file.exists():
-                    try:
-                        # Quick validation of saved volume
-                        data = self._load_volume_efficient(output_file)
-                        if isinstance(data, tuple) and len(data) == 3:
-                            print(f"Found valid preprocessed volume: {output_file}")
-                            self.case_paths.append(case_path)
-                            continue
-                    except Exception as e:
-                        print(f"Error validating {output_file}: {e}")
-                
-                print(f"Processing case {case_path.name}")
-                try:
-                    # Load and preprocess volume with target size
-                    volume_data = self.preprocessor.preprocess_volume(case_path)
-                    if volume_data[0] is not None:
-                        # Resize during preprocessing to save memory
-                        resized_data = tuple(
-                            self._resize_volume(vol, self.config.vol_max_dim, 
-                                             mode='nearest' if i > 0 else 'trilinear')
-                            for i, vol in enumerate(volume_data)
-                        )
-                        torch.save(resized_data, output_file)
-                        self.case_paths.append(case_path)
-                        
-                        # Clear memory after processing each volume
-                        del volume_data, resized_data
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                except Exception as e:
-                    print(f"Error processing {case_path.name}: {e}")
-                    continue
-            
-            print(f"Preprocessing complete. Total valid cases: {len(self.case_paths)}")
-        
-        else:  # Load existing preprocessed volumes
-            print(f"Loading preprocessed volumes from {self.preprocessed_dir}")
-            all_volume_files = sorted(self.preprocessed_dir.glob("case_*_volume.pt"))
-            if not all_volume_files:
-                print("No preprocessed volumes found, forcing preprocessing")
-                self.case_paths = sorted([d for d in self.root_dir.iterdir() if d.is_dir() and d.name.startswith('case_')])
-                preprocess = True
-            else:
-                self.case_paths = [Path(str(f).replace('_volume.pt', '')) for f in all_volume_files]
-    
-    def __len__(self) -> int:
-        return len(self.case_paths)
-    
-    @staticmethod
-    def _load_volume_efficient(file_path: Path) -> Tuple[torch.Tensor, ...]:
-        """Memory efficient volume loading using load_with_meta."""
-        # Map tensors to CPU memory first
-        loaded = torch.load(file_path, map_location='cpu')
-        return loaded
+        print(f"Found {len(self.volume_paths)} preprocessed volumes")
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        case_path = self.case_paths[idx]
-        volume_file = self.preprocessed_dir / f"{case_path.name}_volume.pt"
+    def __len__(self) -> int:
+        return len(self.volume_paths)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Load a preprocessed volume
         
-        if self.debug_logger:
-            self.debug_logger.log_memory(f"Before loading {case_path.name}")
-        
+        Returns:
+            tuple of (image, tumor_mask, kidney_mask) tensors
+            shape: [1, D, H, W] for each
+        """
+        volume_path = self.volume_paths[idx]
         try:
-            with gpu_memory_check() if self.debug_logger else nullcontext():
-                # Load image, kidney mask and tumor mask efficiently
-                image, kidney_mask, tumor_mask = self._load_volume_efficient(volume_file)
-                
-                # Remove any extra dimensions
-                image = image.squeeze()
-                kidney_mask = kidney_mask.squeeze()
-                tumor_mask = tumor_mask.squeeze()
-                
-                if self.debug_logger:
-                    self.debug_logger.log_shapes("Loaded volume", image=image, kidney_mask=kidney_mask, tumor_mask=tumor_mask)
-                    self.debug_logger.log_stats("Volume stats", image=image, kidney_mask=kidney_mask, tumor_mask=tumor_mask)
-                    
-                    if idx == 0:
-                        debug_data_sample(
-                            (image, kidney_mask, tumor_mask),
-                            self.preprocessed_dir / "debug_samples"
-                        )
-                
-                # Add channel dimension if needed
-                if len(image.shape) == 3:
-                    image = image.unsqueeze(0)
-                if len(kidney_mask.shape) == 3:
-                    kidney_mask = kidney_mask.unsqueeze(0)
-                if len(tumor_mask.shape) == 3:
-                    tumor_mask = tumor_mask.unsqueeze(0)
-                
-                # Concatenate image and kidney mask as input channels
-                # Use torch.cat with existing tensors to avoid copies
-                model_input = torch.cat([image, kidney_mask], dim=0)
-                
-                # Apply augmentations if in training mode
-                if self.augmenter is not None:
-                    model_input, tumor_mask = self.augmenter(model_input, tumor_mask)
-                
-                return model_input, tumor_mask
-                
-        except Exception as e:
-            print(f"Error loading volume {volume_file}: {e}")
-            # Return a dummy volume in case of error
-            dummy_shape = (2,) + tuple(self.config.vol_max_dim)  # 2 channels for input
-            return torch.zeros(dummy_shape), torch.zeros((1,) + tuple(self.config.vol_max_dim))
-    
-    @staticmethod
-    def _resize_volume(volume: torch.Tensor, target_size: Tuple[int, int, int], mode='trilinear') -> torch.Tensor:
-        """Resize a volume to target dimensions."""
-        if len(volume.shape) == 3:
-            volume = volume.unsqueeze(0).unsqueeze(0)
-        elif len(volume.shape) == 4:
-            volume = volume.unsqueeze(0)
+            data = torch.load(volume_path)
             
-        resized = torch.nn.functional.interpolate(
-            volume,
-            size=target_size,
-            mode=mode,
-            align_corners=False if mode == 'trilinear' else None
-        )
-        
-        return resized.squeeze(0)
+            # Handle different data formats
+            if isinstance(data, (tuple, list)) and len(data) == 3:
+                # (image, tumor_mask, kidney_mask) format
+                image, tumor_mask, kidney_mask = data
+            elif isinstance(data, dict):
+                # Dictionary format
+                if all(k in data for k in ['image', 'tumor', 'kidney']):
+                    image = data['image'] 
+                    tumor_mask = data['tumor']
+                    kidney_mask = data['kidney']
+                else:
+                    raise ValueError(f"Unknown dictionary keys in {volume_path}: {list(data.keys())}")
+            else:
+                raise ValueError(f"Unknown data format in {volume_path}: {type(data)}")
+            
+            # Ensure all tensors are proper shape and type
+            if len(image.shape) == 3:
+                image = image.unsqueeze(0)
+            if len(tumor_mask.shape) == 3:
+                tumor_mask = tumor_mask.unsqueeze(0)
+            if len(kidney_mask.shape) == 3:
+                kidney_mask = kidney_mask.unsqueeze(0)
+                
+            image = image.float()
+            tumor_mask = tumor_mask.float()
+            kidney_mask = kidney_mask.float()
+            
+            # Verify shapes match
+            if not (image.shape == tumor_mask.shape == kidney_mask.shape):
+                raise ValueError(f"Shape mismatch in {volume_path}: "
+                            f"image {image.shape}, tumor {tumor_mask.shape}, "
+                            f"kidney {kidney_mask.shape}")
+                
+            return image, tumor_mask, kidney_mask
+            
+        except Exception as e:
+            print(f"Error loading {volume_path}: {str(e)}")
+            raise
+
+    def get_sample_id(self, idx: int) -> str:
+        """Get case ID from volume path"""
+        return self.volume_paths[idx].stem.split('_')[1]  # 'case_00123_volume' -> '00123'
 
     @staticmethod
     def collate_fn(batch):
-        """Memory-efficient collate function."""
-        inputs, masks = zip(*batch)
+        """Custom collate to handle different sized volumes"""
+        # Find max dimensions
+        max_d = max(x[0].shape[-3] for x in batch)
+        max_h = max(x[0].shape[-2] for x in batch)
+        max_w = max(x[0].shape[-1] for x in batch)
         
-        # Since we preprocess to target size, all volumes should be same size
-        # Just stack them directly to avoid copies
-        try:
-            stacked_inputs = torch.stack(inputs)
-            stacked_masks = torch.stack(masks)
-            return stacked_inputs, stacked_masks
-        except:
-            # Fallback to padding if sizes differ
-            max_shape = [max(s) for s in zip(*[img.shape[-3:] for img in inputs])]
+        # Pad each sample to max size
+        padded_batch = []
+        for image, tumor, kidney in batch:
+            d, h, w = image.shape[-3:]
             
-            padded_inputs = []
-            padded_masks = []
+            # Calculate padding
+            pad_d = max_d - d
+            pad_h = max_h - h 
+            pad_w = max_w - w
             
-            for inp, msk in zip(inputs, masks):
-                pad_size = [m - s for m, s in zip(max_shape, inp.shape[-3:])]
-                pad = []
-                for p in reversed(pad_size):
-                    pad.extend([0, p])
-                    
-                padded_inputs.append(torch.nn.functional.pad(inp, pad))
-                padded_masks.append(torch.nn.functional.pad(msk, pad))
+            # Pad all tensors
+            image_pad = F.pad(image, (0, pad_w, 0, pad_h, 0, pad_d))
+            tumor_pad = F.pad(tumor, (0, pad_w, 0, pad_h, 0, pad_d))
+            kidney_pad = F.pad(kidney, (0, pad_w, 0, pad_h, 0, pad_d))
             
-            return torch.stack(padded_inputs), torch.stack(padded_masks)
+            padded_batch.append((image_pad, tumor_pad, kidney_pad))
+        
+        # Stack along batch dimension
+        images, tumors, kidneys = zip(*padded_batch)
+        return (torch.stack(images), 
+                torch.stack(tumors),
+                torch.stack(kidneys))
