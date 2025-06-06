@@ -170,8 +170,7 @@ class PatchSegmentationTrainer:
         
         if self.config.checkpoint_path:
             print(f"Loading checkpoint: {self.config.checkpoint_path}")
-            print(f"Resuming training from epoch {self.start_epoch}")
-            
+        
         if self.config.use_kidney_mask:
             print("Phase 2 parameters:")
             print(f"  min_kidney_voxels: {self.config.min_kidney_voxels}")
@@ -197,9 +196,6 @@ class PatchSegmentationTrainer:
             print("\nPhase 2 Configuration:")
             print(f"Minimum kidney voxels: {self.config.min_kidney_voxels}")
             print(f"Required kidney overlap: {self.config.kidney_patch_overlap*100:.1f}%")
-            
-        if self.config.checkpoint_path:
-            print(f"\nResuming from checkpoint: {self.config.checkpoint_path}")
             
         if self.config.debug:
             print("\nDebug mode enabled - will show additional output and visualizations")
@@ -453,6 +449,9 @@ class PatchSegmentationTrainer:
         print(f"Loading checkpoint: {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path)
         
+        # Load model state
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        
         # Verify phase compatibility
         checkpoint_phase = checkpoint['config'].get('training_phase', 1)
         current_phase = 2 if self.config.use_kidney_mask else 1
@@ -460,16 +459,34 @@ class PatchSegmentationTrainer:
         if checkpoint_phase != current_phase:
             logger.warning(
                 f"Loading Phase {checkpoint_phase} checkpoint in Phase {current_phase} training.\n"
-                f"Consider running a warm-up epoch with lower learning rate."
+                "Starting fresh from epoch 0 for new phase."
             )
-        
-        # Load model and training state
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
-        self.start_epoch = checkpoint['epoch'] + 1
-        self.best_val_dice = checkpoint['best_val_dice']
+            # Reset counters but keep model weights for new phase
+            self.start_epoch = 0
+            self.best_val_dice = float('-inf')
+            # Initialize fresh optimizer and scheduler
+            self.optimizer = torch.optim.Adam(
+                self.model.parameters(),
+                lr=1e-5,  # Lower learning rate for phase transition
+                weight_decay=1e-5,
+                eps=1e-8
+            )
+            self.scheduler = ReduceLROnPlateau(
+                self.optimizer, 
+                mode='max',
+                factor=0.5,
+                patience=5,
+                verbose=True,
+                min_lr=1e-6
+            )
+            self.scaler = GradScaler()
+        else:
+            # Continue from saved epoch if same phase
+            self.start_epoch = checkpoint['epoch'] + 1
+            self.best_val_dice = checkpoint['best_val_dice']
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
         
         # Load configuration if available
         if 'config' in checkpoint:
@@ -491,11 +508,14 @@ class PatchSegmentationTrainer:
                         f"differs from current setting ({self.config.kidney_patch_overlap})"
                     )
         
-        print(f"Resuming training from epoch {self.start_epoch}")
+        print(f"Starting training from epoch {self.start_epoch}")
         if current_phase == 2:
             print("Phase 2 parameters:")
             print(f"  min_kidney_voxels: {self.config.min_kidney_voxels}")
             print(f"  kidney_patch_overlap: {self.config.kidney_patch_overlap}")
+        
+        # Print learning rate
+        print(f"Learning rate: {self.optimizer.param_groups[0]['lr']:.2e}")
 
     def _load_latest_checkpoint(self):
         """Load latest training checkpoint"""
