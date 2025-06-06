@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Dict
+from typing import Optional, Dict, Union, Tuple, List
 
 class WeightedDiceBCELoss(nn.Module):
     """Combined Dice and BCE loss with stronger weighting for tumor voxels"""
@@ -21,17 +21,21 @@ class WeightedDiceBCELoss(nn.Module):
         )
     
     def forward(self, 
-               logits: torch.Tensor,
+               logits: Union[torch.Tensor, List[torch.Tensor], Tuple[torch.Tensor, ...]],
                target: torch.Tensor,
                kidney_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Args:
-            logits: Raw model output [B, 1, D, H, W]
-            target: Ground truth mask [B, 1, D, H, W]
-            kidney_mask: Optional kidney ROI mask [B, 1, D, H, W]
+            logits: Model output, either a tensor [B,1,D,H,W] or list/tuple of tensors
+            target: Ground truth mask [B,1,D,H,W]
+            kidney_mask: Optional kidney ROI mask [B,1,D,H,W]
         """
-        B, C, D, H, W = logits.shape
+        # Handle list/tuple outputs (take last element)
+        if isinstance(logits, (list, tuple)):
+            logits = logits[-1]
+            
         device = logits.device
+        B, C, D, H, W = logits.shape
 
         if kidney_mask is not None:
             valid = (kidney_mask > 0).float()
@@ -80,10 +84,14 @@ class WeightedDiceBCELoss(nn.Module):
         return total_loss
 
     def log_stats(self, 
-                logits: torch.Tensor, 
-                target: torch.Tensor, 
+                logits: Union[torch.Tensor, List[torch.Tensor], Tuple[torch.Tensor, ...]],
+                target: torch.Tensor,
                 kidney_mask: Optional[torch.Tensor] = None) -> Dict[str, float]:
         """Log detailed statistics about predictions and loss components"""
+        # Handle list/tuple outputs
+        if isinstance(logits, (list, tuple)):
+            logits = logits[-1]
+            
         with torch.no_grad():
             device = logits.device
             
