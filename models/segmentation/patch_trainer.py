@@ -13,6 +13,7 @@ import sys
 from torch.utils.tensorboard import SummaryWriter
 import matplotlib.pyplot as plt
 import logging
+import random
 
 from models.segmentation.model import SegmentationModel
 from dataset_patch import KiTS23PatchDataset, worker_init_fn
@@ -51,16 +52,17 @@ class PatchSegmentationTrainer:
         self.start_epoch = 0
         self.current_epoch = 0
         self.best_val_dice = float('-inf')
+        self.seed = 42  # Global seed for reproducibility
         
         # Create checkpoint directory
         self.config.checkpoint_dir.mkdir(exist_ok=True)
         
         # Initialize training components
         self.criterion = WeightedDiceBCELoss(
-            pos_weight=10.0,
+            pos_weight=torch.tensor([10.0]).to(self.device),  # Move to device
             dice_weight=1.0,
             bce_weight=1.0
-        ).to(self.device)
+        )
         
         self.optimizer = torch.optim.Adam(
             self.model.parameters(),
@@ -94,11 +96,19 @@ class PatchSegmentationTrainer:
         except RuntimeError:
             pass
 
+        # Set random seeds for reproducibility
+        random.seed(self.seed)
+        np.random.seed(self.seed)
+        torch.manual_seed(self.seed)
+        torch.cuda.manual_seed_all(self.seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
         # Create volume dataset and split train/val
         volume_dataset = KiTS23VolumeDataset(dataset_path, self.config)
-        train_dataset, val_dataset = volume_dataset.get_train_val_splits(val_ratio=0.2)
+        train_dataset, val_dataset = volume_dataset.get_train_val_splits(val_ratio=0.2, seed=self.seed)
         
-        # Create patch datasets
+        # Create patch datasets with split volumes
         train_patch_dataset = KiTS23PatchDataset(
             dataset_path,  # Use path directly
             patch_size=self.patch_size,
@@ -119,11 +129,11 @@ class PatchSegmentationTrainer:
             debug=False
         )
         
-        # Set volume paths based on splits
+        # Assign split volume paths
         train_patch_dataset.volume_paths = train_dataset.volume_paths
         val_patch_dataset.volume_paths = val_dataset.volume_paths
         
-        # Create data loaders
+        # Create data loaders with worker initialization
         train_loader = DataLoader(
             train_patch_dataset,
             batch_size=self.batch_size,
@@ -131,7 +141,7 @@ class PatchSegmentationTrainer:
             num_workers=self.num_workers,
             pin_memory=True,
             persistent_workers=True,
-            worker_init_fn=worker_init_fn
+            worker_init_fn=worker_init_fn,  # Initialize worker RNG
         )
         
         val_loader = DataLoader(
@@ -141,13 +151,14 @@ class PatchSegmentationTrainer:
             num_workers=2,
             pin_memory=True,
             persistent_workers=True,
-            worker_init_fn=worker_init_fn
+            worker_init_fn=worker_init_fn,  # Initialize worker RNG
         )
 
         print(f"\nTraining Configuration ({self.config.get_phase_name()})")
         print("-----------------------")
         print(f"PyTorch version: {torch.__version__}")
         print(f"Using device: {self.device}")
+        print(f"Random seed: {self.seed}")
         
         print("\nSegmentation Model Configuration:")
         print(f"Input channels: 1 (CT only)")
@@ -419,7 +430,8 @@ class PatchSegmentationTrainer:
                 'use_kidney_mask': self.config.use_kidney_mask,
                 'min_kidney_voxels': getattr(self.config, 'min_kidney_voxels', None),
                 'kidney_patch_overlap': getattr(self.config, 'kidney_patch_overlap', None),
-                'training_phase': 2 if self.config.use_kidney_mask else 1
+                'training_phase': 2 if self.config.use_kidney_mask else 1,
+                'seed': self.seed
             }
         }
         
@@ -464,6 +476,7 @@ class PatchSegmentationTrainer:
             self.patch_size = checkpoint['config']['patch_size']
             self.batch_size = checkpoint['config']['batch_size']
             self.tumor_only_prob = checkpoint['config']['tumor_only_prob']
+            self.seed = checkpoint['config'].get('seed', 42)
             
             # Verify Phase 2 parameters match if applicable
             if current_phase == 2:
