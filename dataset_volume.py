@@ -47,21 +47,22 @@ class KiTS23VolumeDataset(Dataset):
         Returns:
             tuple of (image, tumor_mask, kidney_mask) tensors
             shape: [1, D, H, W] for each
+            Note: kidney_mask is now always all ones (no Totalsegmentator)
         """
         volume_path = self.volume_paths[idx]
         try:
             data = torch.load(volume_path)
             
             # Handle different data formats
-            if isinstance(data, (tuple, list)) and len(data) == 3:
-                # (image, tumor_mask, kidney_mask) format
-                image, tumor_mask, kidney_mask = data
+            if isinstance(data, (tuple, list)) and len(data) >= 2:
+                # (image, tumor_mask, [kidney_mask]) format
+                image = data[0] 
+                tumor_mask = data[1]
             elif isinstance(data, dict):
                 # Dictionary format
-                if all(k in data for k in ['image', 'tumor', 'kidney']):
+                if all(k in data for k in ['image', 'tumor']):
                     image = data['image'] 
                     tumor_mask = data['tumor']
-                    kidney_mask = data['kidney']
                 else:
                     raise ValueError(f"Unknown dictionary keys in {volume_path}: {list(data.keys())}")
             else:
@@ -72,18 +73,17 @@ class KiTS23VolumeDataset(Dataset):
                 image = image.unsqueeze(0)
             if len(tumor_mask.shape) == 3:
                 tumor_mask = tumor_mask.unsqueeze(0)
-            if len(kidney_mask.shape) == 3:
-                kidney_mask = kidney_mask.unsqueeze(0)
                 
             image = image.float()
             tumor_mask = tumor_mask.float()
-            kidney_mask = kidney_mask.float()
+            
+            # Create dummy kidney mask (all ones)
+            kidney_mask = torch.ones_like(tumor_mask)
             
             # Verify shapes match
             if not (image.shape == tumor_mask.shape == kidney_mask.shape):
                 raise ValueError(f"Shape mismatch in {volume_path}: "
-                            f"image {image.shape}, tumor {tumor_mask.shape}, "
-                            f"kidney {kidney_mask.shape}")
+                            f"image {image.shape}, tumor {tumor_mask.shape}")
                 
             return image, tumor_mask, kidney_mask
             
