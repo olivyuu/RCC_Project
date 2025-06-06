@@ -1,10 +1,10 @@
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset
+import random
 import numpy as np
+from torch.utils.data import Dataset
 from typing import Tuple, Optional, List
 from pathlib import Path
-import random
 
 class KiTS23PatchDataset(Dataset):
     """
@@ -21,39 +21,59 @@ class KiTS23PatchDataset(Dataset):
                 patch_size: Tuple[int, int, int] = (64, 128, 128),
                 tumor_only_prob: float = 0.7,
                 debug: bool = False):
+        super().__init__()
         self.base = full_dataset
         self.patch_size = patch_size
         self.tumor_only_prob = tumor_only_prob
         self.debug = debug
         
+        # Set random seeds for reproducibility
+        random.seed(42)
+        np.random.seed(42)
+        
         # For each volume, precompute the list of tumor voxel coordinates
         print("Precomputing tumor coordinates for efficient sampling...")
         self.tumor_indices = []
         total_tumor_voxels = 0
+        volumes_with_tumor = 0
         
         for idx in range(len(full_dataset)):
-            _, tumor_mask, _ = full_dataset[idx]
+            # Get tumor mask from base dataset
+            data = full_dataset[idx]
+            if len(data) != 3:
+                raise ValueError(f"Base dataset must return (image, tumor_mask, kidney_mask), got {len(data)} items")
+            
+            tumor_mask = data[1]  # Second item should be tumor mask
+            if not isinstance(tumor_mask, torch.Tensor):
+                raise ValueError(f"Expected torch.Tensor tumor mask, got {type(tumor_mask)}")
+            
+            # Find tumor voxel coordinates
             coords = (tumor_mask > 0).nonzero(as_tuple=False)  # [N, 4] -> [batch, z, y, x]
-            # Drop batch dimension since it's always 1
-            coords = coords[:, 1:]  # [N, 3] -> [z, y, x]
+            coords = coords[:, 1:]  # Drop batch dimension -> [N, 3]
             self.tumor_indices.append(coords)
-            total_tumor_voxels += len(coords)
+            
+            n_tumor = len(coords)
+            total_tumor_voxels += n_tumor
+            if n_tumor > 0:
+                volumes_with_tumor += 1
             
             if debug and idx < 5:
-                print(f"Volume {idx}:")
+                print(f"\nVolume {idx}:")
+                print(f"  Shape: {tumor_mask.shape}")
                 print(f"  Total voxels: {tumor_mask.numel()}")
-                print(f"  Tumor voxels: {len(coords)}")
-                print(f"  Tumor percentage: {100 * len(coords) / tumor_mask.numel():.4f}%")
+                print(f"  Tumor voxels: {n_tumor}")
+                print(f"  Tumor percentage: {100 * n_tumor / tumor_mask.numel():.4f}%")
         
         print(f"\nDataset statistics:")
         print(f"Total volumes: {len(full_dataset)}")
+        print(f"Volumes with tumor: {volumes_with_tumor}")
         print(f"Total tumor voxels: {total_tumor_voxels}")
         print(f"Average tumor voxels per volume: {total_tumor_voxels / len(full_dataset):.1f}")
+        print(f"Tumor-centered patch probability: {tumor_only_prob:.1%}")
+        print(f"Patch size: {patch_size}")
 
-    def __len__(self):
-        return len(self.base)
-
-    def _extract_patch(self, volume: torch.Tensor, 
+    def _extract_patch(self, 
+                     volume: torch.Tensor,
                      center: Tuple[int, int, int],
                      pad_value: float = 0) -> torch.Tensor:
         """Extract a patch of self.patch_size centered at the given coordinates"""
@@ -98,7 +118,11 @@ class KiTS23PatchDataset(Dataset):
             kidney_patch: [1, D, H, W] kidney mask patch
         """
         # Get full volume data
-        image, tumor_mask, kidney_mask = self.base[idx]
+        data = self.base[idx]
+        if len(data) != 3:
+            raise ValueError(f"Base dataset returned {len(data)} items, expected 3")
+        image, tumor_mask, kidney_mask = data
+        
         Z, Y, X = tumor_mask.shape[1:]  # Ignore channel dimension
         
         # Decide whether to sample tumor-centered patch
@@ -112,6 +136,7 @@ class KiTS23PatchDataset(Dataset):
             center = coords[center_idx].tolist()
         else:
             # Select random center within volume bounds
+            # Ensure we stay away from edges when possible
             cz = random.randint(self.patch_size[0]//2, Z - self.patch_size[0]//2) if Z > self.patch_size[0] else Z//2
             cy = random.randint(self.patch_size[1]//2, Y - self.patch_size[1]//2) if Y > self.patch_size[1] else Y//2
             cx = random.randint(self.patch_size[2]//2, X - self.patch_size[2]//2) if X > self.patch_size[2] else X//2
@@ -127,18 +152,26 @@ class KiTS23PatchDataset(Dataset):
         assert tumor_patch.shape[1:] == self.patch_size
         assert kidney_patch.shape[1:] == self.patch_size
         
+        # Log detailed patch statistics in debug mode
         if self.debug:
             tumor_voxels = (tumor_patch > 0).sum().item()
             total_voxels = tumor_patch.numel()
+            tumor_ratio = tumor_voxels / total_voxels
+            kidney_voxels = (kidney_patch > 0).sum().item()
+            
             print(f"\nPatch from volume {idx}:")
             print(f"  Center: {center}")
             print(f"  Tumor centered: {use_tumor}")
-            print(f"  Tumor voxels: {tumor_voxels}/{total_voxels}")
-            print(f"  Tumor percentage: {100 * tumor_voxels / total_voxels:.4f}%")
-        
-        # Apply data augmentation here if needed
+            print(f"  Tumor voxels: {tumor_voxels}/{total_voxels} ({100 * tumor_ratio:.4f}%)")
+            print(f"  Kidney voxels: {kidney_voxels}/{total_voxels} ({100 * kidney_voxels / total_voxels:.4f}%)")
+            
+            if tumor_ratio < 0.01 and use_tumor:
+                print("  Warning: Low tumor ratio in tumor-centered patch!")
         
         return image_patch, tumor_patch, kidney_patch
+
+    def __len__(self):
+        return len(self.base)
 
     @staticmethod
     def collate_fn(batch):

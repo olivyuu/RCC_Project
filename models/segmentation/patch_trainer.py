@@ -10,10 +10,12 @@ from tqdm import tqdm
 import signal
 import sys
 from torch.utils.tensorboard import SummaryWriter
+import matplotlib.pyplot as plt
 
 from models.segmentation.model import SegmentationModel
 from dataset_patch import KiTS23PatchDataset
 from losses_patch import WeightedDiceBCELoss
+from dataset_volume import KiTS23VolumeDataset
 
 class PatchSegmentationTrainer:
     def __init__(self, config):
@@ -37,6 +39,16 @@ class PatchSegmentationTrainer:
             features=config.features
         ).to(self.device)
         
+        # Training settings
+        self.max_grad_norm = 5.0
+        self.batch_size = 2
+        self.tumor_only_prob = 0.7
+        self.patch_size = (64, 128, 128)
+        self.num_workers = 4
+        self.start_epoch = 0
+        self.current_epoch = 0
+        self.best_val_dice = float('-inf')
+        
         # Initialize training components
         self.criterion = WeightedDiceBCELoss(
             pos_weight=10.0,  # Higher weight for tumor voxels
@@ -51,7 +63,6 @@ class PatchSegmentationTrainer:
             eps=1e-8
         )
         
-        # Tighter LR scheduling
         self.scheduler = torch.optim.ReduceLROnPlateau(
             self.optimizer, 
             mode='max',
@@ -64,17 +75,6 @@ class PatchSegmentationTrainer:
         self.scaler = GradScaler()
         self.writer = SummaryWriter(log_dir=config.log_dir)
         
-        # Training state
-        self.start_epoch = 0
-        self.best_val_dice = float('-inf')
-        self.current_epoch = 0
-        self.max_grad_norm = 5.0
-        
-        # Patch training settings
-        self.patch_size = (64, 128, 128)
-        self.batch_size = 2  # Can be higher since patches are smaller
-        self.num_workers = 4
-        
         if config.resume_training:
             self._load_checkpoint()
 
@@ -85,7 +85,6 @@ class PatchSegmentationTrainer:
             pass
 
         # Create training dataset
-        from dataset_volume import KiTS23VolumeDataset
         full_dataset = KiTS23VolumeDataset(dataset_path, self.config, preprocess=self.config.preprocess)
         
         # Split into train/val
@@ -100,8 +99,8 @@ class PatchSegmentationTrainer:
         train_patch_dataset = KiTS23PatchDataset(
             train_dataset,
             patch_size=self.patch_size,
-            tumor_only_prob=0.7,  # 70% tumor-centered patches
-            debug=False
+            tumor_only_prob=self.tumor_only_prob,  # Use instance variable
+            debug=self.config.debug
         )
         
         # Create data loaders
@@ -121,13 +120,13 @@ class PatchSegmentationTrainer:
             shuffle=False,
             num_workers=2,
             pin_memory=True,
-            persistent_workers=True,
-            collate_fn=KiTS23VolumeDataset.collate_fn
+            persistent_workers=True
         )
 
         print(f"\nTraining configuration:")
         print(f"Patch size: {self.patch_size}")
         print(f"Batch size: {self.batch_size}")
+        print(f"Tumor sampling probability: {self.tumor_only_prob}")
         print(f"Training patches per epoch: {len(train_loader)}")
         print(f"Validation volumes: {len(val_dataset)}")
 
@@ -136,78 +135,7 @@ class PatchSegmentationTrainer:
                 self.current_epoch = epoch
                 
                 # Training phase
-                self.model.train()
-                train_loss = 0
-                train_dice = 0
-                valid_batches = 0
-                total_norm = 0
-                
-                # Track tumor ratio in patches
-                tumor_ratios = []
-                
-                with tqdm(train_loader, desc=f"Epoch {epoch+1}/{self.config.num_epochs}") as pbar:
-                    for batch_idx, (images, tumor_masks, kidney_masks) in enumerate(pbar):
-                        # Move data to device
-                        images = images.to(device=self.device)
-                        tumor_masks = tumor_masks.to(device=self.device)
-                        kidney_masks = kidney_masks.to(device=self.device)
-                        
-                        # Get CT and kidney channels
-                        ct_images = images[:, 0:1].float()
-                        kidney_inputs = kidney_masks.float()
-                        
-                        # Combine input channels
-                        inputs = torch.cat([ct_images, kidney_inputs], dim=1)
-                        
-                        # Forward pass
-                        with torch.cuda.amp.autocast():
-                            outputs = self.model(inputs)
-                            loss = self.criterion(outputs, tumor_masks, kidney_masks)
-                        
-                        # Backward pass with gradient clipping
-                        self.optimizer.zero_grad()
-                        self.scaler.scale(loss).backward()
-                        self.scaler.unscale_(self.optimizer)
-                        
-                        # Clip gradients
-                        total_norm = torch.nn.utils.clip_grad_norm_(
-                            self.model.parameters(),
-                            self.max_grad_norm
-                        )
-                        
-                        self.scaler.step(self.optimizer)
-                        self.scaler.update()
-                        
-                        # Compute metrics
-                        with torch.no_grad():
-                            # Get statistics
-                            stats = self.criterion.log_stats(outputs, tumor_masks, kidney_masks)
-                            tumor_ratios.append(stats['tumor_ratio'])
-                            
-                            if batch_idx % 50 == 0:
-                                self._log_batch_stats(stats, batch_idx, epoch)
-                            
-                            train_loss += loss.item()
-                            valid_batches += 1
-                        
-                        # Update progress bar
-                        pbar.set_postfix({
-                            'loss': f"{loss.item():.4f}",
-                            'tumor_ratio': f"{stats['tumor_ratio']:.4%}",
-                            'grad_norm': f"{total_norm:.4f}"
-                        })
-                        
-                        # Clear cache periodically
-                        if batch_idx % 10 == 0:
-                            torch.cuda.empty_cache()
-                
-                # Calculate epoch metrics
-                train_loss = train_loss / valid_batches if valid_batches > 0 else float('inf')
-                mean_tumor_ratio = np.mean(tumor_ratios)
-                
-                print(f"\nTraining epoch statistics:")
-                print(f"Mean tumor ratio in patches: {mean_tumor_ratio:.4%}")
-                print(f"Mean loss: {train_loss:.4f}")
+                train_loss, train_stats = self._train_epoch(train_loader)
                 
                 # Validation phase
                 val_loss, val_dice = self._validate(val_loader)
@@ -217,16 +145,7 @@ class PatchSegmentationTrainer:
                 current_lr = self.optimizer.param_groups[0]['lr']
                 
                 # Log metrics
-                self.writer.add_scalar('Loss/train', train_loss, epoch)
-                self.writer.add_scalar('Loss/val', val_loss, epoch)
-                self.writer.add_scalar('Dice/val', val_dice, epoch)
-                self.writer.add_scalar('LearningRate', current_lr, epoch)
-                self.writer.add_scalar('TumorRatio', mean_tumor_ratio, epoch)
-                
-                print(f"\nEpoch {epoch+1}/{self.config.num_epochs}")
-                print(f"Train - Loss: {train_loss:.4f}")
-                print(f"Val   - Loss: {val_loss:.4f}, Dice: {val_dice:.4f}")
-                print(f"Learning Rate: {current_lr:.6f}")
+                self._log_epoch(train_loss, train_stats, val_loss, val_dice, current_lr, epoch)
                 
                 # Save best model
                 is_best = val_dice > self.best_val_dice
@@ -241,6 +160,10 @@ class PatchSegmentationTrainer:
                     },
                     is_best=is_best
                 )
+                
+                # Visualize predictions periodically
+                if self.config.debug and epoch % 5 == 0:
+                    self._visualize_predictions(val_loader, epoch)
 
         except KeyboardInterrupt:
             print("\nTraining interrupted by user. Saving checkpoint...")
@@ -263,15 +186,88 @@ class PatchSegmentationTrainer:
         print("\nTraining completed!")
         print(f"Best validation Dice score: {self.best_val_dice:.4f}")
 
-    def _log_batch_stats(self, stats: dict, batch_idx: int, epoch: int):
-        """Log detailed batch statistics to tensorboard"""
-        step = epoch * 1000 + batch_idx  # Unique step number
-        self.writer.add_scalar('Batch/tumor_ratio', stats['tumor_ratio'], step)
-        self.writer.add_scalar('Batch/true_positives', stats['true_positives'], step)
-        self.writer.add_scalar('Batch/mean_prob', stats['mean_prob'], step)
-        self.writer.add_scalar('Batch/max_prob', stats['max_prob'], step)
+    def _train_epoch(self, train_loader):
+        """Run one epoch of training"""
+        self.model.train()
+        train_loss = 0
+        valid_batches = 0
+        total_norm = 0
+        
+        # Track statistics
+        tumor_ratios = []
+        mean_probs = []
+        max_probs = []
+        dice_scores = []
+        
+        with tqdm(train_loader, desc=f"Epoch {self.current_epoch+1}/{self.config.num_epochs}") as pbar:
+            for batch_idx, (images, tumor_masks, kidney_masks) in enumerate(pbar):
+                # Move data to device
+                images = images.to(device=self.device)
+                tumor_masks = tumor_masks.to(device=self.device)
+                kidney_masks = kidney_masks.to(device=self.device)
+                
+                # Get CT and kidney channels
+                ct_images = images[:, 0:1].float()
+                kidney_inputs = kidney_masks.float()
+                
+                # Combine input channels
+                inputs = torch.cat([ct_images, kidney_inputs], dim=1)
+                
+                # Forward pass
+                with torch.cuda.amp.autocast():
+                    outputs = self.model(inputs)
+                    loss = self.criterion(outputs, tumor_masks, kidney_masks)
+                
+                # Backward pass with gradient clipping
+                self.optimizer.zero_grad()
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)
+                
+                total_norm = torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.max_grad_norm
+                )
+                
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                
+                # Compute metrics
+                with torch.no_grad():
+                    stats = self.criterion.log_stats(outputs, tumor_masks, kidney_masks)
+                    tumor_ratios.append(stats['tumor_ratio'])
+                    mean_probs.append(stats['mean_prob'])
+                    max_probs.append(stats['max_prob'])
+                    dice_scores.append(stats['dice_score'])
+                    
+                    if batch_idx % 50 == 0:
+                        self._log_batch_stats(stats, batch_idx, self.current_epoch)
+                    
+                    train_loss += loss.item()
+                    valid_batches += 1
+                
+                # Update progress bar
+                pbar.set_postfix({
+                    'loss': f"{loss.item():.4f}",
+                    'tumor_ratio': f"{stats['tumor_ratio']:.4%}",
+                    'dice': f"{stats['dice_score']:.4f}",
+                    'grad_norm': f"{total_norm:.4f}"
+                })
+                
+                # Clear cache periodically
+                if batch_idx % 10 == 0:
+                    torch.cuda.empty_cache()
+        
+        # Calculate epoch statistics
+        avg_stats = {
+            'loss': train_loss / valid_batches if valid_batches > 0 else float('inf'),
+            'tumor_ratio': np.mean(tumor_ratios),
+            'mean_prob': np.mean(mean_probs),
+            'max_prob': np.mean(max_probs),
+            'dice_score': np.mean(dice_scores)
+        }
+        
+        return avg_stats['loss'], avg_stats
 
-    @torch.no_grad()
     def _validate(self, val_loader):
         """Validate on full volumes"""
         self.model.eval()
@@ -292,25 +288,26 @@ class PatchSegmentationTrainer:
                 inputs = torch.cat([ct_images, kidney_inputs], dim=1)
                 
                 try:
-                    # Forward pass
-                    outputs = self.model(inputs)
-                    loss = self.criterion(outputs, tumor_masks, kidney_masks)
-                    
-                    # Get predictions
-                    probs = torch.sigmoid(outputs)
-                    preds = (probs > 0.5).float()
-                    
-                    # Calculate Dice only within kidney
-                    dice = self._calculate_dice(preds, tumor_masks, kidney_masks)
-                    
-                    val_loss += loss.item()
-                    val_dice += dice
-                    valid_batches += 1
-                    
-                    pbar.set_postfix({
-                        'loss': f"{loss.item():.4f}",
-                        'dice': f"{dice:.4f}"
-                    })
+                    with torch.no_grad():
+                        # Forward pass
+                        outputs = self.model(inputs)
+                        loss = self.criterion(outputs, tumor_masks, kidney_masks)
+                        
+                        # Get predictions
+                        probs = torch.sigmoid(outputs)
+                        preds = (probs > 0.5).float()
+                        
+                        # Calculate Dice only within kidney
+                        dice = self._calculate_dice(preds, tumor_masks, kidney_masks)
+                        
+                        val_loss += loss.item()
+                        val_dice += dice
+                        valid_batches += 1
+                        
+                        pbar.set_postfix({
+                            'loss': f"{loss.item():.4f}",
+                            'dice': f"{dice:.4f}"
+                        })
                     
                 except RuntimeError as e:
                     if "out of memory" in str(e):
@@ -319,10 +316,8 @@ class PatchSegmentationTrainer:
                         continue
                     raise e
         
-        if valid_batches > 0:
-            return (val_loss / valid_batches,
-                   val_dice / valid_batches)
-        return float('inf'), 0
+        return (val_loss / valid_batches if valid_batches > 0 else float('inf'),
+                val_dice / valid_batches if valid_batches > 0 else 0)
 
     def _calculate_dice(self, 
                       pred: torch.Tensor,
@@ -341,6 +336,79 @@ class PatchSegmentationTrainer:
         dice = (2. * intersection + smooth) / (union + smooth)
         return dice.item()
 
+    def _log_batch_stats(self, stats: dict, batch_idx: int, epoch: int):
+        """Log detailed batch statistics to tensorboard"""
+        step = epoch * 1000 + batch_idx  # Unique step number
+        self.writer.add_scalar('Batch/tumor_ratio', stats['tumor_ratio'], step)
+        self.writer.add_scalar('Batch/true_positives', stats['true_positives'], step)
+        self.writer.add_scalar('Batch/mean_prob', stats['mean_prob'], step)
+        self.writer.add_scalar('Batch/max_prob', stats['max_prob'], step)
+        self.writer.add_scalar('Batch/dice_score', stats['dice_score'], step)
+
+    def _log_epoch(self, train_loss, train_stats, val_loss, val_dice, lr, epoch):
+        """Log epoch-level metrics"""
+        # Training metrics
+        self.writer.add_scalar('Loss/train', train_loss, epoch)
+        self.writer.add_scalar('Loss/val', val_loss, epoch)
+        self.writer.add_scalar('Dice/val', val_dice, epoch)
+        self.writer.add_scalar('LearningRate', lr, epoch)
+        
+        # Training statistics
+        self.writer.add_scalar('Train/tumor_ratio', train_stats['tumor_ratio'], epoch)
+        self.writer.add_scalar('Train/mean_prob', train_stats['mean_prob'], epoch)
+        self.writer.add_scalar('Train/max_prob', train_stats['max_prob'], epoch)
+        self.writer.add_scalar('Train/dice_score', train_stats['dice_score'], epoch)
+        
+        print(f"\nEpoch {epoch+1}/{self.config.num_epochs}")
+        print(f"Train - Loss: {train_loss:.4f}, Dice: {train_stats['dice_score']:.4f}")
+        print(f"Val   - Loss: {val_loss:.4f}, Dice: {val_dice:.4f}")
+        print(f"Learning Rate: {lr:.6f}")
+        print(f"Mean tumor ratio: {train_stats['tumor_ratio']:.4%}")
+
+    def _visualize_predictions(self, val_loader, epoch):
+        """Visualize predictions on validation data"""
+        self.model.eval()
+        
+        # Get first validation batch
+        images, tumor_masks, kidney_masks = next(iter(val_loader))
+        images = images.to(self.device)
+        tumor_masks = tumor_masks.to(self.device)
+        kidney_masks = kidney_masks.to(self.device)
+        
+        with torch.no_grad():
+            # Get predictions
+            ct_images = images[:, 0:1].float()
+            kidney_inputs = kidney_masks.float()
+            inputs = torch.cat([ct_images, kidney_inputs], dim=1)
+            outputs = self.model(inputs)
+            probs = torch.sigmoid(outputs)
+            
+            # Get middle slice
+            slice_idx = probs.shape[2] // 2
+            
+            # Create figure
+            fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+            
+            # Plot CT
+            axes[0].imshow(ct_images[0, 0, slice_idx].cpu(), cmap='gray')
+            axes[0].set_title('CT')
+            
+            # Plot kidney mask
+            axes[1].imshow(kidney_masks[0, 0, slice_idx].cpu(), cmap='gray')
+            axes[1].set_title('Kidney')
+            
+            # Plot ground truth tumor
+            axes[2].imshow(tumor_masks[0, 0, slice_idx].cpu(), cmap='gray')
+            axes[2].set_title('Ground Truth')
+            
+            # Plot prediction
+            axes[3].imshow(probs[0, 0, slice_idx].cpu(), cmap='gray')
+            axes[3].set_title(f'Prediction (Epoch {epoch+1})')
+            
+            # Save figure
+            self.writer.add_figure('Predictions', fig, epoch)
+            plt.close(fig)
+
     def _save_checkpoint(self, epoch: int, metrics: dict, is_best: bool = False):
         """Save training checkpoint"""
         checkpoint = {
@@ -350,7 +418,12 @@ class PatchSegmentationTrainer:
             'scheduler_state_dict': self.scheduler.state_dict(),
             'scaler_state_dict': self.scaler.state_dict(),
             'best_val_dice': self.best_val_dice,
-            'metrics': metrics
+            'metrics': metrics,
+            'config': {
+                'patch_size': self.patch_size,
+                'batch_size': self.batch_size,
+                'tumor_only_prob': self.tumor_only_prob
+            }
         }
         
         latest_path = self.config.checkpoint_dir / "latest.pth"
@@ -377,5 +450,11 @@ class PatchSegmentationTrainer:
         self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
         self.start_epoch = checkpoint['epoch'] + 1
         self.best_val_dice = checkpoint['best_val_dice']
+        
+        # Load configuration if available
+        if 'config' in checkpoint:
+            self.patch_size = checkpoint['config']['patch_size']
+            self.batch_size = checkpoint['config']['batch_size']
+            self.tumor_only_prob = checkpoint['config']['tumor_only_prob']
         
         print(f"Resuming training from epoch {self.start_epoch}")
