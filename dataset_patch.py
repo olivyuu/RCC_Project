@@ -9,6 +9,13 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+def worker_init_fn(worker_id: int):
+    """Initialize random seeds uniquely for each worker"""
+    worker_seed = 42 + worker_id
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+    torch.manual_seed(worker_seed)
+
 class KiTS23PatchDataset(Dataset):
     """Dataset wrapper that samples patches from preprocessed volumes"""
     
@@ -299,3 +306,6 @@ class KiTS23PatchDataset(Dataset):
 
     def __len__(self):
         return len(self.volume_paths)
+
+# For DataLoader worker initialization
+__all__ = ['KiTS23PatchDataset', 'worker_init_fn']
