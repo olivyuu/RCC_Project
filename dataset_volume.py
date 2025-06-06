@@ -1,127 +1,191 @@
+import os
 import torch
-from pathlib import Path 
-from typing import Tuple, Optional, List
 import numpy as np
-from torch.utils.data import Dataset
-import torch.nn.functional as F
+from torch.utils.data import Dataset, random_split
+from pathlib import Path
+import logging
+from typing import Optional, Tuple, Dict, List
 from tqdm import tqdm
 
+logger = logging.getLogger(__name__)
+
 class KiTS23VolumeDataset(Dataset):
-    """Dataset for loading preprocessed KiTS23 volumes"""
+    """Dataset for loading preprocessed KiTS23 volumes and segmentations"""
     
     def __init__(self, 
                 root_dir: str,
-                config: object,
-                preprocess: bool = True):
+                config,
+                preprocess: bool = False,
+                phase: str = 'train',
+                device: Optional[torch.device] = None):
         """
         Args:
-            root_dir: Path to preprocessed volumes directory
+            root_dir: Path to preprocessed .pt files
             config: Configuration object
-            preprocess: Whether to preprocess volumes (or load preprocessed)
+            preprocess: Not used, kept for compatibility
+            phase: 'train' or 'val' for different augmentation
+            device: Device to load tensors to (default: None = CPU)
         """
         self.root_dir = Path(root_dir)
         self.config = config
-        self.preprocess = preprocess
+        self.phase = phase
+        self.device = device
         
-        if not self.root_dir.exists():
-            raise FileNotFoundError(f"Directory not found: {self.root_dir}")
-            
-        # Find all preprocessed .pt files
-        self.volume_paths = sorted([
-            f for f in self.root_dir.glob('*.pt')
-            if f.name.startswith('case_') and f.name.endswith('_volume.pt')
-        ])
-        
+        # Find all preprocessed volumes
+        self.volume_paths = sorted(list(self.root_dir.glob("case_*.pt")))
         if not self.volume_paths:
             raise RuntimeError(f"No preprocessed volumes found in {self.root_dir}")
             
-        print(f"Found {len(self.volume_paths)} preprocessed volumes")
+        logger.info(f"Found {len(self.volume_paths)} .pt files in: {self.root_dir}")
+        
+        # Cache volume statistics
+        self.stats = self._compute_dataset_statistics()
+        self._log_dataset_info()
 
-    def __len__(self) -> int:
+    def _compute_dataset_statistics(self) -> Dict:
+        """Compute and cache dataset statistics"""
+        stats = {
+            'n_volumes': len(self.volume_paths),
+            'n_tumor': 0,
+            'n_kidney': 0,
+            'tumor_volumes': [],
+            'kidney_volumes': [],
+            'shapes': [],
+            'spacings': []
+        }
+        
+        logger.info("Computing dataset statistics...")
+        for path in tqdm(self.volume_paths):
+            try:
+                data = torch.load(path)
+                tumor_voxels = data['tumor'].sum().item()
+                kidney_voxels = data['kidney'].sum().item()
+                
+                stats['n_tumor'] += tumor_voxels
+                stats['n_kidney'] += kidney_voxels
+                stats['tumor_volumes'].append(tumor_voxels)
+                stats['kidney_volumes'].append(kidney_voxels)
+                stats['shapes'].append(data['original_shape'])
+                stats['spacings'].append(data['original_spacing'])
+                
+            except Exception as e:
+                logger.error(f"Error loading {path}: {str(e)}")
+                
+        return stats
+
+    def _log_dataset_info(self):
+        """Log dataset statistics"""
+        logger.info("\nDataset Statistics:")
+        logger.info(f"Total volumes: {self.stats['n_volumes']}")
+        logger.info(f"Total tumor voxels: {self.stats['n_tumor']}")
+        logger.info(f"Total kidney voxels: {self.stats['n_kidney']}")
+        logger.info(f"Average tumor voxels per volume: {self.stats['n_tumor'] / self.stats['n_volumes']:.1f}")
+        logger.info(f"Average kidney voxels per volume: {self.stats['n_kidney'] / self.stats['n_volumes']:.1f}")
+        
+        if self.config.debug:
+            # Log detailed stats for first few volumes
+            for idx in range(min(3, len(self.volume_paths))):
+                data = torch.load(self.volume_paths[idx])
+                logger.debug(f"\nVolume {idx}:")
+                logger.debug(f"  Shape: {data['image'].shape}")
+                logger.debug(f"  Original shape: {data['original_shape']}")
+                logger.debug(f"  Original spacing: {data['original_spacing']}")
+                logger.debug(f"  Tumor voxels: {data['tumor'].sum().item()}")
+                logger.debug(f"  Kidney voxels: {data['kidney'].sum().item()}")
+                if 'source' in data:
+                    logger.debug(f"  Source: {data['source']}")
+
+    def get_volume_info(self, idx: int) -> Dict:
+        """Get metadata for a volume"""
+        data = torch.load(self.volume_paths[idx])
+        return {
+            'case_id': data.get('case_id', f"case_{idx:05d}"),
+            'original_shape': data['original_shape'],
+            'original_spacing': data['original_spacing'],
+            'original_affine': data.get('original_affine', None),
+            'tumor_voxels': self.stats['tumor_volumes'][idx],
+            'kidney_voxels': self.stats['kidney_volumes'][idx]
+        }
+
+    def get_train_val_splits(self, 
+                          val_ratio: float = 0.2,
+                          seed: int = 42) -> Tuple[Dataset, Dataset]:
+        """Create train/validation split"""
+        val_size = int(len(self) * val_ratio)
+        train_size = len(self) - val_size
+        
+        # Create new datasets for each split
+        train_dataset = KiTS23VolumeDataset(
+            self.root_dir,
+            self.config,
+            phase='train',
+            device=self.device
+        )
+        val_dataset = KiTS23VolumeDataset(
+            self.root_dir,
+            self.config, 
+            phase='val',
+            device=self.device
+        )
+        
+        # Split indices
+        indices = list(range(len(self)))
+        generator = torch.Generator().manual_seed(seed)
+        train_indices, val_indices = random_split(indices, [train_size, val_size], generator=generator)
+        
+        # Assign paths to splits
+        train_dataset.volume_paths = [self.volume_paths[i] for i in train_indices]
+        val_dataset.volume_paths = [self.volume_paths[i] for i in val_indices]
+        
+        logger.info(f"Split dataset into {len(train_dataset)} train and {len(val_dataset)} validation volumes")
+        return train_dataset, val_dataset
+
+    def __len__(self):
         return len(self.volume_paths)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Load a preprocessed volume
+        Load preprocessed volume data
         
         Returns:
-            tuple of (image, tumor_mask, kidney_mask) tensors
-            shape: [1, D, H, W] for each
-            Note: kidney_mask is now always all ones (no Totalsegmentator)
+            image: [1,D,H,W] Preprocessed CT volume
+            tumor: [1,D,H,W] Tumor mask 
+            kidney: [1,D,H,W] Kidney mask from KiTS23
         """
-        volume_path = self.volume_paths[idx]
         try:
-            data = torch.load(volume_path)
+            # Load preprocessed data
+            data = torch.load(self.volume_paths[idx])
             
-            # Handle different data formats
-            if isinstance(data, (tuple, list)) and len(data) >= 2:
-                # (image, tumor_mask, [kidney_mask]) format
-                image = data[0] 
-                tumor_mask = data[1]
-            elif isinstance(data, dict):
-                # Dictionary format
-                if all(k in data for k in ['image', 'tumor']):
-                    image = data['image'] 
-                    tumor_mask = data['tumor']
-                else:
-                    raise ValueError(f"Unknown dictionary keys in {volume_path}: {list(data.keys())}")
-            else:
-                raise ValueError(f"Unknown data format in {volume_path}: {type(data)}")
-            
-            # Ensure all tensors are proper shape and type
-            if len(image.shape) == 3:
-                image = image.unsqueeze(0)
-            if len(tumor_mask.shape) == 3:
-                tumor_mask = tumor_mask.unsqueeze(0)
-                
-            image = image.float()
-            tumor_mask = tumor_mask.float()
-            
-            # Create dummy kidney mask (all ones)
-            kidney_mask = torch.ones_like(tumor_mask)
+            # Extract required tensors
+            image = data['image']    # CT volume
+            tumor = data['tumor']    # Tumor segmentation  
+            kidney = data['kidney']  # KiTS23 kidney segmentation
             
             # Verify shapes match
-            if not (image.shape == tumor_mask.shape == kidney_mask.shape):
-                raise ValueError(f"Shape mismatch in {volume_path}: "
-                            f"image {image.shape}, tumor {tumor_mask.shape}")
+            if not (image.shape == tumor.shape == kidney.shape):
+                raise ValueError(
+                    f"Shape mismatch in volume {idx}: "
+                    f"image {image.shape}, tumor {tumor.shape}, kidney {kidney.shape}"
+                )
+            
+            # Verify data format
+            if not all(isinstance(x, torch.Tensor) for x in [image, tumor, kidney]):
+                raise TypeError(f"Non-tensor data in volume {idx}")
                 
-            return image, tumor_mask, kidney_mask
+            if not all(x.dim() == 4 for x in [image, tumor, kidney]):
+                raise ValueError(f"Wrong tensor dimensions in volume {idx}")
+                
+            if not all(x.shape[0] == 1 for x in [image, tumor, kidney]):
+                raise ValueError(f"Missing channel dimension in volume {idx}")
+            
+            # Move to device if specified
+            if self.device is not None:
+                image = image.to(self.device)
+                tumor = tumor.to(self.device)
+                kidney = kidney.to(self.device)
+                
+            return image, tumor, kidney
             
         except Exception as e:
-            print(f"Error loading {volume_path}: {str(e)}")
+            logger.error(f"Error loading volume {self.volume_paths[idx]}: {str(e)}")
             raise
-
-    def get_sample_id(self, idx: int) -> str:
-        """Get case ID from volume path"""
-        return self.volume_paths[idx].stem.split('_')[1]  # 'case_00123_volume' -> '00123'
-
-    @staticmethod
-    def collate_fn(batch):
-        """Custom collate to handle different sized volumes"""
-        # Find max dimensions
-        max_d = max(x[0].shape[-3] for x in batch)
-        max_h = max(x[0].shape[-2] for x in batch)
-        max_w = max(x[0].shape[-1] for x in batch)
-        
-        # Pad each sample to max size
-        padded_batch = []
-        for image, tumor, kidney in batch:
-            d, h, w = image.shape[-3:]
-            
-            # Calculate padding
-            pad_d = max_d - d
-            pad_h = max_h - h 
-            pad_w = max_w - w
-            
-            # Pad all tensors
-            image_pad = F.pad(image, (0, pad_w, 0, pad_h, 0, pad_d))
-            tumor_pad = F.pad(tumor, (0, pad_w, 0, pad_h, 0, pad_d))
-            kidney_pad = F.pad(kidney, (0, pad_w, 0, pad_h, 0, pad_d))
-            
-            padded_batch.append((image_pad, tumor_pad, kidney_pad))
-        
-        # Stack along batch dimension
-        images, tumors, kidneys = zip(*padded_batch)
-        return (torch.stack(images), 
-                torch.stack(tumors),
-                torch.stack(kidneys))
