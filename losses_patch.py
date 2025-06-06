@@ -26,7 +26,8 @@ class WeightedDiceBCELoss(nn.Module):
                kidney_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Args:
-            logits: Model output, either a tensor [B,1,D,H,W] or list/tuple of tensors
+            logits: Model output [B,C,D,H,W] or list/tuple of tensors
+                   C can be 1 (tumor logits) or 2 (background/tumor logits)
             target: Ground truth mask [B,1,D,H,W]
             kidney_mask: Optional kidney ROI mask [B,1,D,H,W]
         """
@@ -34,8 +35,22 @@ class WeightedDiceBCELoss(nn.Module):
         if isinstance(logits, (list, tuple)):
             logits = logits[-1]
             
+        B, C, d, h, w = logits.shape
+        
+        # If 2-channel output, take channel 1 (tumor)
+        if C == 2:
+            logits = logits[:, 1:2]  # Shape becomes [B,1,d,h,w]
+        
+        # If spatial dimensions don't match, upsample logits
+        if (d, h, w) != target.shape[2:]:
+            logits = F.interpolate(
+                logits,
+                size=target.shape[2:],  # Match target size
+                mode='trilinear',
+                align_corners=False
+            )
+        
         device = logits.device
-        B, C, D, H, W = logits.shape
 
         if kidney_mask is not None:
             valid = (kidney_mask > 0).float()
@@ -91,6 +106,19 @@ class WeightedDiceBCELoss(nn.Module):
         # Handle list/tuple outputs
         if isinstance(logits, (list, tuple)):
             logits = logits[-1]
+        
+        # Handle 2-channel output
+        if logits.shape[1] == 2:
+            logits = logits[:, 1:2]
+            
+        # Upsample if needed
+        if logits.shape[2:] != target.shape[2:]:
+            logits = F.interpolate(
+                logits,
+                size=target.shape[2:],
+                mode='trilinear',
+                align_corners=False
+            )
             
         with torch.no_grad():
             device = logits.device
