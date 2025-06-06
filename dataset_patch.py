@@ -10,17 +10,27 @@ import logging
 logger = logging.getLogger(__name__)
 
 class KiTS23PatchDataset(Dataset):
-    """Dataset wrapper that samples patches with kidney-aware sampling for Phase 2"""
+    """Dataset wrapper that samples patches from preprocessed volumes"""
+    
     def __init__(self, 
-                full_dataset: Dataset,
+                data_dir: str,
                 patch_size: Tuple[int, int, int] = (64, 128, 128),
                 tumor_only_prob: float = 0.7,
-                use_kidney_mask: bool = False,  # Phase 2: Enable kidney masking
-                min_kidney_voxels: int = 100,  # Minimum kidney voxels for valid patch
-                kidney_patch_overlap: float = 0.5,  # Minimum overlap with kidney
+                use_kidney_mask: bool = False,
+                min_kidney_voxels: int = 100,
+                kidney_patch_overlap: float = 0.5,
                 debug: bool = False):
-        super().__init__()
-        self.base = full_dataset
+        """
+        Args:
+            data_dir: Directory containing preprocessed .pt files
+            patch_size: Size of patches to extract (D,H,W)
+            tumor_only_prob: Probability of sampling tumor-centered patches
+            use_kidney_mask: Whether to use kidney masking (Phase 2)
+            min_kidney_voxels: Minimum kidney voxels required in patch
+            kidney_patch_overlap: Required tumor-kidney overlap ratio
+            debug: Enable debug output
+        """
+        self.data_dir = Path(data_dir)
         self.patch_size = patch_size
         self.tumor_only_prob = tumor_only_prob
         self.use_kidney_mask = use_kidney_mask
@@ -28,7 +38,10 @@ class KiTS23PatchDataset(Dataset):
         self.kidney_patch_overlap = kidney_patch_overlap
         self.debug = debug
         
-        # NOTE: Random seeding is now handled by DataLoader's worker_init_fn
+        # Find all preprocessed volumes
+        self.volume_paths = sorted(list(self.data_dir.glob("case_*.pt")))
+        if not self.volume_paths:
+            raise RuntimeError(f"No preprocessed volumes found in {self.data_dir}")
         
         print("Precomputing coordinates for efficient sampling...")
         
@@ -45,26 +58,22 @@ class KiTS23PatchDataset(Dataset):
         volumes_with_kidney = 0
         self.empty_kidney_volumes = set()  # Track volumes with no kidney
         
-        for idx in range(len(full_dataset)):
-            # Get masks
-            data = full_dataset[idx]
-            if len(data) != 3:
-                raise ValueError(f"Base dataset must return (image, tumor_mask, kidney_mask), got {len(data)} items")
-            
-            _, tumor_mask, kidney_mask = data
-            
-            if not all(isinstance(x, torch.Tensor) for x in [tumor_mask, kidney_mask]):
-                raise ValueError("Expected torch.Tensor masks")
+        for idx, vol_path in enumerate(self.volume_paths):
+            # Load preprocessed data
+            data = torch.load(vol_path)
+            image = data['image']
+            tumor = data['tumor']
+            kidney = data['kidney']
             
             # Store volume shape for fallback sampling
-            self.volume_shapes.append(tumor_mask.shape[1:])  # [D,H,W]
+            self.volume_shapes.append(image.shape[1:])  # [D,H,W]
             
             # Find coordinates based on phase
             if self.use_kidney_mask:
-                tumor_and_kidney = (tumor_mask > 0) & (kidney_mask > 0)
+                tumor_and_kidney = (tumor > 0) & (kidney > 0)
                 tumor_coords = tumor_and_kidney.nonzero(as_tuple=False)[:, 1:]
-                kidney_coords = (kidney_mask > 0).nonzero(as_tuple=False)[:, 1:]
-                kidney_bg = (kidney_mask > 0) & (tumor_mask == 0)
+                kidney_coords = (kidney > 0).nonzero(as_tuple=False)[:, 1:]
+                kidney_bg = (kidney > 0) & (tumor == 0)
                 bg_coords = kidney_bg.nonzero(as_tuple=False)[:, 1:]
                 
                 # Check for empty kidney
@@ -73,7 +82,7 @@ class KiTS23PatchDataset(Dataset):
                     self.empty_kidney_volumes.add(idx)
             else:
                 # Phase 1: Use only tumor mask
-                tumor_coords = (tumor_mask > 0).nonzero(as_tuple=False)[:, 1:]
+                tumor_coords = (tumor > 0).nonzero(as_tuple=False)[:, 1:]
                 kidney_coords = tumor_coords  # Placeholder
                 bg_coords = tumor_coords  # Placeholder
             
@@ -94,31 +103,28 @@ class KiTS23PatchDataset(Dataset):
             
             if debug and idx < 5:
                 print(f"\nVolume {idx}:")
-                print(f"  Shape: {tumor_mask.shape}")
-                print(f"  Total voxels: {tumor_mask.numel()}")
+                print(f"  Shape: {image.shape}")
+                print(f"  Total voxels: {image.numel()}")
                 print(f"  Tumor voxels: {n_tumor}")
                 if self.use_kidney_mask:
                     print(f"  Kidney voxels: {n_kidney}")
-                    print(f"  Tumor in kidney voxels: {len(tumor_coords)}")
+                    print(f"  Tumor in kidney: {len(tumor_coords)}")
                     print(f"  Tumor percentage in kidney: {100 * len(tumor_coords) / max(n_kidney, 1):.4f}%")
                 else:
-                    print(f"  Tumor percentage: {100 * n_tumor / tumor_mask.numel():.4f}%")
+                    print(f"  Tumor percentage: {100 * n_tumor / image.numel():.4f}%")
         
         print(f"\nDataset statistics:")
-        print(f"Total volumes: {len(full_dataset)}")
+        print(f"Total volumes: {len(self.volume_paths)}")
         print(f"Volumes with tumor: {volumes_with_tumor}")
         if self.use_kidney_mask:
             print(f"Volumes with kidney: {volumes_with_kidney}")
             print(f"Volumes without kidney: {len(self.empty_kidney_volumes)}")
             print(f"Total kidney voxels: {total_kidney_voxels}")
-            print(f"Average kidney voxels per volume: {total_kidney_voxels / len(full_dataset):.1f}")
+            print(f"Average kidney voxels per volume: {total_kidney_voxels / len(self.volume_paths):.1f}")
         print(f"Total tumor voxels: {total_tumor_voxels}")
-        print(f"Average tumor voxels per volume: {total_tumor_voxels / len(full_dataset):.1f}")
+        print(f"Average tumor voxels per volume: {total_tumor_voxels / len(self.volume_paths):.1f}")
         print(f"Tumor-centered patch probability: {tumor_only_prob:.1%}")
         print(f"Patch size: {patch_size}")
-        if self.use_kidney_mask:
-            print(f"Minimum kidney voxels per patch: {min_kidney_voxels}")
-            print(f"Required kidney overlap: {kidney_patch_overlap:.1%}")
 
     def _get_random_center(self, volume_idx: int) -> List[int]:
         """Get random center coordinates respecting patch bounds"""
@@ -146,13 +152,13 @@ class KiTS23PatchDataset(Dataset):
         x0 = max(0, cx - W//2)
         x1 = min(X, cx + W//2)
         
-        # Calculate required padding
+        # Extract patch
+        patch = volume[:, z0:z1, y0:y1, x0:x1]
+        
+        # Calculate padding if needed
         pad_z = (max(0, D//2 - cz), max(0, (cz + D//2) - Z))
         pad_y = (max(0, H//2 - cy), max(0, (cy + H//2) - Y))
         pad_x = (max(0, W//2 - cx), max(0, (cx + W//2) - X))
-        
-        # Extract patch
-        patch = volume[:, z0:z1, y0:y1, x0:x1]
         
         # Pad if necessary
         if sum(pad_z + pad_y + pad_x) > 0:
@@ -205,11 +211,11 @@ class KiTS23PatchDataset(Dataset):
             tumor_patch: [1, D, H, W] tumor mask patch
             kidney_patch: [1, D, H, W] kidney mask patch (or ones if Phase 1)
         """
-        # Get full volume data
-        data = self.base[idx]
-        if len(data) != 3:
-            raise ValueError(f"Base dataset returned {len(data)} items, expected 3")
-        image, tumor_mask, kidney_mask = data
+        # Load preprocessed volume data
+        data = torch.load(self.volume_paths[idx])
+        image = data['image']
+        tumor = data['tumor']
+        kidney = data['kidney']
         
         # Decide whether to sample tumor-centered patch
         use_tumor = (len(self.tumor_indices[idx]) > 0 and 
@@ -219,11 +225,10 @@ class KiTS23PatchDataset(Dataset):
         if self.use_kidney_mask and idx in self.empty_kidney_volumes:
             center = self._get_random_center(idx)
             image_patch = self._extract_patch(image, center, pad_value=0)
-            tumor_patch = self._extract_patch(tumor_mask, center, pad_value=0)
+            tumor_patch = self._extract_patch(tumor, center, pad_value=0)
             kidney_patch = torch.zeros_like(tumor_patch)  # No kidney present
-            if not self.warned_empty_kidney:
-                logger.warning(f"Using zero kidney mask for volume {idx} (no kidney present)")
-                self.warned_empty_kidney = True
+            if self.debug:
+                print(f"Using random center for empty kidney volume {idx}")
             return image_patch, tumor_patch, kidney_patch
         
         max_attempts = 10
@@ -250,10 +255,10 @@ class KiTS23PatchDataset(Dataset):
             
             # Extract patches
             image_patch = self._extract_patch(image, center, pad_value=0)
-            tumor_patch = self._extract_patch(tumor_mask, center, pad_value=0)
+            tumor_patch = self._extract_patch(tumor, center, pad_value=0)
             
             if self.use_kidney_mask:
-                kidney_patch = self._extract_patch(kidney_mask, center, pad_value=0)
+                kidney_patch = self._extract_patch(kidney, center, pad_value=0)
                 # Validate patch
                 if self._validate_kidney_patch(kidney_patch, tumor_patch if use_tumor else None):
                     break
@@ -264,11 +269,10 @@ class KiTS23PatchDataset(Dataset):
         else:  # No valid patch found after max attempts
             logger.warning(f"Could not find valid patch in volume {idx} after {max_attempts} attempts")
             # Return centered patch as fallback
-            D, H, W = self.volume_shapes[idx]
-            center = [D//2, H//2, W//2]
+            center = [d//2 for d in self.volume_shapes[idx]]
             image_patch = self._extract_patch(image, center, pad_value=0)
-            tumor_patch = self._extract_patch(tumor_mask, center, pad_value=0)
-            kidney_patch = self._extract_patch(kidney_mask, center, pad_value=0) if self.use_kidney_mask else torch.ones_like(tumor_patch)
+            tumor_patch = self._extract_patch(tumor, center, pad_value=0)
+            kidney_patch = self._extract_patch(kidney, center, pad_value=0) if self.use_kidney_mask else torch.ones_like(tumor_patch)
         
         # Verify patch sizes
         assert image_patch.shape[1:] == self.patch_size, f"Wrong patch size: {image_patch.shape[1:]} vs {self.patch_size}"
@@ -294,11 +298,4 @@ class KiTS23PatchDataset(Dataset):
         return image_patch, tumor_patch, kidney_patch
 
     def __len__(self):
-        return len(self.base)
-
-def worker_init_fn(worker_id: int):
-    """Initialize random seeds uniquely for each worker"""
-    worker_seed = 42 + worker_id
-    random.seed(worker_seed)
-    np.random.seed(worker_seed)
-    torch.manual_seed(worker_seed)
+        return len(self.volume_paths)
