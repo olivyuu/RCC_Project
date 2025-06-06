@@ -45,18 +45,24 @@ class KiTS23PatchDataset(Dataset):
             if not self.volume_paths:
                 raise RuntimeError(f"No preprocessed volumes found in {self.data_dir}")
         else:
-            # Use volume paths from dataset object
+            # Use paths and root_dir from dataset object
             self.volume_paths = data_source.volume_paths
             self.data_dir = data_source.root_dir
-            
+        
         self.patch_size = patch_size
         self.tumor_only_prob = tumor_only_prob
         self.use_kidney_mask = use_kidney_mask
         self.min_kidney_voxels = min_kidney_voxels
         self.kidney_patch_overlap = kidney_patch_overlap
         self.debug = debug
+
+        # Track sampling statistics
+        self.total_patches = 0
+        self.tumor_centered_patches = 0
+        self.kidney_valid_patches = 0
+        self.failed_attempts = 0
         
-        print("Precomputing coordinates for efficient sampling...")
+        print("Computing coordinate lists for patch sampling...")
         
         # Store indices for each volume
         self.tumor_indices = []      # All tumor voxels
@@ -71,6 +77,7 @@ class KiTS23PatchDataset(Dataset):
         volumes_with_kidney = 0
         self.empty_kidney_volumes = set()
         
+        # Build coordinate lists only for volumes in this dataset
         for idx, vol_path in enumerate(self.volume_paths):
             # Load preprocessed data
             data = torch.load(vol_path)
@@ -81,7 +88,7 @@ class KiTS23PatchDataset(Dataset):
             # Store volume shape for fallback sampling
             self.volume_shapes.append(image.shape[1:])
             
-            # Collect ALL tumor coordinates (don't filter by kidney yet)
+            # Get all tumor coordinates regardless of kidney
             tumor_coords = (tumor > 0).nonzero(as_tuple=False)[:, 1:]
             
             if self.use_kidney_mask:
@@ -227,10 +234,12 @@ class KiTS23PatchDataset(Dataset):
         image = data['image']
         tumor = data['tumor']
         kidney = data['kidney']
-        
-        # Decide whether to sample tumor-centered patch
+
+        self.total_patches += 1
         use_tumor = (len(self.tumor_indices[idx]) > 0 and 
                     random.random() < self.tumor_only_prob)
+        if use_tumor:
+            self.tumor_centered_patches += 1
         
         # Handle volumes with no kidney in Phase 2
         if self.use_kidney_mask and idx in self.empty_kidney_volumes:
@@ -272,18 +281,24 @@ class KiTS23PatchDataset(Dataset):
                 kidney_patch = self._extract_patch(kidney, center, pad_value=0)
                 # Validate patch
                 if self._validate_kidney_patch(kidney_patch, tumor_patch if use_tumor else None):
+                    self.kidney_valid_patches += 1
                     break
             else:
                 kidney_patch = torch.ones_like(tumor_patch)
                 break
                 
         else:  # No valid patch found after max attempts
+            self.failed_attempts += 1
             logger.warning(f"Could not find valid patch in volume {idx} after {max_attempts} attempts")
             # Return centered patch as fallback
             center = [d//2 for d in self.volume_shapes[idx]]
             image_patch = self._extract_patch(image, center, pad_value=0)
             tumor_patch = self._extract_patch(tumor, center, pad_value=0)
             kidney_patch = self._extract_patch(kidney, center, pad_value=0) if self.use_kidney_mask else torch.ones_like(tumor_patch)
+        
+        # Log sampling statistics periodically
+        if self.total_patches % 1000 == 0:
+            self._log_sampling_stats()
         
         # Verify patch sizes
         assert image_patch.shape[1:] == self.patch_size, f"Wrong patch size: {image_patch.shape[1:]} vs {self.patch_size}"
@@ -322,6 +337,15 @@ class KiTS23PatchDataset(Dataset):
                     logger.debug(f"  {k}: {v}")
         
         return image_patch, tumor_patch, kidney_patch
+
+    def _log_sampling_stats(self):
+        """Log patch sampling statistics"""
+        logger.info("\nPatch sampling statistics:")
+        logger.info(f"Total patches sampled: {self.total_patches}")
+        logger.info(f"Tumor-centered patches: {self.tumor_centered_patches} ({100*self.tumor_centered_patches/self.total_patches:.1f}%)")
+        if self.use_kidney_mask:
+            logger.info(f"Kidney-valid patches: {self.kidney_valid_patches} ({100*self.kidney_valid_patches/self.total_patches:.1f}%)")
+        logger.info(f"Failed attempts: {self.failed_attempts} ({100*self.failed_attempts/self.total_patches:.1f}%)")
 
     def __len__(self):
         return len(self.volume_paths)

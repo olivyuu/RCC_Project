@@ -108,9 +108,9 @@ class PatchSegmentationTrainer:
         volume_dataset = KiTS23VolumeDataset(dataset_path, self.config)
         train_dataset, val_dataset = volume_dataset.get_train_val_splits(val_ratio=0.2, seed=self.seed)
         
-        # Create patch datasets with split volumes
+        # Create patch datasets using split datasets directly
         train_patch_dataset = KiTS23PatchDataset(
-            dataset_path,  # Use path directly
+            data_source=train_dataset,  # Pass dataset object instead of path
             patch_size=self.patch_size,
             tumor_only_prob=self.tumor_only_prob,
             use_kidney_mask=self.config.use_kidney_mask,
@@ -120,7 +120,7 @@ class PatchSegmentationTrainer:
         )
         
         val_patch_dataset = KiTS23PatchDataset(
-            dataset_path,  # Use path directly
+            data_source=val_dataset,  # Pass dataset object instead of path
             patch_size=self.patch_size,
             tumor_only_prob=0.5,  # Equal sampling for validation
             use_kidney_mask=self.config.use_kidney_mask,
@@ -128,10 +128,6 @@ class PatchSegmentationTrainer:
             kidney_patch_overlap=self.config.kidney_patch_overlap if hasattr(self.config, 'kidney_patch_overlap') else 0.5,
             debug=False
         )
-        
-        # Assign split volume paths
-        train_patch_dataset.volume_paths = train_dataset.volume_paths
-        val_patch_dataset.volume_paths = val_dataset.volume_paths
         
         # Create data loaders with worker initialization
         train_loader = DataLoader(
@@ -170,6 +166,7 @@ class PatchSegmentationTrainer:
         
         if self.config.checkpoint_path:
             print(f"Loading checkpoint: {self.config.checkpoint_path}")
+            print(f"Starting from epoch {self.start_epoch}")
         
         if self.config.use_kidney_mask:
             print("Phase 2 parameters:")
@@ -209,6 +206,10 @@ class PatchSegmentationTrainer:
                 
                 # Training phase
                 train_loss, train_stats = self._train_epoch(train_loader)
+                
+                # Log sampling statistics from dataset
+                if hasattr(train_patch_dataset, '_log_sampling_stats'):
+                    train_patch_dataset._log_sampling_stats()
                 
                 # Validation phase
                 val_loss, val_dice = self._validate(val_loader)
@@ -464,7 +465,7 @@ class PatchSegmentationTrainer:
             # Reset counters but keep model weights for new phase
             self.start_epoch = 0
             self.best_val_dice = float('-inf')
-            # Initialize fresh optimizer and scheduler
+            # Initialize fresh optimizer and scheduler with lower learning rate
             self.optimizer = torch.optim.Adam(
                 self.model.parameters(),
                 lr=1e-5,  # Lower learning rate for phase transition
