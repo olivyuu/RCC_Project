@@ -12,11 +12,14 @@ import signal
 import sys
 from torch.utils.tensorboard import SummaryWriter
 import matplotlib.pyplot as plt
+import logging
 
 from models.segmentation.model import SegmentationModel
-from dataset_patch import KiTS23PatchDataset
+from dataset_patch import KiTS23PatchDataset, worker_init_fn
 from losses_patch import WeightedDiceBCELoss
 from dataset_volume import KiTS23VolumeDataset
+
+logger = logging.getLogger(__name__)
 
 class PatchSegmentationTrainer:
     def __init__(self, config):
@@ -100,7 +103,7 @@ class PatchSegmentationTrainer:
             generator=torch.Generator().manual_seed(42)
         )
         
-        # Wrap training data in patch sampler
+        # Create patch datasets for training and validation
         train_patch_dataset = KiTS23PatchDataset(
             train_dataset,
             patch_size=self.patch_size,
@@ -111,23 +114,35 @@ class PatchSegmentationTrainer:
             debug=self.config.debug
         )
         
-        # Create data loaders
+        val_patch_dataset = KiTS23PatchDataset(
+            val_dataset,
+            patch_size=self.patch_size,
+            tumor_only_prob=0.5,  # Equal sampling for validation
+            use_kidney_mask=self.config.use_kidney_mask,
+            min_kidney_voxels=self.config.min_kidney_voxels if hasattr(self.config, 'min_kidney_voxels') else 100,
+            kidney_patch_overlap=self.config.kidney_patch_overlap if hasattr(self.config, 'kidney_patch_overlap') else 0.5,
+            debug=False
+        )
+        
+        # Create data loaders with worker initialization
         train_loader = DataLoader(
             train_patch_dataset,
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
             pin_memory=True,
-            persistent_workers=True
+            persistent_workers=True,
+            worker_init_fn=worker_init_fn
         )
         
         val_loader = DataLoader(
-            val_dataset,
-            batch_size=1,
+            val_patch_dataset,
+            batch_size=self.batch_size * 2,  # Larger batch size for validation
             shuffle=False,
             num_workers=2,
             pin_memory=True,
-            persistent_workers=True
+            persistent_workers=True,
+            worker_init_fn=worker_init_fn
         )
 
         print(f"\nTraining configuration ({self.config.get_phase_name()}):")
@@ -138,7 +153,7 @@ class PatchSegmentationTrainer:
             print(f"Minimum kidney voxels: {self.config.min_kidney_voxels}")
             print(f"Required kidney overlap: {self.config.kidney_patch_overlap:.1%}")
         print(f"Training patches per epoch: {len(train_loader)}")
-        print(f"Validation volumes: {len(val_dataset)}")
+        print(f"Validation patches per epoch: {len(val_loader)}")
 
         try:
             signal.signal(signal.SIGINT, self._handle_interrupt)
@@ -296,7 +311,7 @@ class PatchSegmentationTrainer:
         return avg_stats['loss'], avg_stats
 
     def _validate(self, val_loader):
-        """Validate on full volumes"""
+        """Validate on patches to avoid OOM"""
         self.model.eval()
         val_loss = 0
         val_dice = 0
@@ -304,15 +319,15 @@ class PatchSegmentationTrainer:
         
         with tqdm(val_loader, desc="Validating") as pbar:
             for images, tumor_masks, kidney_masks in pbar:
-                # Move to device
-                images = images.to(self.device)
-                tumor_masks = tumor_masks.to(self.device)
-                kidney_masks = kidney_masks.to(self.device)
-                
-                # Use CT image only
-                inputs = images[:, 0:1].float()
-                
                 try:
+                    # Move data to device
+                    images = images.to(self.device)
+                    tumor_masks = tumor_masks.to(self.device)
+                    kidney_masks = kidney_masks.to(self.device)
+                    
+                    # Use CT image only
+                    inputs = images[:, 0:1].float()
+                    
                     with torch.no_grad():
                         # Forward pass
                         outputs = self.model(inputs)
@@ -326,25 +341,19 @@ class PatchSegmentationTrainer:
                                 align_corners=False
                             )
                         
-                        # Compute loss
+                        # Compute loss and metrics
                         loss = self.criterion(outputs, tumor_masks, kidney_masks)
-                        
-                        # Get predictions
-                        probs = torch.sigmoid(outputs)
-                        preds = (probs > 0.5).float()
-                        
-                        # Calculate Dice (using kidney mask in Phase 2)
-                        dice = self._calculate_dice(preds, tumor_masks, kidney_masks)
+                        stats = self.criterion.log_stats(outputs, tumor_masks, kidney_masks)
                         
                         val_loss += loss.item()
-                        val_dice += dice
+                        val_dice += stats['dice_score']
                         valid_batches += 1
                         
                         pbar.set_postfix({
                             'loss': f"{loss.item():.4f}",
-                            'dice': f"{dice:.4f}"
+                            'dice': f"{stats['dice_score']:.4f}"
                         })
-                    
+                        
                 except RuntimeError as e:
                     if "out of memory" in str(e):
                         print(f"\nCUDA OOM during validation. Skipping batch.")
@@ -361,17 +370,18 @@ class PatchSegmentationTrainer:
                       mask: torch.Tensor,
                       smooth: float = 1e-5) -> float:
         """Calculate Dice score for predictions"""
-        # Apply mask if in Phase 2
-        if self.config.use_kidney_mask:
-            pred = pred * mask
-            target = target * mask
-        
-        # Calculate Dice
-        intersection = (pred * target).sum()
-        union = pred.sum() + target.sum()
-        
-        dice = (2. * intersection + smooth) / (union + smooth)
-        return dice.item()
+        with torch.no_grad():
+            # Apply mask if in Phase 2
+            if self.config.use_kidney_mask:
+                pred = pred * mask
+                target = target * mask
+            
+            # Calculate Dice
+            intersection = (pred * target).sum()
+            union = pred.sum() + target.sum()
+            
+            dice = (2. * intersection + smooth) / (union + smooth)
+            return dice.item()
 
     def _log_batch_stats(self, stats: dict, batch_idx: int, epoch: int):
         """Log detailed batch statistics"""
@@ -430,7 +440,7 @@ class PatchSegmentationTrainer:
             # Get probabilities
             probs = torch.sigmoid(outputs)
             
-            # Get middle slice
+            # Get middle slice for visualization
             slice_idx = probs.shape[2] // 2
             
             # Create figure with subplots (4 in Phase 2, 3 in Phase 1)
@@ -482,6 +492,8 @@ class PatchSegmentationTrainer:
                 'batch_size': self.batch_size,
                 'tumor_only_prob': self.tumor_only_prob,
                 'use_kidney_mask': self.config.use_kidney_mask,
+                'min_kidney_voxels': getattr(self.config, 'min_kidney_voxels', None),
+                'kidney_patch_overlap': getattr(self.config, 'kidney_patch_overlap', None),
                 'training_phase': 2 if self.config.use_kidney_mask else 1
             }
         }
@@ -498,7 +510,7 @@ class PatchSegmentationTrainer:
     def _load_checkpoint(self, checkpoint_path: str):
         """Load training checkpoint from specific path"""
         if not Path(checkpoint_path).exists():
-            print(f"No checkpoint found at {checkpoint_path}")
+            logger.error(f"No checkpoint found at {checkpoint_path}")
             return
         
         print(f"Loading checkpoint: {checkpoint_path}")
@@ -509,8 +521,12 @@ class PatchSegmentationTrainer:
         current_phase = 2 if self.config.use_kidney_mask else 1
         
         if checkpoint_phase != current_phase:
-            print(f"Warning: Loading Phase {checkpoint_phase} checkpoint in Phase {current_phase} training")
+            logger.warning(
+                f"Loading Phase {checkpoint_phase} checkpoint in Phase {current_phase} training.\n"
+                f"Consider running a warm-up epoch with lower learning rate."
+            )
         
+        # Load model and training state
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
@@ -523,8 +539,25 @@ class PatchSegmentationTrainer:
             self.patch_size = checkpoint['config']['patch_size']
             self.batch_size = checkpoint['config']['batch_size']
             self.tumor_only_prob = checkpoint['config']['tumor_only_prob']
+            
+            # Verify Phase 2 parameters match if applicable
+            if current_phase == 2:
+                if checkpoint.get('min_kidney_voxels') != self.config.min_kidney_voxels:
+                    logger.warning(
+                        f"Checkpoint min_kidney_voxels ({checkpoint.get('min_kidney_voxels')}) "
+                        f"differs from current setting ({self.config.min_kidney_voxels})"
+                    )
+                if checkpoint.get('kidney_patch_overlap') != self.config.kidney_patch_overlap:
+                    logger.warning(
+                        f"Checkpoint kidney_patch_overlap ({checkpoint.get('kidney_patch_overlap')}) "
+                        f"differs from current setting ({self.config.kidney_patch_overlap})"
+                    )
         
         print(f"Resuming training from epoch {self.start_epoch}")
+        if current_phase == 2:
+            print("Phase 2 parameters:")
+            print(f"  min_kidney_voxels: {self.config.min_kidney_voxels}")
+            print(f"  kidney_patch_overlap: {self.config.kidney_patch_overlap}")
 
     def _load_latest_checkpoint(self):
         """Load latest training checkpoint"""
