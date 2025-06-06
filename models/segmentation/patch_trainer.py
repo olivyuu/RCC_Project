@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 from torch.cuda.amp import GradScaler
 import torch.cuda
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from pathlib import Path
 import numpy as np
 from tqdm import tqdm
@@ -63,7 +64,7 @@ class PatchSegmentationTrainer:
             eps=1e-8
         )
         
-        self.scheduler = torch.optim.ReduceLROnPlateau(
+        self.scheduler = ReduceLROnPlateau(
             self.optimizer, 
             mode='max',
             factor=0.5,
