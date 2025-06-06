@@ -36,7 +36,7 @@ class PatchSegmentationTrainer:
         # Initialize model
         self.model = SegmentationModel(
             in_channels=2,  # CT and kidney mask channels
-            out_channels=1,  # Single channel for tumor probability
+            out_channels=2,  # Two channels for background/tumor
             features=config.features
         ).to(self.device)
         
@@ -79,114 +79,6 @@ class PatchSegmentationTrainer:
         if config.resume_training:
             self._load_checkpoint()
 
-    def train(self, dataset_path: str):
-        try:
-            mp.set_start_method('spawn')
-        except RuntimeError:
-            pass
-
-        # Create training dataset
-        full_dataset = KiTS23VolumeDataset(dataset_path, self.config, preprocess=self.config.preprocess)
-        
-        # Split into train/val
-        val_size = int(len(full_dataset) * 0.2)
-        train_size = len(full_dataset) - val_size
-        train_dataset, val_dataset = random_split(
-            full_dataset, [train_size, val_size],
-            generator=torch.Generator().manual_seed(42)
-        )
-        
-        # Wrap training data in patch sampler
-        train_patch_dataset = KiTS23PatchDataset(
-            train_dataset,
-            patch_size=self.patch_size,
-            tumor_only_prob=self.tumor_only_prob,  # Use instance variable
-            debug=self.config.debug
-        )
-        
-        # Create data loaders
-        train_loader = DataLoader(
-            train_patch_dataset,
-            batch_size=self.batch_size,
-            shuffle=True,
-            num_workers=self.num_workers,
-            pin_memory=True,
-            persistent_workers=True
-        )
-        
-        # Keep validation on full volumes
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=1,
-            shuffle=False,
-            num_workers=2,
-            pin_memory=True,
-            persistent_workers=True
-        )
-
-        print(f"\nTraining configuration:")
-        print(f"Patch size: {self.patch_size}")
-        print(f"Batch size: {self.batch_size}")
-        print(f"Tumor sampling probability: {self.tumor_only_prob}")
-        print(f"Training patches per epoch: {len(train_loader)}")
-        print(f"Validation volumes: {len(val_dataset)}")
-
-        try:
-            for epoch in range(self.start_epoch, self.config.num_epochs):
-                self.current_epoch = epoch
-                
-                # Training phase
-                train_loss, train_stats = self._train_epoch(train_loader)
-                
-                # Validation phase
-                val_loss, val_dice = self._validate(val_loader)
-                
-                # Learning rate scheduling
-                self.scheduler.step(val_dice)
-                current_lr = self.optimizer.param_groups[0]['lr']
-                
-                # Log metrics
-                self._log_epoch(train_loss, train_stats, val_loss, val_dice, current_lr, epoch)
-                
-                # Save best model
-                is_best = val_dice > self.best_val_dice
-                if is_best:
-                    self.best_val_dice = val_dice
-                
-                self._save_checkpoint(
-                    epoch,
-                    {
-                        'loss': val_loss,
-                        'dice': val_dice
-                    },
-                    is_best=is_best
-                )
-                
-                # Visualize predictions periodically
-                if self.config.debug and epoch % 5 == 0:
-                    self._visualize_predictions(val_loader, epoch)
-
-        except KeyboardInterrupt:
-            print("\nTraining interrupted by user. Saving checkpoint...")
-            self._save_checkpoint(
-                self.current_epoch,
-                {'dice': self.best_val_dice},
-                is_best=False
-            )
-            print("Checkpoint saved. Exiting...")
-            sys.exit(0)
-            
-        except Exception as e:
-            print(f"\nError during training: {str(e)}")
-            print(f"Error type: {type(e).__name__}")
-            import traceback
-            traceback.print_exc()
-            raise
-        
-        self.writer.close()
-        print("\nTraining completed!")
-        print(f"Best validation Dice score: {self.best_val_dice:.4f}")
-
     def _train_epoch(self, train_loader):
         """Run one epoch of training"""
         self.model.train()
@@ -199,6 +91,7 @@ class PatchSegmentationTrainer:
         mean_probs = []
         max_probs = []
         dice_scores = []
+        skipped_batches = 0
         
         with tqdm(train_loader, desc=f"Epoch {self.current_epoch+1}/{self.config.num_epochs}") as pbar:
             for batch_idx, (images, tumor_masks, kidney_masks) in enumerate(pbar):
@@ -206,6 +99,13 @@ class PatchSegmentationTrainer:
                 images = images.to(device=self.device)
                 tumor_masks = tumor_masks.to(device=self.device)
                 kidney_masks = kidney_masks.to(device=self.device)
+                
+                # Skip patches with no kidney voxels
+                if kidney_masks.sum() == 0:
+                    if self.config.debug:
+                        print(f"\n[Warning] Skipping batch {batch_idx} (no kidney in patch)")
+                    skipped_batches += 1
+                    continue
                 
                 # Get CT and kidney channels
                 ct_images = images[:, 0:1].float()
@@ -218,6 +118,12 @@ class PatchSegmentationTrainer:
                 with torch.cuda.amp.autocast():
                     outputs = self.model(inputs)
                     loss = self.criterion(outputs, tumor_masks, kidney_masks)
+                
+                # Skip if loss is invalid
+                if not torch.isfinite(loss):
+                    print(f"\n[Warning] Skipping batch {batch_idx} (invalid loss: {loss.item()})")
+                    skipped_batches += 1
+                    continue
                 
                 # Backward pass with gradient clipping
                 self.optimizer.zero_grad()
@@ -259,13 +165,26 @@ class PatchSegmentationTrainer:
                     torch.cuda.empty_cache()
         
         # Calculate epoch statistics
-        avg_stats = {
-            'loss': train_loss / valid_batches if valid_batches > 0 else float('inf'),
-            'tumor_ratio': np.mean(tumor_ratios),
-            'mean_prob': np.mean(mean_probs),
-            'max_prob': np.mean(max_probs),
-            'dice_score': np.mean(dice_scores)
-        }
+        if valid_batches > 0:
+            avg_stats = {
+                'loss': train_loss / valid_batches,
+                'tumor_ratio': np.mean(tumor_ratios),
+                'mean_prob': np.mean(mean_probs),
+                'max_prob': np.mean(max_probs),
+                'dice_score': np.mean(dice_scores)
+            }
+        else:
+            print("\nWarning: No valid batches in epoch!")
+            avg_stats = {
+                'loss': float('inf'),
+                'tumor_ratio': 0,
+                'mean_prob': 0,
+                'max_prob': 0,
+                'dice_score': 0
+            }
+        
+        if skipped_batches > 0:
+            print(f"\nSkipped {skipped_batches} batches due to no kidney or invalid loss")
         
         return avg_stats['loss'], avg_stats
 
@@ -294,7 +213,26 @@ class PatchSegmentationTrainer:
                         outputs = self.model(inputs)
                         loss = self.criterion(outputs, tumor_masks, kidney_masks)
                         
+                        # Skip invalid loss
+                        if not torch.isfinite(loss):
+                            print(f"\n[Warning] Skipping validation batch (invalid loss)")
+                            continue
+                            
                         # Get predictions
+                        if isinstance(outputs, (list, tuple)):
+                            outputs = outputs[-1]  # Take last output if list/tuple
+                            
+                        if outputs.shape[1] == 2:  # Two-channel output
+                            outputs = outputs[:, 1:2]  # Take tumor channel
+                            
+                        if outputs.shape[2:] != tumor_masks.shape[2:]:
+                            outputs = F.interpolate(
+                                outputs,
+                                size=tumor_masks.shape[2:],
+                                mode='trilinear',
+                                align_corners=False
+                            )
+                        
                         probs = torch.sigmoid(outputs)
                         preds = (probs > 0.5).float()
                         
@@ -382,6 +320,20 @@ class PatchSegmentationTrainer:
             kidney_inputs = kidney_masks.float()
             inputs = torch.cat([ct_images, kidney_inputs], dim=1)
             outputs = self.model(inputs)
+            
+            # Handle model output
+            if isinstance(outputs, (list, tuple)):
+                outputs = outputs[-1]
+            if outputs.shape[1] == 2:
+                outputs = outputs[:, 1:2]
+            if outputs.shape[2:] != tumor_masks.shape[2:]:
+                outputs = F.interpolate(
+                    outputs,
+                    size=tumor_masks.shape[2:],
+                    mode='trilinear',
+                    align_corners=False
+                )
+                
             probs = torch.sigmoid(outputs)
             
             # Get middle slice
