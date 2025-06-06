@@ -11,10 +11,10 @@ from models.segmentation.config import SegmentationConfig
 
 # Default paths
 DEFAULT_DATA_DIR = "/workspace/RCC_Project/preprocessed_volumes"
-DEFAULT_OUTPUT_DIR = "experiments/patch_training"
+DEFAULT_OUTPUT_DIR = "experiments/patch_training_phase1"
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Train tumor segmentation model using patches')
+    parser = argparse.ArgumentParser(description='Train tumor segmentation model using patches (Phase 1: Smoke Test)')
     
     # Data paths
     parser.add_argument('--data_dir', type=str, default=DEFAULT_DATA_DIR,
@@ -27,8 +27,8 @@ def parse_args():
                       help='Patch dimensions as D,H,W (default: 64,128,128)')
     parser.add_argument('--batch_size', type=int, default=2,
                       help='Batch size for patch training (default: 2)')
-    parser.add_argument('--epochs', type=int, default=100,
-                      help='Number of epochs to train (default: 100)')
+    parser.add_argument('--epochs', type=int, default=10,  # Reduced for Phase 1
+                      help='Number of epochs to train (default: 10)')
     parser.add_argument('--tumor_prob', type=float, default=0.7,
                       help='Probability of sampling tumor-centered patches (default: 0.7)')
     
@@ -85,7 +85,7 @@ def main():
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     
-    print("\nTraining Configuration:")
+    print("\nTraining Configuration (Phase 1: Smoke Test)")
     print("-----------------------")
     print(f"PyTorch version: {torch.__version__}")
     print(f"Using device: {torch.device('cuda' if torch.cuda.is_available() else 'cpu')}")
@@ -99,6 +99,7 @@ def main():
     config.num_epochs = args.epochs
     config.resume_training = args.resume
     config.debug = args.debug
+    config.preprocess = False  # Skip preprocessing for Phase 1
     
     # Create output directories
     config.output_dir.mkdir(exist_ok=True, parents=True)
@@ -145,6 +146,12 @@ def main():
     print("\nOptimizer Configuration:")
     print(f"Learning rate: {args.learning_rate}")
     print(f"Weight decay: {args.weight_decay}")
+    
+    print("\nPhase 1 Notes:")
+    print("- Using dummy (all-ones) kidney masks")
+    print("- CT channel only (1-channel input)")
+    print("- Running smoke test for gradient flow")
+    print("- Monitoring loss and Dice scores")
     
     if args.debug:
         print("\nDebug mode enabled - will show additional output and visualizations")

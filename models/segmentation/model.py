@@ -1,328 +1,145 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import autocast
 
-class ConvDropoutNormNonlin(nn.Module):
-    def __init__(self, in_channels, out_channels, 
-                 conv_op=nn.Conv3d, norm_op=nn.InstanceNorm3d):
+class DoubleConv(nn.Module):
+    """Double convolution block"""
+    def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
-        self.conv = conv_op(in_channels, out_channels, 3, padding=1)
-        self.norm = norm_op(out_channels)
-        self.nonlin = nn.LeakyReLU(inplace=True)
-        self.dropout = nn.Dropout3d(p=0.1)
-
-    def forward(self, x):
-        # Ensure input is float32
-        x = x.to(dtype=torch.float32)
-        x = self.conv(x)
-        x = self.norm(x)
-        x = self.nonlin(x)
-        x = self.dropout(x)
-        return x
-
-class SpatialAttention(nn.Module):
-    def __init__(self, in_channels):
-        super().__init__()
-        self.conv = nn.Conv3d(in_channels, 1, kernel_size=1)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        attention = self.sigmoid(self.conv(x))
-        return x * attention
-
-class ChannelAttention(nn.Module):
-    def __init__(self, in_channels, reduction=16):
-        super().__init__()
-        self.avg_pool = nn.AdaptiveAvgPool3d(1)
-        self.max_pool = nn.AdaptiveMaxPool3d(1)
-        self.fc = nn.Sequential(
-            nn.Linear(in_channels, in_channels // reduction),
+        self.double_conv = nn.Sequential(
+            nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm3d(out_channels),
             nn.ReLU(inplace=True),
-            nn.Linear(in_channels // reduction, in_channels)
+            nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm3d(out_channels),
+            nn.ReLU(inplace=True)
         )
-        self.sigmoid = nn.Sigmoid()
 
-    def forward(self, x):
-        avg_out = self.fc(self.avg_pool(x).view(x.size(0), -1))
-        max_out = self.fc(self.max_pool(x).view(x.size(0), -1))
-        out = self.sigmoid(avg_out + max_out).view(x.size(0), x.size(1), 1, 1, 1)
-        return x * out
-
-class DownBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, n_convs=2):
-        super().__init__()
-        ops = []
-        for i in range(n_convs):
-            channels = in_channels if i == 0 else out_channels
-            ops.append(ConvDropoutNormNonlin(channels, out_channels))
-        self.conv_block = nn.Sequential(*ops)
-        self.pool = nn.MaxPool3d(2)
-        self.channel_attention = ChannelAttention(out_channels)
-        self.spatial_attention = SpatialAttention(out_channels)
-
-    def forward(self, x):
-        x = self.conv_block(x)
-        x = self.channel_attention(x)
-        x = self.spatial_attention(x)
-        return self.pool(x), x
-
-class UpBlock(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.upconv = nn.ConvTranspose3d(in_channels, out_channels, 
-                                      kernel_size=2, stride=2)
-        self.reduce_skip = nn.Conv3d(in_channels, out_channels, kernel_size=1)
-        self.attention_gate = AttentionGate(F_g=out_channels, F_l=out_channels, F_int=out_channels//2)
-        
-        if in_channels == 320:
-            concat_channels = 576  # From checkpoint
-        elif in_channels == 256:
-            concat_channels = 384  # From checkpoint
-        elif in_channels == 128:
-            concat_channels = 192  # From checkpoint
-        elif in_channels == 64:
-            concat_channels = 96   # From checkpoint
-        else:
-            concat_channels = out_channels * 2  # Fallback
-            
-        self.expand_concat = nn.Conv3d(out_channels * 2, concat_channels, kernel_size=1)
-        self.conv_block = nn.Sequential(
-            ConvDropoutNormNonlin(concat_channels, out_channels),
-            ConvDropoutNormNonlin(out_channels, out_channels)
-        )
-        self.channel_attention = ChannelAttention(out_channels)
-        self.spatial_attention = SpatialAttention(out_channels)
-
-    def forward(self, x, skip):
-        # Memory efficient upsampling
-        x = self.upconv(x)
-        if x.shape != skip.shape:
-            x = F.interpolate(x, skip.shape[2:], mode='trilinear', align_corners=False)
-        
-        # Process skip connection
-        skip = self.reduce_skip(skip)
-        skip = self.attention_gate(x, skip)
-        
-        # Concatenate and process
-        x = torch.cat((skip, x), dim=1)
-        del skip  # Free memory
-        
-        x = self.expand_concat(x)
-        x = self.conv_block(x)
-        x = self.channel_attention(x)
-        x = self.spatial_attention(x)
-        return x
-
-class AttentionGate(nn.Module):
-    def __init__(self, F_g, F_l, F_int):
-        super().__init__()
-        self.W_g = nn.Sequential(
-            nn.Conv3d(F_g, F_int, kernel_size=1),
-            nn.BatchNorm3d(F_int)
-        )
-        self.W_x = nn.Sequential(
-            nn.Conv3d(F_l, F_int, kernel_size=1),
-            nn.BatchNorm3d(F_int)
-        )
-        self.psi = nn.Sequential(
-            nn.Conv3d(F_int, 1, kernel_size=1),
-            nn.BatchNorm3d(1),
-            nn.Sigmoid()
-        )
-        self.relu = nn.ReLU(inplace=True)
-
-    def forward(self, g, x):
-        g1 = self.W_g(g)
-        x1 = self.W_x(x)
-        psi = self.relu(g1 + x1)
-        psi = self.psi(psi)
-        return x * psi
-
-class DeepSupervisionHead(nn.Module):
-    def __init__(self, in_channels, out_channels, scale_factor):
-        super().__init__()
-        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size=1)
-        self.scale_factor = scale_factor
-
-    def forward(self, x):
-        x = self.conv(x)
-        if self.scale_factor > 1:
-            x = F.interpolate(x, scale_factor=self.scale_factor, mode='trilinear', align_corners=False)
-        return x
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.double_conv(x)
 
 class SegmentationModel(nn.Module):
-    def __init__(self, in_channels=1, out_channels=2, 
-                 features=(32, 64, 128, 256, 320)):
+    """
+    U-Net style segmentation model optimized for single-channel CT input.
+    
+    Phase 1 configuration:
+    - Single channel input (CT only)
+    - Single channel output (tumor probability)
+    - No assumption about kidney masks
+    """
+    def __init__(self, 
+                in_channels: int = 1,  # Default to single channel (CT)
+                out_channels: int = 1,  # Single channel output (tumor)
+                features: int = 32):    # Base feature channels
         super().__init__()
         
-        # Ensure model is initialized in float32
-        torch.set_default_dtype(torch.float32)
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.features = features
         
-        # Encoder
-        self.down_blocks = nn.ModuleList()
-        current_channels = in_channels
-        for feature in features:
-            self.down_blocks.append(DownBlock(current_channels, feature))
-            current_channels = feature
-
+        # Verify valid input configuration
+        if in_channels != 1:
+            print(f"Warning: Expected in_channels=1 for Phase 1 (CT only), got {in_channels}")
+        
+        # Encoder (downsampling path)
+        self.enc1 = DoubleConv(in_channels, features)
+        self.enc2 = DoubleConv(features, features * 2)
+        self.enc3 = DoubleConv(features * 2, features * 4)
+        self.enc4 = DoubleConv(features * 4, features * 8)
+        
         # Bottleneck
-        self.bottleneck = nn.Sequential(
-            ConvDropoutNormNonlin(features[-1], features[-1]),
-            ChannelAttention(features[-1]),
-            SpatialAttention(features[-1])
-        )
-
-        # Decoder with deep supervision and attention
-        self.up_blocks = nn.ModuleList()
-        self.deep_supervision = nn.ModuleList()
+        self.bottleneck = DoubleConv(features * 8, features * 16)
         
-        features = list(reversed(features))
-        scales = [8, 4, 2, 1]  # Scale factors for deep supervision
-        for i in range(len(features) - 1):
-            self.up_blocks.append(UpBlock(features[i], features[i + 1]))
-            # Always output 2 channels (background + tumor) for deep supervision
-            self.deep_supervision.append(
-                DeepSupervisionHead(features[i + 1], 2, scales[i])
+        # Decoder (upsampling path)
+        self.up4 = DoubleConv(features * 16, features * 8)
+        self.up3 = DoubleConv(features * 8, features * 4)
+        self.up2 = DoubleConv(features * 4, features * 2)
+        self.up1 = DoubleConv(features * 2, features)
+        
+        # Final 1x1 convolution to get output channels
+        self.final_conv = nn.Conv3d(features, out_channels, kernel_size=1)
+        
+        # Max pooling for downsampling
+        self.pool = nn.MaxPool3d(2)
+        
+        # Print model configuration
+        self._print_config()
+        
+    def _print_config(self):
+        """Print model configuration details"""
+        print("\nSegmentation Model Configuration:")
+        print(f"Input channels: {self.in_channels} (CT only)")
+        print(f"Output channels: {self.out_channels} (tumor probability)")
+        print(f"Base features: {self.features}")
+        print(f"Encoder depths: {self.features} → {self.features*2} → {self.features*4} → {self.features*8}")
+        print(f"Bottleneck features: {self.features*16}")
+        
+        # Calculate approximate number of parameters
+        num_params = sum(p.numel() for p in self.parameters())
+        print(f"Total parameters: {num_params:,}")
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass through U-Net
+        
+        Args:
+            x: Input tensor [B, 1, D, H, W] (single channel CT)
+            
+        Returns:
+            Output tensor [B, 1, D, H, W] (tumor probability logits)
+        """
+        # Input validation
+        if x.shape[1] != self.in_channels:
+            raise ValueError(
+                f"Expected input with {self.in_channels} channels, got {x.shape[1]} channels.\n"
+                f"Input shape: {tuple(x.shape)}"
             )
-
-        # Final convolution always outputs 2 channels (background + tumor)
-        self.final_conv = nn.Conv3d(features[-1], 2, 1)
         
-        # Initialize final conv bias for moderately conservative tumor predictions
-        self.final_conv.bias.data = self.final_conv.bias.data.to(torch.float32)
-        torch.nn.init.constant_(self.final_conv.bias, -3.5)  # sigmoid(-3.5) ≈ 0.03
+        # Save input spatial dimensions for size validation
+        input_size = x.shape[2:]
         
-        # Progressive learning weights for deep supervision
-        self.progressive_weights = nn.Parameter(torch.tensor([1.0, 0.8, 0.6, 0.4, 0.2], dtype=torch.float32))
-        self.softmax = nn.Softmax(dim=0)
+        # Encoder path with skip connections
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+        e4 = self.enc4(self.pool(e3))
         
-        # Enable gradient checkpointing by default
-        self.use_checkpointing = True
+        # Bottleneck
+        b = self.bottleneck(self.pool(e4))
         
-        # For Grad-CAM
-        self.target_layer = None
-        self.gradients = None
-        self.activations = None
+        # Decoder path with skip connections
+        # Interpolate bottleneck up to e4 size
+        d4 = self.up4(torch.cat([
+            F.interpolate(b, size=e4.shape[2:], mode='trilinear', align_corners=False),
+            e4
+        ], dim=1))
         
-        # Convert all parameters to float32
-        for param in self.parameters():
-            param.data = param.data.to(torch.float32)
-    
-    def _get_activation(self, module, input, output):
-        self.activations = output
-    
-    def _get_gradient(self, module, input_grad, output_grad):
-        self.gradients = output_grad[0]
-    
-    def set_target_layer(self, layer_name):
-        if hasattr(self, layer_name):
-            target_layer = getattr(self, layer_name)
-            target_layer.register_forward_hook(self._get_activation)
-            target_layer.register_full_backward_hook(self._get_gradient)
-            self.target_layer = target_layer
-
-    def get_output_stats(self, x):
-        """Get statistics about model outputs for monitoring"""
-        with torch.no_grad():
-            outputs = self.forward(x)
-            if isinstance(outputs, (list, tuple)):
-                outputs = outputs[-1]
-            
-            probs = torch.softmax(outputs, dim=1)
-            tumor_probs = probs[:, 1]  # Get tumor channel probabilities
-            
-            stats = {
-                'logits_min': outputs.min().item(),
-                'logits_max': outputs.max().item(),
-                'tumor_prob_min': tumor_probs.min().item(),
-                'tumor_prob_max': tumor_probs.max().item(),
-                'tumor_prob_mean': tumor_probs.mean().item(),
-                'tumor_prob_std': tumor_probs.std().item(),
-                'tumor_voxels_gt_50': (tumor_probs > 0.5).float().sum().item(),
-                'tumor_voxels_gt_10': (tumor_probs > 0.1).float().sum().item(),
-            }
-            return stats
-
-    def compute_soft_dice(self, outputs, targets, kidney_masks):
-        """Compute soft Dice score without thresholding"""
-        with torch.no_grad():
-            probs = torch.softmax(outputs, dim=1)[:, 1:]  # Get tumor probabilities
-            
-            # Ensure correct dimensions
-            if len(targets.shape) == len(probs.shape) - 1:
-                targets = targets.unsqueeze(1)
-            
-            if len(kidney_masks.shape) == len(probs.shape) - 1:
-                kidney_masks = kidney_masks.unsqueeze(1)
-            
-            # Apply kidney mask
-            probs = probs * kidney_masks
-            targets = targets * kidney_masks
-            
-            # Compute soft Dice
-            intersection = (probs * targets).sum()
-            union = probs.sum() + targets.sum()
-            soft_dice = (2. * intersection + 1e-5) / (union + 1e-5)
-            
-            return {
-                'soft_dice': soft_dice.item(),
-                'avg_tumor_prob': probs.mean().item(),
-                'intersection': intersection.item(),
-                'union': union.item()
-            }
-
-    @autocast()
-    def forward(self, x):
-        # Ensure input is float32
-        x = x.to(dtype=torch.float32)
+        # Continue upsampling and concatenating
+        d3 = self.up3(torch.cat([
+            F.interpolate(d4, size=e3.shape[2:], mode='trilinear', align_corners=False),
+            e3
+        ], dim=1))
         
-        if self.training:
-            weights = self.softmax(self.progressive_weights)
+        d2 = self.up2(torch.cat([
+            F.interpolate(d3, size=e2.shape[2:], mode='trilinear', align_corners=False),
+            e2
+        ], dim=1))
         
-        skip_connections = []
-        for i, down_block in enumerate(self.down_blocks[:-1]):
-            if self.use_checkpointing and self.training:
-                x, skip = torch.utils.checkpoint.checkpoint(down_block, x, use_reentrant=False)
-            else:
-                x, skip = down_block(x)
-            skip_connections.append(skip)
+        d1 = self.up1(torch.cat([
+            F.interpolate(d2, size=e1.shape[2:], mode='trilinear', align_corners=False),
+            e1
+        ], dim=1))
         
-        if self.use_checkpointing and self.training:
-            x, skip = torch.utils.checkpoint.checkpoint(self.down_blocks[-1], x, use_reentrant=False)
-            x = torch.utils.checkpoint.checkpoint(self.bottleneck, x, use_reentrant=False)
-        else:
-            x, skip = self.down_blocks[-1](x)
-            x = self.bottleneck(x)
-            
-        skip_connections.append(skip)
-        skip_connections = skip_connections[::-1]  # Reverse for decoder
-
-        deep_outputs = []
-        for i, up_block in enumerate(self.up_blocks):
-            if self.use_checkpointing and self.training:
-                x = torch.utils.checkpoint.checkpoint(up_block, x, skip_connections[i], use_reentrant=False)
-            else:
-                x = up_block(x, skip_connections[i])
-                
-            if self.training:
-                deep_out = self.deep_supervision[i](x)
-                deep_outputs.append(deep_out)
-
-            skip_connections[i] = None
-
-        output = self.final_conv(x)
-
-        if self.training:
-            outputs = [output] + deep_outputs
-            weighted_outputs = [out * weight for out, weight in zip(outputs, weights)]
-            return weighted_outputs
-        return output
-
-    def enable_checkpointing(self):
-        """Enable gradient checkpointing for memory efficiency"""
-        self.use_checkpointing = True
-
-    def disable_checkpointing(self):
-        """Disable gradient checkpointing"""
-        self.use_checkpointing = False
+        # Final convolution
+        out = self.final_conv(d1)
+        
+        # Verify output size matches input
+        if out.shape[2:] != input_size:
+            out = F.interpolate(
+                out, 
+                size=input_size,
+                mode='trilinear',
+                align_corners=False
+            )
+        
+        return out
