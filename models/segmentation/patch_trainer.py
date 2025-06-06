@@ -22,6 +22,8 @@ from dataset_volume import KiTS23VolumeDataset
 logger = logging.getLogger(__name__)
 
 class PatchSegmentationTrainer:
+    """Trainer for patch-based segmentation model"""
+    
     def __init__(self, config):
         self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -33,10 +35,7 @@ class PatchSegmentationTrainer:
             torch.cuda.set_per_process_memory_fraction(0.95)
             torch.backends.cudnn.benchmark = True
         
-        # Create checkpoint directory
-        self.config.checkpoint_dir.mkdir(exist_ok=True)
-        
-        # Initialize model
+        # Create model
         self.model = SegmentationModel(
             in_channels=1,  # CT only
             out_channels=1,  # Single channel output (tumor)
@@ -52,6 +51,9 @@ class PatchSegmentationTrainer:
         self.start_epoch = 0
         self.current_epoch = 0
         self.best_val_dice = float('-inf')
+        
+        # Create checkpoint directory
+        self.config.checkpoint_dir.mkdir(exist_ok=True)
         
         # Initialize training components
         self.criterion = WeightedDiceBCELoss(
@@ -85,27 +87,20 @@ class PatchSegmentationTrainer:
         elif config.resume_training:
             self._load_latest_checkpoint()
 
-    def train(self, dataset_path: str):
+    def train(self, dataset_path):
         """Main training loop"""
         try:
             mp.set_start_method('spawn')
         except RuntimeError:
             pass
 
-        # Create training dataset
-        full_dataset = KiTS23VolumeDataset(dataset_path, self.config, preprocess=self.config.preprocess)
+        # Create volume dataset and split train/val
+        volume_dataset = KiTS23VolumeDataset(dataset_path, self.config)
+        train_dataset, val_dataset = volume_dataset.get_train_val_splits(val_ratio=0.2)
         
-        # Split into train/val
-        val_size = int(len(full_dataset) * 0.2)
-        train_size = len(full_dataset) - val_size
-        train_dataset, val_dataset = random_split(
-            full_dataset, [train_size, val_size],
-            generator=torch.Generator().manual_seed(42)
-        )
-        
-        # Create patch datasets for training and validation
+        # Create patch datasets
         train_patch_dataset = KiTS23PatchDataset(
-            train_dataset,
+            dataset_path,  # Use path directly
             patch_size=self.patch_size,
             tumor_only_prob=self.tumor_only_prob,
             use_kidney_mask=self.config.use_kidney_mask,
@@ -115,7 +110,7 @@ class PatchSegmentationTrainer:
         )
         
         val_patch_dataset = KiTS23PatchDataset(
-            val_dataset,
+            dataset_path,  # Use path directly
             patch_size=self.patch_size,
             tumor_only_prob=0.5,  # Equal sampling for validation
             use_kidney_mask=self.config.use_kidney_mask,
@@ -124,7 +119,11 @@ class PatchSegmentationTrainer:
             debug=False
         )
         
-        # Create data loaders with worker initialization
+        # Set volume paths based on splits
+        train_patch_dataset.volume_paths = train_dataset.volume_paths
+        val_patch_dataset.volume_paths = val_dataset.volume_paths
+        
+        # Create data loaders
         train_loader = DataLoader(
             train_patch_dataset,
             batch_size=self.batch_size,
@@ -137,7 +136,7 @@ class PatchSegmentationTrainer:
         
         val_loader = DataLoader(
             val_patch_dataset,
-            batch_size=self.batch_size * 2,  # Larger batch size for validation
+            batch_size=self.batch_size * 2,
             shuffle=False,
             num_workers=2,
             pin_memory=True,
@@ -145,15 +144,54 @@ class PatchSegmentationTrainer:
             worker_init_fn=worker_init_fn
         )
 
-        print(f"\nTraining configuration ({self.config.get_phase_name()}):")
+        print(f"\nTraining Configuration ({self.config.get_phase_name()})")
+        print("-----------------------")
+        print(f"PyTorch version: {torch.__version__}")
+        print(f"Using device: {self.device}")
+        
+        print("\nSegmentation Model Configuration:")
+        print(f"Input channels: 1 (CT only)")
+        print(f"Output channels: 1 (tumor probability)")
+        print(f"Base features: {self.config.features}")
+        print(f"Encoder depths: 32 → 64 → 128 → 256")
+        print(f"Bottleneck features: 512")
+        print(f"Total parameters: {sum(p.numel() for p in self.model.parameters()):,}")
+        
+        if self.config.checkpoint_path:
+            print(f"Loading checkpoint: {self.config.checkpoint_path}")
+            print(f"Resuming training from epoch {self.start_epoch}")
+            
+        if self.config.use_kidney_mask:
+            print("Phase 2 parameters:")
+            print(f"  min_kidney_voxels: {self.config.min_kidney_voxels}")
+            print(f"  kidney_patch_overlap: {self.config.kidney_patch_overlap}")
+            
+        print("\nModel Configuration:")
         print(f"Patch size: {self.patch_size}")
         print(f"Batch size: {self.batch_size}")
+        print(f"Number of workers: {self.num_workers}")
+        print(f"Gradient clipping: {self.max_grad_norm}")
         print(f"Tumor sampling probability: {self.tumor_only_prob}")
+        
+        print("\nLoss Configuration:")
+        print(f"Positive class weight: {self.criterion.bce.pos_weight.item()}")
+        print(f"Dice loss weight: {self.criterion.dice_weight}")
+        print(f"BCE loss weight: {self.criterion.bce_weight}")
+        
+        print("\nOptimizer Configuration:")
+        print(f"Learning rate: {self.optimizer.param_groups[0]['lr']}")
+        print(f"Weight decay: {self.optimizer.param_groups[0]['weight_decay']}")
+        
         if self.config.use_kidney_mask:
+            print("\nPhase 2 Configuration:")
             print(f"Minimum kidney voxels: {self.config.min_kidney_voxels}")
-            print(f"Required kidney overlap: {self.config.kidney_patch_overlap:.1%}")
-        print(f"Training patches per epoch: {len(train_loader)}")
-        print(f"Validation patches per epoch: {len(val_loader)}")
+            print(f"Required kidney overlap: {self.config.kidney_patch_overlap*100:.1f}%")
+            
+        if self.config.checkpoint_path:
+            print(f"\nResuming from checkpoint: {self.config.checkpoint_path}")
+            
+        if self.config.debug:
+            print("\nDebug mode enabled - will show additional output and visualizations")
 
         try:
             signal.signal(signal.SIGINT, self._handle_interrupt)
@@ -364,119 +402,6 @@ class PatchSegmentationTrainer:
         return (val_loss / valid_batches if valid_batches > 0 else float('inf'),
                 val_dice / valid_batches if valid_batches > 0 else 0)
 
-    def _calculate_dice(self, 
-                      pred: torch.Tensor,
-                      target: torch.Tensor,
-                      mask: torch.Tensor,
-                      smooth: float = 1e-5) -> float:
-        """Calculate Dice score for predictions"""
-        with torch.no_grad():
-            # Apply mask if in Phase 2
-            if self.config.use_kidney_mask:
-                pred = pred * mask
-                target = target * mask
-            
-            # Calculate Dice
-            intersection = (pred * target).sum()
-            union = pred.sum() + target.sum()
-            
-            dice = (2. * intersection + smooth) / (union + smooth)
-            return dice.item()
-
-    def _log_batch_stats(self, stats: dict, batch_idx: int, epoch: int):
-        """Log detailed batch statistics"""
-        step = epoch * 1000 + batch_idx
-        
-        # Log all statistics
-        for key, value in stats.items():
-            self.writer.add_scalar(f'Batch/{key}', value, step)
-
-    def _log_epoch(self, train_loss, train_stats, val_loss, val_dice, lr, epoch):
-        """Log epoch-level metrics"""
-        # Add scalars to tensorboard
-        self.writer.add_scalar('Loss/Train', train_loss, epoch)
-        self.writer.add_scalar('Loss/Val', val_loss, epoch)
-        self.writer.add_scalar('Dice/Val', val_dice, epoch)
-        self.writer.add_scalar('LearningRate', lr, epoch)
-        
-        # Add training statistics
-        for key, value in train_stats.items():
-            if key != 'loss':  # Already logged above
-                self.writer.add_scalar(f'Train/{key}', value, epoch)
-        
-        # Print summary
-        print(f"\nEpoch {epoch+1}/{self.config.num_epochs}")
-        print(f"Train - Loss: {train_loss:.4f}, Dice: {train_stats['dice_score']:.4f}")
-        if 'kidney_ratio' in train_stats:
-            print(f"       Kidney ratio: {train_stats['kidney_ratio']:.4%}")
-        print(f"Val   - Loss: {val_loss:.4f}, Dice: {val_dice:.4f}")
-        print(f"Learning Rate: {lr:.6f}")
-        print(f"Mean tumor ratio: {train_stats['tumor_ratio']:.4%}")
-
-    def _visualize_predictions(self, val_loader, epoch):
-        """Visualize predictions on validation data"""
-        self.model.eval()
-        
-        # Get first validation batch
-        images, tumor_masks, kidney_masks = next(iter(val_loader))
-        images = images.to(self.device)
-        tumor_masks = tumor_masks.to(self.device)
-        kidney_masks = kidney_masks.to(self.device)
-        
-        with torch.no_grad():
-            # Get predictions
-            inputs = images[:, 0:1].float()
-            outputs = self.model(inputs)
-            
-            # Ensure output shape matches target
-            if outputs.shape[2:] != tumor_masks.shape[2:]:
-                outputs = F.interpolate(
-                    outputs,
-                    size=tumor_masks.shape[2:],
-                    mode='trilinear',
-                    align_corners=False
-                )
-                
-            # Get probabilities
-            probs = torch.sigmoid(outputs)
-            
-            # Get middle slice for visualization
-            slice_idx = probs.shape[2] // 2
-            
-            # Create figure with subplots (4 in Phase 2, 3 in Phase 1)
-            n_plots = 4 if self.config.use_kidney_mask else 3
-            fig, axes = plt.subplots(1, n_plots, figsize=(5*n_plots, 5))
-            
-            # Plot CT
-            axes[0].imshow(images[0, 0, slice_idx].cpu(), cmap='gray')
-            axes[0].set_title('CT')
-            axes[0].axis('off')
-            
-            # Plot ground truth tumor
-            axes[1].imshow(tumor_masks[0, 0, slice_idx].cpu(), cmap='gray')
-            axes[1].set_title('Ground Truth')
-            axes[1].axis('off')
-            
-            if self.config.use_kidney_mask:
-                # Plot kidney mask
-                axes[2].imshow(kidney_masks[0, 0, slice_idx].cpu(), cmap='gray')
-                axes[2].set_title('Kidney Mask')
-                axes[2].axis('off')
-                
-                # Plot prediction
-                axes[3].imshow(probs[0, 0, slice_idx].cpu(), cmap='gray')
-                axes[3].set_title(f'Prediction (Epoch {epoch+1})')
-                axes[3].axis('off')
-            else:
-                # Plot prediction
-                axes[2].imshow(probs[0, 0, slice_idx].cpu(), cmap='gray')
-                axes[2].set_title(f'Prediction (Epoch {epoch+1})')
-                axes[2].axis('off')
-            
-            # Add to tensorboard
-            self.writer.add_figure('Predictions', fig, epoch)
-            plt.close(fig)
-
     def _save_checkpoint(self, epoch: int, metrics: dict, is_best: bool = False):
         """Save training checkpoint"""
         checkpoint = {
@@ -508,7 +433,7 @@ class PatchSegmentationTrainer:
             print(f"Saved best model with Dice: {metrics['dice']:.4f}")
 
     def _load_checkpoint(self, checkpoint_path: str):
-        """Load training checkpoint from specific path"""
+        """Load training checkpoint"""
         if not Path(checkpoint_path).exists():
             logger.error(f"No checkpoint found at {checkpoint_path}")
             return
@@ -575,3 +500,97 @@ class PatchSegmentationTrainer:
         )
         print("Checkpoint saved. Exiting gracefully.")
         sys.exit(0)
+
+    def _visualize_predictions(self, val_loader, epoch):
+        """Create visualization of current predictions"""
+        self.model.eval()
+        
+        # Get first validation batch
+        images, tumor_masks, kidney_masks = next(iter(val_loader))
+        images = images.to(self.device)
+        tumor_masks = tumor_masks.to(self.device)
+        kidney_masks = kidney_masks.to(self.device)
+        
+        with torch.no_grad():
+            # Get predictions
+            inputs = images[:, 0:1].float()
+            outputs = self.model(inputs)
+            
+            # Ensure output shape matches target
+            if outputs.shape[2:] != tumor_masks.shape[2:]:
+                outputs = F.interpolate(
+                    outputs,
+                    size=tumor_masks.shape[2:],
+                    mode='trilinear',
+                    align_corners=False
+                )
+                
+            # Get probabilities
+            probs = torch.sigmoid(outputs)
+            
+            # Get middle slice for visualization
+            slice_idx = probs.shape[2] // 2
+            
+            # Create figure with subplots (4 in Phase 2, 3 in Phase 1)
+            n_plots = 4 if self.config.use_kidney_mask else 3
+            fig, axes = plt.subplots(1, n_plots, figsize=(5*n_plots, 5))
+            
+            # Plot CT
+            axes[0].imshow(images[0, 0, slice_idx].cpu(), cmap='gray')
+            axes[0].set_title('CT')
+            axes[0].axis('off')
+            
+            # Plot ground truth tumor
+            axes[1].imshow(tumor_masks[0, 0, slice_idx].cpu(), cmap='gray')
+            axes[1].set_title('Ground Truth')
+            axes[1].axis('off')
+            
+            if self.config.use_kidney_mask:
+                # Plot kidney mask
+                axes[2].imshow(kidney_masks[0, 0, slice_idx].cpu(), cmap='gray')
+                axes[2].set_title('Kidney Mask')
+                axes[2].axis('off')
+                
+                # Plot prediction
+                axes[3].imshow(probs[0, 0, slice_idx].cpu(), cmap='gray')
+                axes[3].set_title(f'Prediction (Epoch {epoch+1})')
+                axes[3].axis('off')
+            else:
+                # Plot prediction
+                axes[2].imshow(probs[0, 0, slice_idx].cpu(), cmap='gray')
+                axes[2].set_title(f'Prediction (Epoch {epoch+1})')
+                axes[2].axis('off')
+            
+            # Add to tensorboard
+            self.writer.add_figure('Predictions', fig, epoch)
+            plt.close(fig)
+
+    def _log_batch_stats(self, stats: dict, batch_idx: int, epoch: int):
+        """Log detailed batch statistics"""
+        step = epoch * 1000 + batch_idx
+        
+        # Log all statistics
+        for key, value in stats.items():
+            self.writer.add_scalar(f'Batch/{key}', value, step)
+
+    def _log_epoch(self, train_loss, train_stats, val_loss, val_dice, lr, epoch):
+        """Log epoch-level metrics"""
+        # Add scalars to tensorboard
+        self.writer.add_scalar('Loss/Train', train_loss, epoch)
+        self.writer.add_scalar('Loss/Val', val_loss, epoch)
+        self.writer.add_scalar('Dice/Val', val_dice, epoch)
+        self.writer.add_scalar('LearningRate', lr, epoch)
+        
+        # Add training statistics
+        for key, value in train_stats.items():
+            if key != 'loss':  # Already logged above
+                self.writer.add_scalar(f'Train/{key}', value, epoch)
+        
+        # Print summary
+        print(f"\nEpoch {epoch+1}/{self.config.num_epochs}")
+        print(f"Train - Loss: {train_loss:.4f}, Dice: {train_stats['dice_score']:.4f}")
+        if 'kidney_ratio' in train_stats:
+            print(f"       Kidney ratio: {train_stats['kidney_ratio']:.4%}")
+        print(f"Val   - Loss: {val_loss:.4f}, Dice: {val_dice:.4f}")
+        print(f"Learning Rate: {lr:.6f}")
+        print(f"Mean tumor ratio: {train_stats['tumor_ratio']:.4%}")
