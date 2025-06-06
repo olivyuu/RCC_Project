@@ -9,14 +9,18 @@ matplotlib.use('Agg')  # For servers without display
 from models.segmentation.patch_trainer import PatchSegmentationTrainer
 from models.segmentation.config import SegmentationConfig
 
+# Default paths
+DEFAULT_DATA_DIR = "/workspace/RCC_Project/preprocessed_volumes"
+DEFAULT_OUTPUT_DIR = "experiments/patch_training"
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Train tumor segmentation model using patches')
     
     # Data paths
-    parser.add_argument('--data_dir', type=str, required=True,
-                      help='Path to preprocessed volume data')
-    parser.add_argument('--output_dir', type=str, required=True,
-                      help='Directory to save checkpoints and logs')
+    parser.add_argument('--data_dir', type=str, default=DEFAULT_DATA_DIR,
+                      help=f'Path to preprocessed volume data (default: {DEFAULT_DATA_DIR})')
+    parser.add_argument('--output_dir', type=str, default=DEFAULT_OUTPUT_DIR,
+                      help=f'Directory to save checkpoints and logs (default: {DEFAULT_OUTPUT_DIR})')
     
     # Training settings
     parser.add_argument('--patch_size', type=str, default='64,128,128',
@@ -54,7 +58,23 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=42,
                       help='Random seed for reproducibility (default: 42)')
     
-    return parser.parse_args()
+    args = parser.parse_args()
+    
+    # Convert paths to absolute paths
+    args.data_dir = str(Path(args.data_dir).resolve())
+    args.output_dir = str(Path(args.output_dir).resolve())
+    
+    # Verify data directory exists and contains .pt files
+    data_path = Path(args.data_dir)
+    if not data_path.exists():
+        raise FileNotFoundError(f"Data directory not found: {args.data_dir}")
+    
+    pt_files = list(data_path.glob('*.pt'))
+    if not pt_files:
+        raise ValueError(f"No .pt files found in {args.data_dir}")
+    print(f"Found {len(pt_files)} .pt files in: {args.data_dir}")
+    
+    return args
 
 def main():
     args = parse_args()
