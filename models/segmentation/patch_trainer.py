@@ -35,9 +35,9 @@ class PatchSegmentationTrainer:
         
         # Initialize model
         self.model = SegmentationModel(
-            in_channels=1,  # CT channel only
+            in_channels=1,  # CT only
             out_channels=1,  # Single channel output (tumor)
-            features=self.config.features  # Pass scalar feature value
+            features=self.config.features  # Base feature channels
         ).to(self.device)
         
         # Training settings
@@ -76,8 +76,11 @@ class PatchSegmentationTrainer:
         self.scaler = GradScaler()
         self.writer = SummaryWriter(log_dir=config.log_dir)
         
-        if config.resume_training:
-            self._load_checkpoint()
+        # Load checkpoint if specified
+        if config.checkpoint_path:
+            self._load_checkpoint(config.checkpoint_path)
+        elif config.resume_training:
+            self._load_latest_checkpoint()
 
     def train(self, dataset_path: str):
         """Main training loop"""
@@ -102,6 +105,9 @@ class PatchSegmentationTrainer:
             train_dataset,
             patch_size=self.patch_size,
             tumor_only_prob=self.tumor_only_prob,
+            use_kidney_mask=self.config.use_kidney_mask,
+            min_kidney_voxels=self.config.min_kidney_voxels if hasattr(self.config, 'min_kidney_voxels') else 100,
+            kidney_patch_overlap=self.config.kidney_patch_overlap if hasattr(self.config, 'kidney_patch_overlap') else 0.5,
             debug=self.config.debug
         )
         
@@ -124,10 +130,13 @@ class PatchSegmentationTrainer:
             persistent_workers=True
         )
 
-        print(f"\nTraining configuration:")
+        print(f"\nTraining configuration ({self.config.get_phase_name()}):")
         print(f"Patch size: {self.patch_size}")
         print(f"Batch size: {self.batch_size}")
         print(f"Tumor sampling probability: {self.tumor_only_prob}")
+        if self.config.use_kidney_mask:
+            print(f"Minimum kidney voxels: {self.config.min_kidney_voxels}")
+            print(f"Required kidney overlap: {self.config.kidney_patch_overlap:.1%}")
         print(f"Training patches per epoch: {len(train_loader)}")
         print(f"Validation volumes: {len(val_dataset)}")
 
@@ -160,7 +169,8 @@ class PatchSegmentationTrainer:
                     epoch,
                     {
                         'loss': val_loss,
-                        'dice': val_dice
+                        'dice': val_dice,
+                        'phase': 2 if self.config.use_kidney_mask else 1
                     },
                     is_best=is_best
                 )
@@ -197,15 +207,17 @@ class PatchSegmentationTrainer:
         
         # Track statistics
         tumor_ratios = []
+        kidney_ratios = []  # Phase 2: Track kidney coverage
         mean_probs = []
         max_probs = []
         dice_scores = []
         
         with tqdm(train_loader, desc=f"Epoch {self.current_epoch+1}/{self.config.num_epochs}") as pbar:
-            for batch_idx, (images, tumor_masks, _) in enumerate(pbar):
+            for batch_idx, (images, tumor_masks, kidney_masks) in enumerate(pbar):
                 # Move data to device
                 images = images.to(self.device)
                 tumor_masks = tumor_masks.to(self.device)
+                kidney_masks = kidney_masks.to(self.device)
                 
                 # Use CT image directly (no kidney channel)
                 inputs = images[:, 0:1].float()
@@ -223,9 +235,8 @@ class PatchSegmentationTrainer:
                             align_corners=False
                         )
                     
-                    # Compute loss (passing ones for kidney_mask)
-                    dummy_kidney = torch.ones_like(tumor_masks)
-                    loss = self.criterion(outputs, tumor_masks, dummy_kidney)
+                    # Compute loss
+                    loss = self.criterion(outputs, tumor_masks, kidney_masks)
                 
                 # Backward pass with gradient clipping
                 self.optimizer.zero_grad()
@@ -242,8 +253,10 @@ class PatchSegmentationTrainer:
                 
                 # Compute metrics
                 with torch.no_grad():
-                    stats = self.criterion.log_stats(outputs, tumor_masks, dummy_kidney)
+                    stats = self.criterion.log_stats(outputs, tumor_masks, kidney_masks)
                     tumor_ratios.append(stats['tumor_ratio'])
+                    if 'kidney_ratio' in stats:
+                        kidney_ratios.append(stats['kidney_ratio'])
                     mean_probs.append(stats['mean_prob'])
                     max_probs.append(stats['max_prob'])
                     dice_scores.append(stats['dice_score'])
@@ -255,12 +268,15 @@ class PatchSegmentationTrainer:
                     valid_batches += 1
                 
                 # Update progress bar
-                pbar.set_postfix({
+                postfix = {
                     'loss': f"{loss.item():.4f}",
                     'tumor_ratio': f"{stats['tumor_ratio']:.4%}",
                     'dice': f"{stats['dice_score']:.4f}",
                     'grad_norm': f"{total_norm:.4f}"
-                })
+                }
+                if kidney_ratios:
+                    postfix['kidney_ratio'] = f"{stats['kidney_ratio']:.4%}"
+                pbar.set_postfix(postfix)
                 
                 # Clear cache periodically
                 if batch_idx % 10 == 0:
@@ -274,6 +290,8 @@ class PatchSegmentationTrainer:
             'max_prob': np.mean(max_probs),
             'dice_score': np.mean(dice_scores)
         }
+        if kidney_ratios:
+            avg_stats['kidney_ratio'] = np.mean(kidney_ratios)
         
         return avg_stats['loss'], avg_stats
 
@@ -285,10 +303,11 @@ class PatchSegmentationTrainer:
         valid_batches = 0
         
         with tqdm(val_loader, desc="Validating") as pbar:
-            for images, tumor_masks, _ in pbar:
+            for images, tumor_masks, kidney_masks in pbar:
                 # Move to device
                 images = images.to(self.device)
                 tumor_masks = tumor_masks.to(self.device)
+                kidney_masks = kidney_masks.to(self.device)
                 
                 # Use CT image only
                 inputs = images[:, 0:1].float()
@@ -307,16 +326,15 @@ class PatchSegmentationTrainer:
                                 align_corners=False
                             )
                         
-                        # Compute loss with dummy kidney mask
-                        dummy_kidney = torch.ones_like(tumor_masks)
-                        loss = self.criterion(outputs, tumor_masks, dummy_kidney)
+                        # Compute loss
+                        loss = self.criterion(outputs, tumor_masks, kidney_masks)
                         
                         # Get predictions
                         probs = torch.sigmoid(outputs)
                         preds = (probs > 0.5).float()
                         
-                        # Calculate Dice
-                        dice = self._calculate_dice(preds, tumor_masks, dummy_kidney)
+                        # Calculate Dice (using kidney mask in Phase 2)
+                        dice = self._calculate_dice(preds, tumor_masks, kidney_masks)
                         
                         val_loss += loss.item()
                         val_dice += dice
@@ -343,9 +361,10 @@ class PatchSegmentationTrainer:
                       mask: torch.Tensor,
                       smooth: float = 1e-5) -> float:
         """Calculate Dice score for predictions"""
-        # Apply mask
-        pred = pred * mask
-        target = target * mask
+        # Apply mask if in Phase 2
+        if self.config.use_kidney_mask:
+            pred = pred * mask
+            target = target * mask
         
         # Calculate Dice
         intersection = (pred * target).sum()
@@ -357,11 +376,10 @@ class PatchSegmentationTrainer:
     def _log_batch_stats(self, stats: dict, batch_idx: int, epoch: int):
         """Log detailed batch statistics"""
         step = epoch * 1000 + batch_idx
-        self.writer.add_scalar('Batch/Loss', stats['loss'], step)
-        self.writer.add_scalar('Batch/TumorRatio', stats['tumor_ratio'], step)
-        self.writer.add_scalar('Batch/DiceScore', stats['dice_score'], step)
-        self.writer.add_scalar('Batch/MeanProb', stats['mean_prob'], step)
-        self.writer.add_scalar('Batch/MaxProb', stats['max_prob'], step)
+        
+        # Log all statistics
+        for key, value in stats.items():
+            self.writer.add_scalar(f'Batch/{key}', value, step)
 
     def _log_epoch(self, train_loss, train_stats, val_loss, val_dice, lr, epoch):
         """Log epoch-level metrics"""
@@ -372,14 +390,15 @@ class PatchSegmentationTrainer:
         self.writer.add_scalar('LearningRate', lr, epoch)
         
         # Add training statistics
-        self.writer.add_scalar('Train/TumorRatio', train_stats['tumor_ratio'], epoch)
-        self.writer.add_scalar('Train/MeanProb', train_stats['mean_prob'], epoch)
-        self.writer.add_scalar('Train/MaxProb', train_stats['max_prob'], epoch)
-        self.writer.add_scalar('Train/DiceScore', train_stats['dice_score'], epoch)
+        for key, value in train_stats.items():
+            if key != 'loss':  # Already logged above
+                self.writer.add_scalar(f'Train/{key}', value, epoch)
         
         # Print summary
         print(f"\nEpoch {epoch+1}/{self.config.num_epochs}")
         print(f"Train - Loss: {train_loss:.4f}, Dice: {train_stats['dice_score']:.4f}")
+        if 'kidney_ratio' in train_stats:
+            print(f"       Kidney ratio: {train_stats['kidney_ratio']:.4%}")
         print(f"Val   - Loss: {val_loss:.4f}, Dice: {val_dice:.4f}")
         print(f"Learning Rate: {lr:.6f}")
         print(f"Mean tumor ratio: {train_stats['tumor_ratio']:.4%}")
@@ -389,9 +408,10 @@ class PatchSegmentationTrainer:
         self.model.eval()
         
         # Get first validation batch
-        images, tumor_masks, _ = next(iter(val_loader))
+        images, tumor_masks, kidney_masks = next(iter(val_loader))
         images = images.to(self.device)
         tumor_masks = tumor_masks.to(self.device)
+        kidney_masks = kidney_masks.to(self.device)
         
         with torch.no_grad():
             # Get predictions
@@ -410,11 +430,12 @@ class PatchSegmentationTrainer:
             # Get probabilities
             probs = torch.sigmoid(outputs)
             
-            # Get middle slice for visualization
+            # Get middle slice
             slice_idx = probs.shape[2] // 2
             
-            # Create figure with subplots
-            fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+            # Create figure with subplots (4 in Phase 2, 3 in Phase 1)
+            n_plots = 4 if self.config.use_kidney_mask else 3
+            fig, axes = plt.subplots(1, n_plots, figsize=(5*n_plots, 5))
             
             # Plot CT
             axes[0].imshow(images[0, 0, slice_idx].cpu(), cmap='gray')
@@ -426,10 +447,21 @@ class PatchSegmentationTrainer:
             axes[1].set_title('Ground Truth')
             axes[1].axis('off')
             
-            # Plot prediction
-            axes[2].imshow(probs[0, 0, slice_idx].cpu(), cmap='gray')
-            axes[2].set_title(f'Prediction (Epoch {epoch+1})')
-            axes[2].axis('off')
+            if self.config.use_kidney_mask:
+                # Plot kidney mask
+                axes[2].imshow(kidney_masks[0, 0, slice_idx].cpu(), cmap='gray')
+                axes[2].set_title('Kidney Mask')
+                axes[2].axis('off')
+                
+                # Plot prediction
+                axes[3].imshow(probs[0, 0, slice_idx].cpu(), cmap='gray')
+                axes[3].set_title(f'Prediction (Epoch {epoch+1})')
+                axes[3].axis('off')
+            else:
+                # Plot prediction
+                axes[2].imshow(probs[0, 0, slice_idx].cpu(), cmap='gray')
+                axes[2].set_title(f'Prediction (Epoch {epoch+1})')
+                axes[2].axis('off')
             
             # Add to tensorboard
             self.writer.add_figure('Predictions', fig, epoch)
@@ -448,7 +480,9 @@ class PatchSegmentationTrainer:
             'config': {
                 'patch_size': self.patch_size,
                 'batch_size': self.batch_size,
-                'tumor_only_prob': self.tumor_only_prob
+                'tumor_only_prob': self.tumor_only_prob,
+                'use_kidney_mask': self.config.use_kidney_mask,
+                'training_phase': 2 if self.config.use_kidney_mask else 1
             }
         }
         
@@ -456,19 +490,26 @@ class PatchSegmentationTrainer:
         torch.save(checkpoint, latest_path)
         
         if is_best:
-            best_path = self.config.checkpoint_dir / f"best_model_dice_{metrics['dice']:.4f}.pth"
+            phase_str = "phase2" if self.config.use_kidney_mask else "phase1"
+            best_path = self.config.checkpoint_dir / f"best_model_{phase_str}_dice_{metrics['dice']:.4f}.pth"
             torch.save(checkpoint, best_path)
             print(f"Saved best model with Dice: {metrics['dice']:.4f}")
 
-    def _load_checkpoint(self):
-        """Load training checkpoint"""
-        latest_path = self.config.checkpoint_dir / "latest.pth"
-        if not latest_path.exists():
-            print(f"No checkpoint found at {latest_path}")
+    def _load_checkpoint(self, checkpoint_path: str):
+        """Load training checkpoint from specific path"""
+        if not Path(checkpoint_path).exists():
+            print(f"No checkpoint found at {checkpoint_path}")
             return
         
-        print(f"Loading checkpoint: {latest_path}")
-        checkpoint = torch.load(latest_path)
+        print(f"Loading checkpoint: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path)
+        
+        # Verify phase compatibility
+        checkpoint_phase = checkpoint['config'].get('training_phase', 1)
+        current_phase = 2 if self.config.use_kidney_mask else 1
+        
+        if checkpoint_phase != current_phase:
+            print(f"Warning: Loading Phase {checkpoint_phase} checkpoint in Phase {current_phase} training")
         
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -484,6 +525,12 @@ class PatchSegmentationTrainer:
             self.tumor_only_prob = checkpoint['config']['tumor_only_prob']
         
         print(f"Resuming training from epoch {self.start_epoch}")
+
+    def _load_latest_checkpoint(self):
+        """Load latest training checkpoint"""
+        latest_path = self.config.checkpoint_dir / "latest.pth"
+        if latest_path.exists():
+            self._load_checkpoint(str(latest_path))
 
     def _handle_interrupt(self, signum, frame):
         """Handle interrupt signals gracefully"""
