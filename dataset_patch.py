@@ -25,7 +25,7 @@ class KiTS23PatchDataset(Dataset):
                 tumor_only_prob: float = 0.7,
                 use_kidney_mask: bool = False,
                 min_kidney_voxels: int = 100,
-                kidney_patch_overlap: float = 0.5,
+                kidney_patch_overlap: float = 0.2,  # Lowered from 0.5 to 0.2
                 debug: bool = False):
         """
         Args:
@@ -61,12 +61,14 @@ class KiTS23PatchDataset(Dataset):
         self.tumor_centered_patches = 0
         self.kidney_valid_patches = 0
         self.failed_attempts = 0
+        self.rejected_kidney_patches = 0
+        self.rejected_overlap_patches = 0
         
         print("Computing coordinate lists for patch sampling...")
         
         # Store indices for each volume
         self.tumor_indices = []      # All tumor voxels
-        self.kidney_indices = []     # All kidney voxels
+        self.kidney_indices = []     # All kidney voxels (including cysts)
         self.kidney_bg_indices = []  # Kidney voxels without tumor
         self.volume_shapes = []      # Store shapes for fallback sampling
         
@@ -92,9 +94,12 @@ class KiTS23PatchDataset(Dataset):
             tumor_coords = (tumor > 0).nonzero(as_tuple=False)[:, 1:]
             
             if self.use_kidney_mask:
-                # Get all kidney voxels
-                kidney_coords = (kidney > 0).nonzero(as_tuple=False)[:, 1:]
-                kidney_bg = (kidney > 0) & (tumor == 0)
+                # Include cyst label (3) in kidney mask
+                kidney_mask = (kidney > 0) | (kidney == 3)  # Add cysts
+                # Get all kidney voxels (including cysts)
+                kidney_coords = kidney_mask.nonzero(as_tuple=False)[:, 1:]
+                # Get kidney background (no tumor)
+                kidney_bg = kidney_mask & (tumor == 0)
                 bg_coords = kidney_bg.nonzero(as_tuple=False)[:, 1:]
                 
                 if len(kidney_coords) == 0:
@@ -143,6 +148,8 @@ class KiTS23PatchDataset(Dataset):
         print(f"Average tumor voxels per volume: {total_tumor_voxels / len(self.volume_paths):.1f}")
         print(f"Tumor-centered patch probability: {tumor_only_prob:.1%}")
         print(f"Patch size: {patch_size}")
+        if self.use_kidney_mask:
+            print(f"Kidney overlap threshold: {kidney_patch_overlap:.1%}")
 
     def _get_random_center(self, volume_idx: int) -> List[int]:
         """Get random center coordinates respecting patch bounds"""
@@ -207,6 +214,7 @@ class KiTS23PatchDataset(Dataset):
             if n_kidney < self.min_kidney_voxels:
                 if self.debug:
                     logger.debug(f"Rejecting patch: only {n_kidney} kidney voxels (min: {self.min_kidney_voxels})")
+                self.rejected_kidney_patches += 1
                 return False
                 
             # For tumor-centered patches, check tumor-kidney overlap
@@ -218,6 +226,7 @@ class KiTS23PatchDataset(Dataset):
                     if overlap < self.kidney_patch_overlap:
                         if self.debug:
                             logger.debug(f"Rejecting tumor patch: only {overlap:.1%} tumor-kidney overlap (min: {self.kidney_patch_overlap:.1%})")
+                        self.rejected_overlap_patches += 1
                         return False
                         
         return True
@@ -278,7 +287,9 @@ class KiTS23PatchDataset(Dataset):
             tumor_patch = self._extract_patch(tumor, center, pad_value=0)
             
             if self.use_kidney_mask:
-                kidney_patch = self._extract_patch(kidney, center, pad_value=0)
+                # Include cyst label in kidney mask
+                kidney_mask = (kidney > 0) | (kidney == 3)  # Add cysts
+                kidney_patch = self._extract_patch(kidney_mask.float(), center, pad_value=0)
                 # Validate patch
                 if self._validate_kidney_patch(kidney_patch, tumor_patch if use_tumor else None):
                     self.kidney_valid_patches += 1
@@ -294,7 +305,11 @@ class KiTS23PatchDataset(Dataset):
             center = [d//2 for d in self.volume_shapes[idx]]
             image_patch = self._extract_patch(image, center, pad_value=0)
             tumor_patch = self._extract_patch(tumor, center, pad_value=0)
-            kidney_patch = self._extract_patch(kidney, center, pad_value=0) if self.use_kidney_mask else torch.ones_like(tumor_patch)
+            if self.use_kidney_mask:
+                kidney_mask = (kidney > 0) | (kidney == 3)  # Add cysts to fallback
+                kidney_patch = self._extract_patch(kidney_mask.float(), center, pad_value=0)
+            else:
+                kidney_patch = torch.ones_like(tumor_patch)
         
         # Log sampling statistics periodically
         if self.total_patches % 1000 == 0:
@@ -339,12 +354,14 @@ class KiTS23PatchDataset(Dataset):
         return image_patch, tumor_patch, kidney_patch
 
     def _log_sampling_stats(self):
-        """Log patch sampling statistics"""
+        """Log detailed sampling statistics"""
         logger.info("\nPatch sampling statistics:")
         logger.info(f"Total patches sampled: {self.total_patches}")
         logger.info(f"Tumor-centered patches: {self.tumor_centered_patches} ({100*self.tumor_centered_patches/self.total_patches:.1f}%)")
         if self.use_kidney_mask:
             logger.info(f"Kidney-valid patches: {self.kidney_valid_patches} ({100*self.kidney_valid_patches/self.total_patches:.1f}%)")
+            logger.info(f"Rejected kidney patches: {self.rejected_kidney_patches} ({100*self.rejected_kidney_patches/max(1,self.tumor_centered_patches):.1f}% of tumor patches)")
+            logger.info(f"Rejected overlap patches: {self.rejected_overlap_patches} ({100*self.rejected_overlap_patches/max(1,self.tumor_centered_patches):.1f}% of tumor patches)")
         logger.info(f"Failed attempts: {self.failed_attempts} ({100*self.failed_attempts/self.total_patches:.1f}%)")
 
     def __len__(self):
