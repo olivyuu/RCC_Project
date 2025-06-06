@@ -57,12 +57,12 @@ class PatchSegmentationTrainer:
         # Create checkpoint directory
         self.config.checkpoint_dir.mkdir(exist_ok=True)
         
-        # Initialize training components
+        # Initialize training components - Move entire loss module to device
         self.criterion = WeightedDiceBCELoss(
-            pos_weight=torch.tensor([10.0]).to(self.device),  # Move to device
+            pos_weight=torch.tensor([10.0]).to(self.device),
             dice_weight=1.0,
             bce_weight=1.0
-        )
+        ).to(self.device)
         
         self.optimizer = torch.optim.Adam(
             self.model.parameters(),
@@ -110,22 +110,22 @@ class PatchSegmentationTrainer:
         
         # Create patch datasets using split datasets directly
         train_patch_dataset = KiTS23PatchDataset(
-            data_source=train_dataset,  # Pass dataset object instead of path
+            data_source=train_dataset,  # Pass dataset object
             patch_size=self.patch_size,
             tumor_only_prob=self.tumor_only_prob,
             use_kidney_mask=self.config.use_kidney_mask,
             min_kidney_voxels=self.config.min_kidney_voxels if hasattr(self.config, 'min_kidney_voxels') else 100,
-            kidney_patch_overlap=self.config.kidney_patch_overlap if hasattr(self.config, 'kidney_patch_overlap') else 0.5,
+            kidney_patch_overlap=0.2,  # Lower threshold for kidney overlap
             debug=self.config.debug
         )
         
         val_patch_dataset = KiTS23PatchDataset(
-            data_source=val_dataset,  # Pass dataset object instead of path
+            data_source=val_dataset,  # Pass dataset object
             patch_size=self.patch_size,
             tumor_only_prob=0.5,  # Equal sampling for validation
             use_kidney_mask=self.config.use_kidney_mask,
             min_kidney_voxels=self.config.min_kidney_voxels if hasattr(self.config, 'min_kidney_voxels') else 100,
-            kidney_patch_overlap=self.config.kidney_patch_overlap if hasattr(self.config, 'kidney_patch_overlap') else 0.5,
+            kidney_patch_overlap=0.2,  # Lower threshold for kidney overlap
             debug=False
         )
         
@@ -171,7 +171,7 @@ class PatchSegmentationTrainer:
         if self.config.use_kidney_mask:
             print("Phase 2 parameters:")
             print(f"  min_kidney_voxels: {self.config.min_kidney_voxels}")
-            print(f"  kidney_patch_overlap: {self.config.kidney_patch_overlap}")
+            print(f"  kidney_patch_overlap: {0.2}")  # Updated threshold
             
         print("\nModel Configuration:")
         print(f"Patch size: {self.patch_size}")
@@ -192,7 +192,7 @@ class PatchSegmentationTrainer:
         if self.config.use_kidney_mask:
             print("\nPhase 2 Configuration:")
             print(f"Minimum kidney voxels: {self.config.min_kidney_voxels}")
-            print(f"Required kidney overlap: {self.config.kidney_patch_overlap*100:.1f}%")
+            print(f"Required kidney overlap: {0.2*100:.1f}%")  # Updated threshold
             
         if self.config.debug:
             print("\nDebug mode enabled - will show additional output and visualizations")
@@ -312,17 +312,37 @@ class PatchSegmentationTrainer:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 
-                # Compute metrics
+                # Compute metrics using sigmoid for binary prediction
                 with torch.no_grad():
-                    stats = self.criterion.log_stats(outputs, tumor_masks, kidney_masks)
-                    tumor_ratios.append(stats['tumor_ratio'])
-                    if 'kidney_ratio' in stats:
-                        kidney_ratios.append(stats['kidney_ratio'])
-                    mean_probs.append(stats['mean_prob'])
-                    max_probs.append(stats['max_prob'])
-                    dice_scores.append(stats['dice_score'])
+                    probs = torch.sigmoid(outputs)  # Use sigmoid instead of softmax
+                    pred_mask = (probs > 0.5).float()
+                    
+                    # Calculate metrics
+                    intersection = (pred_mask * tumor_masks).sum()
+                    union = pred_mask.sum() + tumor_masks.sum()
+                    dice_score = (2 * intersection + 1e-5) / (union + 1e-5)
+                    
+                    # Track statistics
+                    tumor_ratio = pred_mask.mean()
+                    tumor_ratios.append(tumor_ratio.item())
+                    
+                    if self.config.use_kidney_mask:
+                        kidney_ratio = (kidney_masks > 0).float().mean()
+                        kidney_ratios.append(kidney_ratio.item())
+                    
+                    mean_probs.append(probs.mean().item())
+                    max_probs.append(probs.max().item())
+                    dice_scores.append(dice_score.item())
                     
                     if batch_idx % 50 == 0:
+                        stats = {
+                            'tumor_ratio': tumor_ratio.item(),
+                            'mean_prob': probs.mean().item(),
+                            'max_prob': probs.max().item(),
+                            'dice_score': dice_score.item()
+                        }
+                        if kidney_ratios:
+                            stats['kidney_ratio'] = kidney_ratio.item()
                         self._log_batch_stats(stats, batch_idx, self.current_epoch)
                     
                     train_loss += loss.item()
@@ -331,12 +351,12 @@ class PatchSegmentationTrainer:
                 # Update progress bar
                 postfix = {
                     'loss': f"{loss.item():.4f}",
-                    'tumor_ratio': f"{stats['tumor_ratio']:.4%}",
-                    'dice': f"{stats['dice_score']:.4f}",
+                    'tumor_ratio': f"{tumor_ratio.item():.4%}",
+                    'dice': f"{dice_score.item():.4f}",
                     'grad_norm': f"{total_norm:.4f}"
                 }
                 if kidney_ratios:
-                    postfix['kidney_ratio'] = f"{stats['kidney_ratio']:.4%}"
+                    postfix['kidney_ratio'] = f"{kidney_ratio.item():.4%}"
                 pbar.set_postfix(postfix)
                 
                 # Clear cache periodically
@@ -357,7 +377,7 @@ class PatchSegmentationTrainer:
         return avg_stats['loss'], avg_stats
 
     def _validate(self, val_loader):
-        """Validate on patches to avoid OOM"""
+        """Validate using sigmoid prediction"""
         self.model.eval()
         val_loss = 0
         val_dice = 0
@@ -387,17 +407,23 @@ class PatchSegmentationTrainer:
                                 align_corners=False
                             )
                         
-                        # Compute loss and metrics
+                        # Compute loss
                         loss = self.criterion(outputs, tumor_masks, kidney_masks)
-                        stats = self.criterion.log_stats(outputs, tumor_masks, kidney_masks)
+                        
+                        # Calculate Dice with sigmoid prediction
+                        probs = torch.sigmoid(outputs)  # Use sigmoid instead of softmax
+                        pred_mask = (probs > 0.5).float()
+                        intersection = (pred_mask * tumor_masks).sum()
+                        union = pred_mask.sum() + tumor_masks.sum()
+                        dice_score = (2 * intersection + 1e-5) / (union + 1e-5)
                         
                         val_loss += loss.item()
-                        val_dice += stats['dice_score']
+                        val_dice += dice_score.item()
                         valid_batches += 1
                         
                         pbar.set_postfix({
                             'loss': f"{loss.item():.4f}",
-                            'dice': f"{stats['dice_score']:.4f}"
+                            'dice': f"{dice_score.item():.4f}"
                         })
                         
                 except RuntimeError as e:
@@ -426,7 +452,7 @@ class PatchSegmentationTrainer:
                 'tumor_only_prob': self.tumor_only_prob,
                 'use_kidney_mask': self.config.use_kidney_mask,
                 'min_kidney_voxels': getattr(self.config, 'min_kidney_voxels', None),
-                'kidney_patch_overlap': getattr(self.config, 'kidney_patch_overlap', None),
+                'kidney_patch_overlap': 0.2,  # Save updated threshold
                 'training_phase': 2 if self.config.use_kidney_mask else 1,
                 'seed': self.seed
             }
@@ -495,25 +521,12 @@ class PatchSegmentationTrainer:
             self.batch_size = checkpoint['config']['batch_size']
             self.tumor_only_prob = checkpoint['config']['tumor_only_prob']
             self.seed = checkpoint['config'].get('seed', 42)
-            
-            # Verify Phase 2 parameters match if applicable
-            if current_phase == 2:
-                if checkpoint.get('min_kidney_voxels') != self.config.min_kidney_voxels:
-                    logger.warning(
-                        f"Checkpoint min_kidney_voxels ({checkpoint.get('min_kidney_voxels')}) "
-                        f"differs from current setting ({self.config.min_kidney_voxels})"
-                    )
-                if checkpoint.get('kidney_patch_overlap') != self.config.kidney_patch_overlap:
-                    logger.warning(
-                        f"Checkpoint kidney_patch_overlap ({checkpoint.get('kidney_patch_overlap')}) "
-                        f"differs from current setting ({self.config.kidney_patch_overlap})"
-                    )
         
         print(f"Starting training from epoch {self.start_epoch}")
         if current_phase == 2:
             print("Phase 2 parameters:")
             print(f"  min_kidney_voxels: {self.config.min_kidney_voxels}")
-            print(f"  kidney_patch_overlap: {self.config.kidney_patch_overlap}")
+            print(f"  kidney_patch_overlap: {0.2}")  # Updated threshold
         
         # Print learning rate
         print(f"Learning rate: {self.optimizer.param_groups[0]['lr']:.2e}")
@@ -558,9 +571,9 @@ class PatchSegmentationTrainer:
                     mode='trilinear',
                     align_corners=False
                 )
-                
-            # Get probabilities
-            probs = torch.sigmoid(outputs)
+            
+            # Get probabilities using sigmoid
+            probs = torch.sigmoid(outputs)  # Use sigmoid instead of softmax
             
             # Get middle slice for visualization
             slice_idx = probs.shape[2] // 2
