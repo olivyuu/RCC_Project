@@ -33,31 +33,31 @@ class SegmentationModel(nn.Module):
                 features: int = 32):    # Base feature channels
         super().__init__()
         
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.features = features
+        self.in_channels = int(in_channels)  # Ensure integer
+        self.out_channels = int(out_channels)  # Ensure integer
+        self.features = int(features)  # Ensure integer
         
         # Verify valid input configuration
-        if in_channels != 1:
-            print(f"Warning: Expected in_channels=1 for Phase 1 (CT only), got {in_channels}")
+        if self.in_channels != 1:
+            print(f"Warning: Expected in_channels=1 for Phase 1 (CT only), got {self.in_channels}")
         
         # Encoder (downsampling path)
-        self.enc1 = DoubleConv(in_channels, features)
-        self.enc2 = DoubleConv(features, features * 2)
-        self.enc3 = DoubleConv(features * 2, features * 4)
-        self.enc4 = DoubleConv(features * 4, features * 8)
+        self.enc1 = DoubleConv(self.in_channels, self.features)
+        self.enc2 = DoubleConv(self.features, self.features * 2)
+        self.enc3 = DoubleConv(self.features * 2, self.features * 4)
+        self.enc4 = DoubleConv(self.features * 4, self.features * 8)
         
         # Bottleneck
-        self.bottleneck = DoubleConv(features * 8, features * 16)
+        self.bottleneck = DoubleConv(self.features * 8, self.features * 16)
         
         # Decoder (upsampling path)
-        self.up4 = DoubleConv(features * 16, features * 8)
-        self.up3 = DoubleConv(features * 8, features * 4)
-        self.up2 = DoubleConv(features * 4, features * 2)
-        self.up1 = DoubleConv(features * 2, features)
+        self.up4 = DoubleConv(self.features * 16, self.features * 8)
+        self.up3 = DoubleConv(self.features * 8, self.features * 4)
+        self.up2 = DoubleConv(self.features * 4, self.features * 2)
+        self.up1 = DoubleConv(self.features * 2, self.features)
         
         # Final 1x1 convolution to get output channels
-        self.final_conv = nn.Conv3d(features, out_channels, kernel_size=1)
+        self.final_conv = nn.Conv3d(self.features, self.out_channels, kernel_size=1)
         
         # Max pooling for downsampling
         self.pool = nn.MaxPool3d(2)
