@@ -76,12 +76,26 @@ class WeightedDiceBCELoss(nn.Module):
             mean_prob = valid_probs.mean().item()
             max_prob = valid_probs.max().item()
             
+            # Calculate loss components
+            bce_raw = self.bce(logits, target)
+            bce_loss = bce_raw.mean().item()
+            
+            # Calculate Dice score
+            dice_score = 2 * true_pos / (n_pred_tumor + n_tumor + 1e-6)
+            dice_loss = 1.0 - dice_score
+            
+            # Calculate total loss
+            total_loss = self.bce_weight * bce_loss + self.dice_weight * dice_loss
+            
             return {
+                'loss': total_loss,  # Add total loss to stats
+                'bce_loss': bce_loss,
+                'dice_loss': dice_loss,
                 'tumor_ratio': tumor_ratio,
                 'tumor_voxels': n_tumor,
                 'predicted_tumor': n_pred_tumor,
                 'true_positives': true_pos,
                 'mean_prob': mean_prob,
                 'max_prob': max_prob,
-                'dice_score': 2 * true_pos / (n_pred_tumor + n_tumor + 1e-6)
+                'dice_score': dice_score
             }
