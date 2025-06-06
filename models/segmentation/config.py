@@ -1,94 +1,80 @@
-from dataclasses import dataclass
-from typing import Tuple
 from pathlib import Path
+from typing import Optional, List, Tuple, Union
 
-@dataclass
 class SegmentationConfig:
-    # Training mode
-    training_mode: str = "patch"  # Options: "patch", "full_volume"
+    """Configuration for segmentation model training"""
+    def __init__(self):
+        # Data paths
+        self.data_dir: Optional[Path] = None
+        self.output_dir: Optional[Path] = None
+        self.checkpoint_dir: Optional[Path] = None
+        self.log_dir: Optional[Path] = None
+        
+        # Data configuration
+        self.image_size: Tuple[int, int, int] = (128, 256, 256)  # D, H, W
+        self.patch_size: Tuple[int, int, int] = (64, 128, 128)   # For patch training
+        
+        # Model configuration
+        self.in_channels: int = 1  # CT only for Phase 1
+        self.out_channels: int = 1  # Binary tumor segmentation
+        self.features: int = 32     # Base feature channels (as scalar)
+        self.dropout: float = 0.1
+        
+        # Training settings
+        self.batch_size: int = 2
+        self.num_workers: int = 4
+        self.learning_rate: float = 5e-5
+        self.weight_decay: float = 1e-5
+        self.max_grad_norm: float = 5.0
+        self.num_epochs: int = 100
+        
+        # Patch sampling settings
+        self.tumor_prob: float = 0.7      # Probability of tumor-centered patches
+        self.min_tumor_voxels: int = 100  # Minimum tumor voxels for sampling
+        
+        # Loss function settings
+        self.pos_weight: float = 10.0     # Positive class weight
+        self.dice_weight: float = 1.0     # Weight for Dice loss
+        self.bce_weight: float = 1.0      # Weight for BCE loss
+        
+        # Optimizer settings
+        self.beta1: float = 0.9           # Adam beta1
+        self.beta2: float = 0.999         # Adam beta2
+        self.epsilon: float = 1e-8        # Adam epsilon
+        
+        # Learning rate scheduler
+        self.scheduler_factor: float = 0.5     # Multiply LR by this on plateau
+        self.scheduler_patience: int = 5       # Epochs to wait before reducing LR
+        self.scheduler_threshold: float = 1e-4 # Minimum improvement to reset patience
+        self.scheduler_min_lr: float = 1e-6    # Minimum learning rate
+        
+        # Validation settings
+        self.val_interval: int = 1        # Validate every N epochs
+        self.val_percent: float = 0.2     # Fraction of data for validation
+        
+        # Runtime settings
+        self.debug: bool = False          # Enable debug output
+        self.resume_training: bool = False # Resume from checkpoint
+        self.save_best_only: bool = True  # Only save best model
+        self.preprocess: bool = False     # Preprocess data on load
+        self.mixed_precision: bool = True # Use mixed precision training
+        self.deterministic: bool = True   # Make training reproducible
+        
+        # Hardware settings
+        self.gpu_mem_fraction: float = 0.95  # Maximum GPU memory fraction to use
+        
+        # Phase tracking
+        self.current_phase: int = 1  # Track which training phase we're in
+
+    def update(self, **kwargs):
+        """Update config attributes from keyword arguments"""
+        for key, value in kwargs.items():
+            if hasattr(self, key):
+                setattr(self, key, value)
+            else:
+                raise ValueError(f"Unknown config parameter: {key}")
     
-    # Data parameters
-    data_dir: str = "/workspace/kits23/dataset"
-    preprocessed_dir: str = "preprocessed_patches"
-    preprocessed_volumes_dir: str = "preprocessed_volumes"  # For full volume training
-    
-    # Model parameters
-    in_channels: int = 1
-    out_channels: int = 2  # Binary segmentation (background, tumor)
-    features: Tuple[int, ...] = (32, 64, 128, 256, 320)
-    
-    # Training parameters
-    batch_size: int = 4  # Will be adjusted based on training_mode
-    validation_split: float = 0.2
-    
-    # Full volume parameters
-    vol_batch_size: int = 1  # Smaller batch size for full volumes
-    vol_gradient_accumulation_steps: int = 4  # Accumulate gradients for effective batch size
-    vol_max_dim: Tuple[int, int, int] = (128, 256, 256)  # Max dimensions for full volume training
-    
-    # Patch parameters - Optimized for KiTS23 dimensions
-    patch_size: Tuple[int, int, int] = (32, 96, 96)  # D, H, W - More memory efficient while maintaining detail
-    patch_stride: Tuple[int, int, int] = (16, 48, 48)  # 50% overlap
-    min_patches_per_image: int = 10
-    max_patches_per_chunk: int = 100
-    
-    # Memory management - Optimized for RTX 3070
-    chunk_size: int = 8
-    max_chunk_memory: int = 512  # MB, adjust based on GPU memory
-    dtype: str = 'float32'
-    num_workers: int = 4
-    pin_memory: bool = True
-    prefetch_factor: int = 4
-    
-    # Training loop parameters
-    num_epochs: int = 15
-    early_stopping_patience: int = 75
-    save_frequency: int = 5
-    
-    # Optimizer parameters
-    initial_lr: float = 2e-4
-    weight_decay: float = 2e-5
-    lr_schedule_patience: int = 15
-    lr_reduce_factor: float = 0.7
-    
-    # Checkpoint parameters
-    resume_training: bool = True
-    checkpoint_dir: Path = Path("checkpoints/segmentation")
-    checkpoint_file: str = "latest.pth"
-    save_latest: bool = True
-    
-    # Augmentation parameters
-    rotation_angle: Tuple[int, int] = (-30, 30)
-    scale_range: Tuple[float, float] = (0.8, 1.2)
-    elastic_deformation_alpha: Tuple[int, int] = (0, 600)
-    elastic_deformation_sigma: Tuple[int, int] = (10, 15)
-    
-    # Cross-validation parameters
-    fold: int = 0
-    num_folds: int = 5
-    
-    # Logging parameters
-    log_dir: str = "runs/segmentation"
-    experiment_name: str = "SegNet_v1"
-    
-    # System parameters
-    seed: int = 42
-    use_amp: bool = True
-    benchmark_cudnn: bool = True
-    deterministic: bool = False
-    debug: bool = False
-    memory_check: bool = False
-    preprocess: bool = True
-    
-    # Size thresholds for preprocessing
-    max_image_size_mb: int = 1024
-    max_image_dimensions: Tuple[int, int, int] = (512, 512, 512)
-    downsample_large_images: bool = True
-    downsample_factor: int = 2
-    max_estimated_memory_mb: int = 1536
-    
-    # Transfer learning parameters
-    transfer_learning: bool = False
-    patch_weights_path: str = ""
-    freeze_layers: bool = False
-    freeze_epochs: int = 2
+    def __repr__(self):
+        """String representation of config"""
+        attrs = [f"  {key}={value}" for key, value in self.__dict__.items()]
+        return "SegmentationConfig:\n" + "\n".join(attrs)

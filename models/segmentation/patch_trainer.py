@@ -36,8 +36,8 @@ class PatchSegmentationTrainer:
         # Initialize model
         self.model = SegmentationModel(
             in_channels=1,  # CT channel only
-            out_channels=1,  # Single channel for tumor probability
-            features=config.features
+            out_channels=1,  # Single channel output (tumor)
+            features=self.config.features  # Pass scalar feature value
         ).to(self.device)
         
         # Training settings
@@ -52,7 +52,7 @@ class PatchSegmentationTrainer:
         
         # Initialize training components
         self.criterion = WeightedDiceBCELoss(
-            pos_weight=10.0,  # Higher weight for tumor voxels
+            pos_weight=10.0,
             dice_weight=1.0,
             bce_weight=1.0
         ).to(self.device)
@@ -182,8 +182,6 @@ class PatchSegmentationTrainer:
         except Exception as e:
             print(f"\nError during training: {str(e)}")
             print(f"Error type: {type(e).__name__}")
-            import traceback
-            traceback.print_exc()
             raise
         
         self.writer.close()
@@ -191,6 +189,7 @@ class PatchSegmentationTrainer:
         print(f"Best validation Dice score: {self.best_val_dice:.4f}")
 
     def _train_epoch(self, train_loader):
+        """Run one epoch of training"""
         self.model.train()
         train_loss = 0
         valid_batches = 0
@@ -279,6 +278,7 @@ class PatchSegmentationTrainer:
         return avg_stats['loss'], avg_stats
 
     def _validate(self, val_loader):
+        """Validate on full volumes"""
         self.model.eval()
         val_loss = 0
         val_dice = 0
@@ -355,21 +355,29 @@ class PatchSegmentationTrainer:
         return dice.item()
 
     def _log_batch_stats(self, stats: dict, batch_idx: int, epoch: int):
+        """Log detailed batch statistics"""
         step = epoch * 1000 + batch_idx
-        for key, value in stats.items():
-            self.writer.add_scalar(f'Batch/{key}', value, step)
+        self.writer.add_scalar('Batch/Loss', stats['loss'], step)
+        self.writer.add_scalar('Batch/TumorRatio', stats['tumor_ratio'], step)
+        self.writer.add_scalar('Batch/DiceScore', stats['dice_score'], step)
+        self.writer.add_scalar('Batch/MeanProb', stats['mean_prob'], step)
+        self.writer.add_scalar('Batch/MaxProb', stats['max_prob'], step)
 
     def _log_epoch(self, train_loss, train_stats, val_loss, val_dice, lr, epoch):
-        # Training metrics
-        self.writer.add_scalar('Loss/train', train_loss, epoch)
-        self.writer.add_scalar('Loss/val', val_loss, epoch)
-        self.writer.add_scalar('Dice/val', val_dice, epoch)
+        """Log epoch-level metrics"""
+        # Add scalars to tensorboard
+        self.writer.add_scalar('Loss/Train', train_loss, epoch)
+        self.writer.add_scalar('Loss/Val', val_loss, epoch)
+        self.writer.add_scalar('Dice/Val', val_dice, epoch)
         self.writer.add_scalar('LearningRate', lr, epoch)
         
-        # Training statistics
-        for key, value in train_stats.items():
-            self.writer.add_scalar(f'Train/{key}', value, epoch)
+        # Add training statistics
+        self.writer.add_scalar('Train/TumorRatio', train_stats['tumor_ratio'], epoch)
+        self.writer.add_scalar('Train/MeanProb', train_stats['mean_prob'], epoch)
+        self.writer.add_scalar('Train/MaxProb', train_stats['max_prob'], epoch)
+        self.writer.add_scalar('Train/DiceScore', train_stats['dice_score'], epoch)
         
+        # Print summary
         print(f"\nEpoch {epoch+1}/{self.config.num_epochs}")
         print(f"Train - Loss: {train_loss:.4f}, Dice: {train_stats['dice_score']:.4f}")
         print(f"Val   - Loss: {val_loss:.4f}, Dice: {val_dice:.4f}")
@@ -377,6 +385,7 @@ class PatchSegmentationTrainer:
         print(f"Mean tumor ratio: {train_stats['tumor_ratio']:.4%}")
 
     def _visualize_predictions(self, val_loader, epoch):
+        """Visualize predictions on validation data"""
         self.model.eval()
         
         # Get first validation batch
@@ -398,31 +407,36 @@ class PatchSegmentationTrainer:
                     align_corners=False
                 )
                 
+            # Get probabilities
             probs = torch.sigmoid(outputs)
             
-            # Get middle slice
+            # Get middle slice for visualization
             slice_idx = probs.shape[2] // 2
             
-            # Create figure
+            # Create figure with subplots
             fig, axes = plt.subplots(1, 3, figsize=(15, 5))
             
             # Plot CT
             axes[0].imshow(images[0, 0, slice_idx].cpu(), cmap='gray')
             axes[0].set_title('CT')
+            axes[0].axis('off')
             
             # Plot ground truth tumor
             axes[1].imshow(tumor_masks[0, 0, slice_idx].cpu(), cmap='gray')
             axes[1].set_title('Ground Truth')
+            axes[1].axis('off')
             
             # Plot prediction
             axes[2].imshow(probs[0, 0, slice_idx].cpu(), cmap='gray')
             axes[2].set_title(f'Prediction (Epoch {epoch+1})')
+            axes[2].axis('off')
             
-            # Save figure
+            # Add to tensorboard
             self.writer.add_figure('Predictions', fig, epoch)
             plt.close(fig)
 
     def _save_checkpoint(self, epoch: int, metrics: dict, is_best: bool = False):
+        """Save training checkpoint"""
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
@@ -447,6 +461,7 @@ class PatchSegmentationTrainer:
             print(f"Saved best model with Dice: {metrics['dice']:.4f}")
 
     def _load_checkpoint(self):
+        """Load training checkpoint"""
         latest_path = self.config.checkpoint_dir / "latest.pth"
         if not latest_path.exists():
             print(f"No checkpoint found at {latest_path}")
@@ -471,6 +486,7 @@ class PatchSegmentationTrainer:
         print(f"Resuming training from epoch {self.start_epoch}")
 
     def _handle_interrupt(self, signum, frame):
+        """Handle interrupt signals gracefully"""
         print("\nInterrupt received. Saving checkpoint before exiting...")
         self._save_checkpoint(
             self.current_epoch,
