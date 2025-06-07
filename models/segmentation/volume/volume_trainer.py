@@ -11,7 +11,7 @@ from torch.utils.tensorboard import SummaryWriter
 import signal
 import sys
 from models.segmentation.model import SegmentationModel
-from losses_patch import WeightedDiceBCELoss  # Updated import
+from losses_patch import WeightedDiceBCELoss
 from models.segmentation.volume.utils.sliding_window import get_sliding_windows, stitch_predictions
 
 logger = logging.getLogger(__name__)
@@ -404,8 +404,27 @@ class VolumeSegmentationTrainer:
         print(f"Loading checkpoint: {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path)
         
-        # Load model weights
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        # Get model state dict
+        state_dict = checkpoint['model_state_dict']
+        
+        # Handle input channel mismatch for Phase 3
+        if self.config.use_kidney_mask:
+            # Modify first conv layer weights to accept 2 channels
+            enc1_weight = state_dict['enc1.double_conv.0.weight']
+            if enc1_weight.shape[1] == 1:  # If loading from Phase 1 model
+                print("Adapting Phase 1 weights for Phase 3 (2-channel input)...")
+                # Duplicate the CT channel weights for kidney mask channel
+                new_enc1_weight = enc1_weight.repeat(1, 2, 1, 1, 1)
+                # Scale the kidney mask channel weights
+                new_enc1_weight[:, 1] *= 0.5  # Initialize kidney mask weights conservatively
+                state_dict['enc1.double_conv.0.weight'] = new_enc1_weight
+        
+        # Load modified state dict
+        try:
+            self.model.load_state_dict(state_dict)
+        except RuntimeError as e:
+            logger.error(f"Error loading checkpoint: {str(e)}")
+            raise
         
         # Verify phase compatibility
         checkpoint_phase = checkpoint['config'].get('training_phase', 1)
