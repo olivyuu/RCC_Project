@@ -410,15 +410,17 @@ class VolumeSegmentationTrainer:
         
         # Handle input channel mismatch for Phase 3
         if self.config.use_kidney_mask:
-            # Modify first conv layer weights to accept 2 channels
-            enc1_weight = state_dict['enc1.double_conv.0.weight']
-            if enc1_weight.shape[1] == 1:  # If loading from Phase 1 model
-                print("Adapting Phase 1 weights for Phase 3 (2-channel input)...")
-                # Duplicate the CT channel weights for kidney mask channel
-                new_enc1_weight = enc1_weight.repeat(1, 2, 1, 1, 1)
-                # Scale the kidney mask channel weights
-                new_enc1_weight[:, 1] *= 0.5  # Initialize kidney mask weights conservatively
-                state_dict['enc1.double_conv.0.weight'] = new_enc1_weight
+            print("Adapting Phase 1 weights for Phase 3 (2-channel input)...")
+            # Find all encoder convolution layers
+            for key in list(state_dict.keys()):
+                if '.double_conv.' in key and 'weight' in key:
+                    conv_weight = state_dict[key]
+                    if conv_weight.shape[1] == 1:  # If single channel input
+                        # Duplicate channel and scale second channel
+                        new_conv_weight = conv_weight.repeat(1, 2, 1, 1, 1)
+                        new_conv_weight[:, 1] *= 0.5
+                        state_dict[key] = new_conv_weight
+                        print(f"Adapted {key}: {conv_weight.shape} -> {new_conv_weight.shape}")
         
         # Load modified state dict
         try:
@@ -432,11 +434,8 @@ class VolumeSegmentationTrainer:
         current_phase = 3 if self.config.use_kidney_mask else 4
         
         if checkpoint_phase not in [1, current_phase]:
-            logger.warning(
-                f"Loading Phase {checkpoint_phase} checkpoint in Phase {current_phase} training.\n"
-                "Starting fresh from epoch 0 for new phase."
-            )
-            # Reset counters but keep model weights
+            print(f"Loading Phase {checkpoint_phase} checkpoint for Phase {current_phase}. Starting fresh from epoch 0.")
+            # Always start from epoch 0 when loading Phase 1 checkpoint
             self.start_epoch = 0
             self.best_val_dice = float('-inf')
             # Initialize fresh optimizer and scheduler 
@@ -455,6 +454,7 @@ class VolumeSegmentationTrainer:
                 min_lr=1e-6
             )
             self.scaler = GradScaler()
+            print("Initialized fresh optimizer and scheduler.")
         else:
             # Continue from saved epoch if same phase
             self.start_epoch = checkpoint['epoch'] + 1
