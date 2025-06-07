@@ -192,6 +192,7 @@ class VolumeSegmentationTrainer:
         train_loss = 0
         train_dice = 0
         n_batches = 0
+        window_dice = []  # Track dice for each window
         
         with tqdm(train_loader, desc=f"Epoch {self.current_epoch+1}/{self.config.num_epochs}") as pbar:
             for batch in pbar:
@@ -221,22 +222,41 @@ class VolumeSegmentationTrainer:
                 with torch.no_grad():
                     probs = torch.sigmoid(outputs)
                     pred_mask = (probs > 0.5).float()
-                    dice_score = self._calculate_dice(pred_mask, targets)
+                    
+                    # Track per-window statistics
+                    for i in range(inputs.size(0)):
+                        target_i = targets[i]
+                        pred_i = pred_mask[i]
+                        target_voxels = int(target_i.sum().item())
+                        pred_voxels = int(pred_i.sum().item())
+                        dice_i = self._calculate_dice(pred_i, target_i).item()
+                        window_dice.append(dice_i)
+                        
+                        if n_batches % 50 == 0:  # Log every 50th window
+                            print(f"Window {n_batches}: GT={target_voxels} vox, "
+                                  f"Pred={pred_voxels} vox, Dice={dice_i:.4f}")
+                    
+                    batch_dice = self._calculate_dice(pred_mask, targets)
                 
                 # Update statistics
                 train_loss += loss.item()
-                train_dice += dice_score
+                train_dice += batch_dice
                 n_batches += 1
                 
                 # Update progress bar
                 pbar.set_postfix({
                     'loss': f"{loss.item():.4f}",
-                    'dice': f"{dice_score:.4f}"
+                    'dice': f"{batch_dice:.4f}"
                 })
                 
                 # Clear cache periodically
                 if n_batches % 10 == 0:
                     torch.cuda.empty_cache()
+        
+        # Print window statistics
+        wd = np.array(window_dice)
+        print(f"\nTrain windows Dice: mean={wd.mean():.4f}, std={wd.std():.4f}, "
+              f"pct>0.0={(wd>0).mean()*100:.1f}%")
         
         return (train_loss / n_batches if n_batches > 0 else float('inf'),
                 train_dice / n_batches if n_batches > 0 else 0)
@@ -247,10 +267,14 @@ class VolumeSegmentationTrainer:
         val_loss = 0
         val_dice = 0
         n_volumes = 0
+        dice_list = []  # Track dice per case
+        neg_count = 0   # Cases without tumor
+        pos_count = 0   # Cases with tumor
         
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc="Validating"):
+            for idx, batch in enumerate(tqdm(val_loader, desc="Validating")):
                 try:
+                    case_id = batch['case_id'][0]
                     # Get full volume
                     inputs = batch['input'].to(self.device)
                     targets = batch['target'].to(self.device)
@@ -278,18 +302,35 @@ class VolumeSegmentationTrainer:
                         overlap_mode='gaussian'  # Use gaussian weighting for smoother stitching
                     )
                     
-                    # Calculate metrics on full volume
+                    # Calculate metrics
                     loss = self.criterion(outputs, targets)
                     probs = torch.sigmoid(outputs)
                     pred_mask = (probs > 0.5).float()
-                    dice_score = self._calculate_dice(pred_mask, targets)
+                    
+                    target_voxels = int(targets.sum().item())
+                    pred_voxels = int(pred_mask.sum().item())
+                    dice_i = self._calculate_dice(pred_mask, targets).item()
+                    dice_list.append(dice_i)
+                    
+                    # Categorize case
+                    if target_voxels == 0:
+                        neg_count += 1
+                    else:
+                        pos_count += 1
+                        
+                    # Log first 10 cases
+                    if idx < 10:
+                        print(f"[VAL Case {case_id}] "
+                              f"GT={target_voxels:6d} voxels, "
+                              f"PR={pred_voxels:6d} voxels, "
+                              f"Dice={dice_i:.4f}")
                     
                     val_loss += loss.item()
-                    val_dice += dice_score
+                    val_dice += dice_i
                     n_volumes += 1
                     
                     if self.config.debug and n_volumes == 1:
-                        self._visualize_full_volume(inputs, targets, pred_mask, batch['case_id'][0])
+                        self._visualize_full_volume(inputs, targets, pred_mask, case_id)
                     
                 except RuntimeError as e:
                     if "out of memory" in str(e):
@@ -297,6 +338,15 @@ class VolumeSegmentationTrainer:
                         torch.cuda.empty_cache()
                         continue
                     raise e
+        
+        # Print validation statistics
+        dice_arr = np.array(dice_list)
+        print(f"\nValidation: {pos_count} positive cases, {neg_count} negatives")
+        print(f"Dice stats over all ({len(dice_arr)}): "
+              f"mean={dice_arr.mean():.4f}, "
+              f"std={dice_arr.std():.4f}, "
+              f"min={dice_arr.min():.4f}, "
+              f"max={dice_arr.max():.4f}")
         
         return (val_loss / n_volumes if n_volumes > 0 else float('inf'),
                 val_dice / n_volumes if n_volumes > 0 else 0)
