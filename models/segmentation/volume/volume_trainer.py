@@ -11,7 +11,7 @@ from torch.utils.tensorboard import SummaryWriter
 import signal
 import sys
 from models.segmentation.model import SegmentationModel
-from models.segmentation.patch.losses_patch import WeightedDiceBCELoss
+from losses_patch import WeightedDiceBCELoss  # Updated import
 from models.segmentation.volume.utils.sliding_window import get_sliding_windows, stitch_predictions
 
 logger = logging.getLogger(__name__)
