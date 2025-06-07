@@ -25,7 +25,7 @@ class KiTS23PatchDataset(Dataset):
                 tumor_only_prob: float = 0.7,
                 use_kidney_mask: bool = False,
                 min_kidney_voxels: int = 100,
-                kidney_patch_overlap: float = 0.2,  # Lowered from 0.5 to 0.2
+                kidney_patch_overlap: float = 0.2,
                 debug: bool = False):
         """
         Args:
@@ -356,14 +356,30 @@ class KiTS23PatchDataset(Dataset):
 
     def _log_sampling_stats(self):
         """Log detailed sampling statistics"""
+        if self.total_patches == 0:
+            logger.info("\nNo patches sampled yet")
+            return
+            
         logger.info("\nPatch sampling statistics:")
         logger.info(f"Total patches sampled: {self.total_patches}")
-        logger.info(f"Tumor-centered patches: {self.tumor_centered_patches} ({100*self.tumor_centered_patches/self.total_patches:.1f}%)")
+        
+        tumor_ratio = 0 if self.total_patches == 0 else (self.tumor_centered_patches / self.total_patches)
+        logger.info(f"Tumor-centered patches: {self.tumor_centered_patches} ({100*tumor_ratio:.1f}%)")
+        
         if self.use_kidney_mask:
-            logger.info(f"Kidney-valid patches: {self.kidney_valid_patches} ({100*self.kidney_valid_patches/self.total_patches:.1f}%)")
-            logger.info(f"Rejected kidney patches: {self.rejected_kidney_patches} ({100*self.rejected_kidney_patches/max(1,self.tumor_centered_patches):.1f}% of tumor patches)")
-            logger.info(f"Rejected overlap patches: {self.rejected_overlap_patches} ({100*self.rejected_overlap_patches/max(1,self.tumor_centered_patches):.1f}% of tumor patches)")
-        logger.info(f"Failed attempts: {self.failed_attempts} ({100*self.failed_attempts/self.total_patches:.1f}%)")
+            kidney_ratio = 0 if self.total_patches == 0 else (self.kidney_valid_patches / self.total_patches)
+            logger.info(f"Kidney-valid patches: {self.kidney_valid_patches} ({100*kidney_ratio:.1f}%)")
+            
+            tumor_reject_ratio = 0 if self.tumor_centered_patches == 0 else (
+                self.rejected_kidney_patches / self.tumor_centered_patches)
+            logger.info(f"Rejected kidney patches: {self.rejected_kidney_patches} ({100*tumor_reject_ratio:.1f}% of tumor patches)")
+            
+            overlap_reject_ratio = 0 if self.tumor_centered_patches == 0 else (
+                self.rejected_overlap_patches / self.tumor_centered_patches)
+            logger.info(f"Rejected overlap patches: {self.rejected_overlap_patches} ({100*overlap_reject_ratio:.1f}% of tumor patches)")
+        
+        fail_ratio = 0 if self.total_patches == 0 else (self.failed_attempts / self.total_patches)
+        logger.info(f"Failed attempts: {self.failed_attempts} ({100*fail_ratio:.1f}%)")
 
     def __len__(self):
         return len(self.volume_paths)
