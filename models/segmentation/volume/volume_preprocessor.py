@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 import numpy as np
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
@@ -29,6 +30,9 @@ class VolumePreprocessor:
         
         # Get window range from config
         self.window_range = getattr(config, 'window_range', (-1024, 1024))
+        
+        # Target shape for downsampling (e.g., 128,256,256)
+        self.target_shape = getattr(config, 'volume_max_dim', (128, 256, 256))
 
     def preprocess_case(self, case_path: Path) -> Dict[str, Any]:
         """
@@ -83,16 +87,35 @@ class VolumePreprocessor:
             del seg_data
             gc.collect()
             
-            print_progress("  Converting to tensors...")
-            # Convert to tensors
-            ct_tensor = torch.from_numpy(ct_norm)[None]           # [1,D,H,W]
-            kidney_tensor = torch.from_numpy(combined_mask)[None]  # [1,D,H,W]
-            tumor_tensor = torch.from_numpy(tumor_mask)[None]      # [1,D,H,W]
-            cyst_tensor = torch.from_numpy(cyst_mask)[None]       # [1,D,H,W]
+            print_progress("  Downsampling volumes...")
+            # Stack all volumes for efficient downsampling
+            vol = np.stack([ct_norm, combined_mask, tumor_mask, cyst_mask], axis=0)  # [4,D,H,W]
+            vol_tensor = torch.from_numpy(vol)[None].to(self.device)  # [1,4,D,H,W]
             
-            # Clean up numpy arrays
-            del ct_norm, combined_mask, tumor_mask, cyst_mask
+            # Downsample all volumes together
+            vol_ds = F.interpolate(
+                vol_tensor, 
+                size=self.target_shape,
+                mode='trilinear',
+                align_corners=False
+            )  # [1,4,D_new,H_new,W_new]
+            
+            # Split channels back out
+            ct_tensor = vol_ds[:, 0:1]      # [1,1,D,H,W]
+            kidney_tensor = vol_ds[:, 1:2]   # [1,1,D,H,W]
+            tumor_tensor = vol_ds[:, 2:3]    # [1,1,D,H,W]
+            cyst_tensor = vol_ds[:, 3:4]     # [1,1,D,H,W]
+            
+            # Clean up full res data
+            del vol, vol_tensor, vol_ds
+            torch.cuda.empty_cache()
             gc.collect()
+            
+            # Move back to CPU
+            ct_tensor = ct_tensor.cpu().squeeze(0)      # [1,D,H,W]
+            kidney_tensor = kidney_tensor.cpu().squeeze(0)  # [1,D,H,W]
+            tumor_tensor = tumor_tensor.cpu().squeeze(0)    # [1,D,H,W]
+            cyst_tensor = cyst_tensor.cpu().squeeze(0)      # [1,D,H,W]
             
             # Create metadata dictionary
             metadata = {
@@ -102,6 +125,7 @@ class VolumePreprocessor:
                 'tumor': tumor_tensor,
                 'cyst': cyst_tensor,
                 'original_shape': original_shape,
+                'target_shape': self.target_shape,
                 'original_spacing': spacing,
                 'stats': {
                     'ct_range': (float(ct_min), float(ct_max)),
@@ -138,29 +162,54 @@ class VolumePreprocessor:
         return torch.load(file_path)
 
     def preprocess_dataset(self, data_dir: Path) -> None:
-        """Preprocess entire dataset"""
+        """Preprocess entire dataset, skipping already processed cases"""
         case_folders = sorted([f for f in data_dir.iterdir() if f.is_dir()])
         print_progress(f"Found {len(case_folders)} cases in {data_dir}")
+        print_progress(f"Target shape: {self.target_shape}")
+        
+        # Check which cases have already been processed
+        processed_files = set(f.stem.replace("case_", "") for f in self.output_dir.glob("case_*.pt"))
+        remaining_cases = [f for f in case_folders if f.name not in processed_files]
+        
+        if len(processed_files) > 0:
+            print_progress(f"Found {len(processed_files)} already processed cases:")
+            for case in processed_files:
+                print_progress(f"  - {case}")
+            print_progress(f"Remaining cases to process: {len(remaining_cases)}")
+            
+        if not remaining_cases:
+            print_progress("All cases have already been processed!")
+            return
         
         success_count = 0
         start_time = time.time()
         
-        for i, case_folder in enumerate(case_folders, 1):
-            print_progress(f"\nProcessing case {i}/{len(case_folders)}")
+        for i, case_folder in enumerate(remaining_cases, 1):
+            print_progress(f"\nProcessing case {i}/{len(remaining_cases)} ({case_folder.name})")
+            
+            # Check again in case file was created by another process
+            output_path = self.output_dir / f"case_{case_folder.name}.pt"
+            if output_path.exists():
+                print_progress(f"  Skipping {case_folder.name} - already processed")
+                success_count += 1
+                continue
+                
             if self.preprocess_case(case_folder) is not None:
                 success_count += 1
             
             # Show progress stats
             elapsed = time.time() - start_time
             cases_per_hour = i / (elapsed / 3600)
-            remaining = len(case_folders) - i
+            remaining = len(remaining_cases) - i
             est_remaining = remaining / cases_per_hour if cases_per_hour > 0 else 0
             
-            print_progress(f"\nProgress: {i}/{len(case_folders)} cases ({i/len(case_folders)*100:.1f}%)")
+            print_progress(f"\nProgress: {i}/{len(remaining_cases)} remaining cases ({i/len(remaining_cases)*100:.1f}%)")
+            print_progress(f"Total processed: {len(processed_files) + i}/{len(case_folders)} cases")
             print_progress(f"Success rate: {success_count/i*100:.1f}%")
             print_progress(f"Processing speed: {cases_per_hour:.1f} cases/hour")
             print_progress(f"Estimated time remaining: {est_remaining:.1f} hours")
             print_progress("="*80)
                 
         print_progress(f"\nPreprocessing complete!")
-        print_progress(f"Successfully preprocessed {success_count}/{len(case_folders)} cases")
+        print_progress(f"Successfully preprocessed {success_count} new cases")
+        print_progress(f"Total processed cases: {len(processed_files) + success_count}/{len(case_folders)}")
