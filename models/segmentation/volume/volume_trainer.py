@@ -413,7 +413,8 @@ class VolumeSegmentationTrainer:
             print("Adapting Phase 1 weights for Phase 3 (2-channel input)...")
             # Find all encoder convolution layers
             for key in list(state_dict.keys()):
-                if '.double_conv.' in key and 'weight' in key:
+                # Only process conv weight tensors (not bias)
+                if 'weight' in key and len(state_dict[key].shape) == 5:  # 5D: [out_ch, in_ch, D, H, W]
                     conv_weight = state_dict[key]
                     if conv_weight.shape[1] == 1:  # If single channel input
                         # Duplicate channel and scale second channel
