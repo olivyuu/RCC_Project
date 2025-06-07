@@ -4,6 +4,7 @@ from typing import Tuple, Optional, List, Dict
 from pathlib import Path
 import logging
 import numpy as np
+import gc
 
 logger = logging.getLogger(__name__)
 
@@ -24,18 +25,18 @@ class KiTS23VolumeDataset(Dataset):
             inference_overlap: Overlap ratio for sliding window inference
             debug: Enable debug logging
         """
-        self.data_dir = Path(data_dir)
+        self.data_dir = Path(data_dir) / "preprocessed_volumes"  # Match VolumePreprocessor output dir
         self.use_kidney_mask = use_kidney_mask
         self.sliding_window_size = sliding_window_size
         self.inference_overlap = inference_overlap
         self.debug = debug
         
-        # Find all preprocessed .pt files
+        # Find all preprocessed .pt files with correct naming pattern
         self.volume_paths = sorted(list(self.data_dir.glob("case_*.pt")))
         if not self.volume_paths:
             raise RuntimeError(f"No preprocessed volumes found in {self.data_dir}")
         
-        logger.info(f"Found {len(self.volume_paths)} preprocessed volumes in {data_dir}")
+        logger.info(f"Found {len(self.volume_paths)} preprocessed volumes in {self.data_dir}")
         logger.info(f"Input channels: {2 if use_kidney_mask else 1} (CT{' + kidney mask' if use_kidney_mask else ''})")
         if sliding_window_size:
             stride = [int(s * (1 - inference_overlap)) for s in sliding_window_size]
@@ -43,43 +44,59 @@ class KiTS23VolumeDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """Get a volume or sliding window crop"""
-        # Load preprocessed tensors
-        data = torch.load(self.volume_paths[idx])
-        image = data['image']         # [1,D,H,W]
-        kidney = data['kidney']       # [1,D,H,W] combined mask
-        tumor = data['tumor']         # [1,D,H,W]
+        try:
+            # Load preprocessed tensors
+            data = torch.load(self.volume_paths[idx])
+            image = data['image']         # [1,D,H,W]
+            tumor = data['tumor']         # [1,D,H,W]
             
-        if self.use_kidney_mask:
-            input_tensor = torch.cat([image, kidney], dim=0)  # [2,D,H,W]
-        else:
-            input_tensor = image  # [1,D,H,W]
+            # Only load kidney mask if needed
+            if self.use_kidney_mask:
+                kidney = data['kidney']       # [1,D,H,W] combined mask (kidney+tumor+cyst)
+                input_tensor = torch.cat([image, kidney], dim=0)  # [2,D,H,W]
+                # Clean up
+                del kidney
+            else:
+                input_tensor = image  # [1,D,H,W]
+                
+            # Clean up image tensor after concatenation
+            del image
             
-        if self.sliding_window_size is None:
-            # Return full volume
-            return {
-                'input': input_tensor,
-                'target': tumor,
-                'case_id': data['case_id'],
-                'shape': data['original_shape'],
-                'spacing': data['original_spacing']
-            }
-        else:
-            # Get random sliding window crop
-            D, H, W = self.sliding_window_size
-            d = np.random.randint(0, image.shape[1] - D + 1)
-            h = np.random.randint(0, image.shape[2] - H + 1)
-            w = np.random.randint(0, image.shape[3] - W + 1)
-            
-            input_crop = input_tensor[:, d:d+D, h:h+H, w:w+W]
-            target_crop = tumor[:, d:d+D, h:h+H, w:w+W]
-            
-            return {
-                'input': input_crop,
-                'target': target_crop,
-                'case_id': data['case_id'],
-                'crop_coords': (d,h,w),
-                'orig_shape': data['original_shape']
-            }
+            if self.sliding_window_size is None:
+                # Return full volume
+                return {
+                    'input': input_tensor,
+                    'target': tumor,
+                    'case_id': data['case_id'],
+                    'shape': data['original_shape'],
+                    'spacing': data['original_spacing']
+                }
+            else:
+                # Get random sliding window crop
+                D, H, W = self.sliding_window_size
+                d = np.random.randint(0, input_tensor.shape[1] - D + 1)
+                h = np.random.randint(0, input_tensor.shape[2] - H + 1)
+                w = np.random.randint(0, input_tensor.shape[3] - W + 1)
+                
+                input_crop = input_tensor[:, d:d+D, h:h+H, w:w+W].clone()
+                target_crop = tumor[:, d:d+D, h:h+H, w:w+W].clone()
+                
+                # Clean up full tensors after cropping
+                del input_tensor
+                del tumor
+                
+                return {
+                    'input': input_crop,
+                    'target': target_crop,
+                    'case_id': data['case_id'],
+                    'crop_coords': (d,h,w),
+                    'orig_shape': data['original_shape']
+                }
+                
+        finally:
+            # Final cleanup
+            torch.cuda.empty_cache()
+            gc.collect()
 
     def __len__(self):
         return len(self.volume_paths)
@@ -100,7 +117,7 @@ class KiTS23VolumeDataset(Dataset):
         
         # Create train/val datasets
         train_dataset = KiTS23VolumeDataset(
-            data_dir=str(self.data_dir),
+            data_dir=str(self.data_dir.parent),  # Remove preprocessed_volumes from path
             use_kidney_mask=self.use_kidney_mask,
             sliding_window_size=self.sliding_window_size,
             inference_overlap=self.inference_overlap,
@@ -109,7 +126,7 @@ class KiTS23VolumeDataset(Dataset):
         train_dataset.volume_paths = [self.volume_paths[i] for i in train_indices]
         
         val_dataset = KiTS23VolumeDataset(
-            data_dir=str(self.data_dir),
+            data_dir=str(self.data_dir.parent),  # Remove preprocessed_volumes from path
             use_kidney_mask=self.use_kidney_mask,
             sliding_window_size=self.sliding_window_size,
             inference_overlap=self.inference_overlap,
