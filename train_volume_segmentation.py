@@ -4,7 +4,7 @@ import logging
 import sys
 
 from models.segmentation.volume.volume_trainer import VolumeSegmentationTrainer
-from models.segmentation.config import SegmentationConfig
+from models.segmentation.volume.volume_config import VolumeSegmentationConfig
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train segmentation model on full volumes")
@@ -36,6 +36,8 @@ def parse_args():
                       help="Sliding window size (D,H,W)")
     parser.add_argument("--window_overlap", type=float, default=0.5,
                       help="Overlap ratio between windows")
+    parser.add_argument("--min_tumor_size", type=int, default=1000,
+                      help="Minimum tumor size after postprocessing")
     
     # Checkpoint parameters
     parser.add_argument("--checkpoint_path", type=str,
@@ -82,38 +84,30 @@ def main():
     window_size = tuple(map(int, args.window_size.split(",")))
     
     # Create configuration
-    config = SegmentationConfig(
-        # Training phase
+    config = VolumeSegmentationConfig(
+        data_dir=args.data_dir,
+        output_dir=args.output_dir,
         training_phase=args.phase,
-        use_kidney_mask=(args.phase == 3),
-        
-        # Model parameters
         features=args.features,
         batch_size=args.batch_size,
         num_epochs=args.epochs,
-        
-        # Volume parameters
         sliding_window_size=window_size,
         inference_overlap=args.window_overlap,
-        
-        # Training parameters
+        postproc_min_size=args.min_tumor_size,
         learning_rate=args.learning_rate,
         grad_clip=args.grad_clip,
-        
-        # Paths
         checkpoint_path=args.checkpoint_path,
-        output_dir=output_dir,
-        checkpoint_dir=output_dir / "checkpoints",
-        log_dir=output_dir / "logs",
-        
         debug=args.debug
     )
+    
+    # Save configuration
+    config.save(output_dir / "volume_config.json")
     
     # Create trainer
     trainer = VolumeSegmentationTrainer(config)
     
     # Start training
-    trainer.train(args.data_dir)
+    trainer.train()
 
 if __name__ == "__main__":
     main()

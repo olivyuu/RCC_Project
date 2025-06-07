@@ -15,13 +15,20 @@ from models.segmentation.model import SegmentationModel
 from models.segmentation.volume.dataset_volume import KiTS23VolumeDataset
 from models.segmentation.patch.losses_patch import WeightedDiceBCELoss
 from models.segmentation.volume.utils.sliding_window import get_sliding_windows, stitch_predictions
+from models.segmentation.volume.volume_config import VolumeSegmentationConfig
 
 logger = logging.getLogger(__name__)
 
 class VolumeSegmentationTrainer:
     """Trainer for full-volume segmentation"""
     
-    def __init__(self, config):
+    def __init__(self, config: VolumeSegmentationConfig):
+        """
+        Initialize trainer with volume-specific configuration
+        
+        Args:
+            config: VolumeSegmentationConfig with phase 3/4 parameters
+        """
         self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
@@ -33,23 +40,18 @@ class VolumeSegmentationTrainer:
             torch.backends.cudnn.benchmark = True
 
         # Create model with correct number of input channels
-        in_channels = 2 if self.config.use_kidney_mask else 1
         self.model = SegmentationModel(
-            in_channels=in_channels,  # CT + kidney mask or CT only
+            in_channels=config.in_channels,  # Determined by phase in config
             out_channels=1,  # Tumor probability
-            features=self.config.features
+            features=config.features
         ).to(self.device)
         
         # Training settings
         self.current_epoch = 0
         self.start_epoch = 0
         self.best_val_dice = float('-inf')
-        self.max_grad_norm = 5.0
         self.seed = 42
 
-        # Create checkpoint directory
-        self.config.checkpoint_dir.mkdir(exist_ok=True)
-        
         # Initialize training components
         self.criterion = WeightedDiceBCELoss(
             pos_weight=torch.tensor([10.0]).to(self.device),
@@ -59,7 +61,7 @@ class VolumeSegmentationTrainer:
         
         self.optimizer = torch.optim.Adam(
             self.model.parameters(),
-            lr=1e-4,
+            lr=config.learning_rate,
             weight_decay=1e-5,
             eps=1e-8
         )
@@ -81,7 +83,7 @@ class VolumeSegmentationTrainer:
             self._load_checkpoint(config.checkpoint_path)
             
         # Print configuration
-        phase_name = "Phase 3" if self.config.use_kidney_mask else "Phase 4"
+        phase_name = "Phase 3" if config.use_kidney_mask else "Phase 4"
         print(f"\nTraining Configuration ({phase_name})")
         print("-----------------------")
         print(f"PyTorch version: {torch.__version__}")
@@ -89,24 +91,24 @@ class VolumeSegmentationTrainer:
         print(f"Random seed: {self.seed}")
         
         print("\nSegmentation Model Configuration:")
-        print(f"Input channels: {in_channels} ({'CT + kidney mask' if self.config.use_kidney_mask else 'CT only'})")
+        print(f"Input channels: {config.in_channels} ({'CT + kidney mask' if config.use_kidney_mask else 'CT only'})")
         print(f"Output channels: 1 (tumor probability)")
-        print(f"Base features: {self.config.features}")
+        print(f"Base features: {config.features}")
         print(f"Encoder depths: 32 → 64 → 128 → 256")
         print(f"Bottleneck features: 512")
         print(f"Total parameters: {sum(p.numel() for p in self.model.parameters()):,}")
         
         print("\nTraining Configuration:")
-        print(f"Sliding window size: {self.config.sliding_window_size}")
-        print(f"Window overlap: {self.config.inference_overlap:.1%}")
-        print(f"Batch size: {self.config.batch_size}")
-        print(f"Learning rate: {self.optimizer.param_groups[0]['lr']}")
-        print(f"Gradient clipping: {self.max_grad_norm}")
+        print(f"Sliding window size: {config.sliding_window_size}")
+        print(f"Window overlap: {config.inference_overlap:.1%}")
+        print(f"Batch size: {config.batch_size}")
+        print(f"Learning rate: {config.learning_rate}")
+        print(f"Gradient clipping: {config.grad_clip}")
         
-        if self.config.debug:
+        if config.debug:
             print("\nDebug mode enabled - will show additional output and visualizations")
 
-    def train(self, dataset_path: str):
+    def train(self):
         """Run full training loop"""
         # Set random seeds
         torch.manual_seed(self.seed)
@@ -117,7 +119,7 @@ class VolumeSegmentationTrainer:
         
         # Create datasets
         dataset = KiTS23VolumeDataset(
-            data_dir=dataset_path,
+            data_dir=self.config.data_dir,
             use_kidney_mask=self.config.use_kidney_mask,
             sliding_window_size=self.config.sliding_window_size,
             inference_overlap=self.config.inference_overlap,
@@ -210,10 +212,10 @@ class VolumeSegmentationTrainer:
         n_batches = 0
         
         with tqdm(train_loader, desc=f"Epoch {self.current_epoch+1}/{self.config.num_epochs}") as pbar:
-            for batch_idx, data in enumerate(pbar):
+            for batch_idx, batch in enumerate(pbar):
                 # Move data to device
-                inputs = data['input'].to(self.device)
-                targets = data['target'].to(self.device)
+                inputs = batch['input'].to(self.device)
+                targets = batch['target'].to(self.device)
                 
                 # Forward pass with autocast
                 with torch.cuda.amp.autocast():
@@ -227,7 +229,7 @@ class VolumeSegmentationTrainer:
                 
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(),
-                    self.max_grad_norm
+                    self.config.grad_clip
                 )
                 
                 self.scaler.step(self.optimizer)
@@ -265,11 +267,11 @@ class VolumeSegmentationTrainer:
         n_volumes = 0
         
         with torch.no_grad():
-            for data in tqdm(val_loader, desc="Validating"):
+            for batch in tqdm(val_loader, desc="Validating"):
                 try:
                     # Get full volume
-                    inputs = data['input'].to(self.device)  # [1,C,D,H,W]
-                    targets = data['target'].to(self.device)  # [1,1,D,H,W]
+                    inputs = batch['input'].to(self.device)
+                    targets = batch['target'].to(self.device)
                     
                     if self.config.sliding_window_size is None:
                         # Process full volume
@@ -329,37 +331,33 @@ class VolumeSegmentationTrainer:
         self.model.eval()
         
         # Get first validation volume
-        data = next(iter(val_loader))
-        inputs = data['input'].to(self.device)
-        targets = data['target'].to(self.device)
+        batch = next(iter(val_loader))
+        inputs = batch['input'].to(self.device)
+        targets = batch['target'].to(self.device)
         
         with torch.no_grad():
-            # Get predictions
-            if self.config.sliding_window_size is None:
-                outputs = self.model(inputs)
-            else:
-                # Get sliding windows
-                windows = get_sliding_windows(
-                    inputs.shape[2:],
-                    self.config.sliding_window_size,
-                    min_overlap=self.config.inference_overlap
-                )
+            # Get predictions using sliding windows
+            windows = get_sliding_windows(
+                inputs.shape[2:],
+                self.config.sliding_window_size,
+                min_overlap=self.config.inference_overlap
+            )
+            
+            # Process windows
+            window_preds = []
+            for coords in windows:
+                z_slice, y_slice, x_slice = coords
+                window = inputs[..., z_slice, y_slice, x_slice]
+                pred = self.model(window)
+                window_preds.append(pred)
                 
-                # Process windows
-                window_preds = []
-                for coords in windows:
-                    z_slice, y_slice, x_slice = coords
-                    window = inputs[..., z_slice, y_slice, x_slice]
-                    pred = self.model(window)
-                    window_preds.append(pred)
-                    
-                # Stitch predictions
-                outputs = stitch_predictions(
-                    window_preds,
-                    windows,
-                    targets.shape,
-                    overlap_mode='mean'
-                )
+            # Stitch predictions
+            outputs = stitch_predictions(
+                window_preds,
+                windows,
+                targets.shape,
+                overlap_mode='mean'
+            )
             
             probs = torch.sigmoid(outputs)
             
@@ -418,6 +416,7 @@ class VolumeSegmentationTrainer:
             'metrics': metrics,
             'config': {
                 'use_kidney_mask': self.config.use_kidney_mask,
+                'in_channels': self.config.in_channels,
                 'sliding_window_size': self.config.sliding_window_size,
                 'inference_overlap': self.config.inference_overlap,
                 'training_phase': 3 if self.config.use_kidney_mask else 4,
@@ -462,7 +461,7 @@ class VolumeSegmentationTrainer:
             # Initialize fresh optimizer and scheduler 
             self.optimizer = torch.optim.Adam(
                 self.model.parameters(),
-                lr=1e-4,
+                lr=self.config.learning_rate,
                 weight_decay=1e-5,
                 eps=1e-8
             )
