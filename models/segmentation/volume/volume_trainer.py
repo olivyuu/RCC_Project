@@ -10,25 +10,17 @@ import matplotlib.pyplot as plt
 from torch.utils.tensorboard import SummaryWriter
 import signal
 import sys
-
 from models.segmentation.model import SegmentationModel
-from models.segmentation.volume.dataset_volume import KiTS23VolumeDataset
 from models.segmentation.patch.losses_patch import WeightedDiceBCELoss
 from models.segmentation.volume.utils.sliding_window import get_sliding_windows, stitch_predictions
-from models.segmentation.volume.volume_config import VolumeSegmentationConfig
 
 logger = logging.getLogger(__name__)
 
 class VolumeSegmentationTrainer:
     """Trainer for full-volume segmentation"""
     
-    def __init__(self, config: VolumeSegmentationConfig):
-        """
-        Initialize trainer with volume-specific configuration
-        
-        Args:
-            config: VolumeSegmentationConfig with phase 3/4 parameters
-        """
+    def __init__(self, config):
+        """Initialize trainer with configuration"""
         self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
@@ -38,6 +30,10 @@ class VolumeSegmentationTrainer:
             torch.cuda.empty_cache()
             torch.cuda.set_per_process_memory_fraction(0.95)
             torch.backends.cudnn.benchmark = True
+            
+        # Validation sliding window settings
+        self.val_window_size = (128, 256, 256)  # Fixed size for validation
+        self.val_overlap = 0.5
 
         # Create model with correct number of input channels
         self.model = SegmentationModel(
@@ -94,19 +90,7 @@ class VolumeSegmentationTrainer:
         print(f"Input channels: {config.in_channels} ({'CT + kidney mask' if config.use_kidney_mask else 'CT only'})")
         print(f"Output channels: 1 (tumor probability)")
         print(f"Base features: {config.features}")
-        print(f"Encoder depths: 32 → 64 → 128 → 256")
-        print(f"Bottleneck features: 512")
         print(f"Total parameters: {sum(p.numel() for p in self.model.parameters()):,}")
-        
-        print("\nTraining Configuration:")
-        print(f"Sliding window size: {config.sliding_window_size}")
-        print(f"Window overlap: {config.inference_overlap:.1%}")
-        print(f"Batch size: {config.batch_size}")
-        print(f"Learning rate: {config.learning_rate}")
-        print(f"Gradient clipping: {config.grad_clip}")
-        
-        if config.debug:
-            print("\nDebug mode enabled - will show additional output and visualizations")
 
     def train(self):
         """Run full training loop"""
@@ -121,6 +105,7 @@ class VolumeSegmentationTrainer:
         dataset = KiTS23VolumeDataset(
             data_dir=self.config.data_dir,
             use_kidney_mask=self.config.use_kidney_mask,
+            training=True,  # Training mode with sliding windows
             sliding_window_size=self.config.sliding_window_size,
             inference_overlap=self.config.inference_overlap,
             debug=self.config.debug
@@ -183,10 +168,6 @@ class VolumeSegmentationTrainer:
                     is_best
                 )
                 
-                # Visualize predictions
-                if self.config.debug and epoch % 5 == 0:
-                    self._visualize_predictions(val_loader, epoch)
-                    
         except KeyboardInterrupt:
             print("\nTraining interrupted. Saving checkpoint...")
             self._save_checkpoint(
@@ -212,7 +193,7 @@ class VolumeSegmentationTrainer:
         n_batches = 0
         
         with tqdm(train_loader, desc=f"Epoch {self.current_epoch+1}/{self.config.num_epochs}") as pbar:
-            for batch_idx, batch in enumerate(pbar):
+            for batch in pbar:
                 # Move data to device
                 inputs = batch['input'].to(self.device)
                 targets = batch['target'].to(self.device)
@@ -253,14 +234,14 @@ class VolumeSegmentationTrainer:
                 })
                 
                 # Clear cache periodically
-                if batch_idx % 10 == 0:
+                if n_batches % 10 == 0:
                     torch.cuda.empty_cache()
         
         return (train_loss / n_batches if n_batches > 0 else float('inf'),
                 train_dice / n_batches if n_batches > 0 else 0)
 
     def _validate(self, val_loader):
-        """Run validation"""
+        """Run validation with full-volume evaluation"""
         self.model.eval()
         val_loss = 0
         val_dice = 0
@@ -273,34 +254,30 @@ class VolumeSegmentationTrainer:
                     inputs = batch['input'].to(self.device)
                     targets = batch['target'].to(self.device)
                     
-                    if self.config.sliding_window_size is None:
-                        # Process full volume
-                        outputs = self.model(inputs)
-                    else:
-                        # Get sliding windows
-                        windows = get_sliding_windows(
-                            inputs.shape[2:],  # [D,H,W]
-                            self.config.sliding_window_size,
-                            min_overlap=self.config.inference_overlap
-                        )
-                        
-                        # Process each window
-                        window_preds = []
-                        for coords in windows:
-                            z_slice, y_slice, x_slice = coords
-                            window = inputs[..., z_slice, y_slice, x_slice]
-                            pred = self.model(window)
-                            window_preds.append(pred)
-                        
-                        # Stitch predictions
-                        outputs = stitch_predictions(
-                            window_preds,
-                            windows,
-                            targets.shape,
-                            overlap_mode='mean'
-                        )
+                    # Process with sliding windows
+                    windows = get_sliding_windows(
+                        inputs.shape[2:],  # [D,H,W]
+                        self.val_window_size,
+                        min_overlap=self.val_overlap
+                    )
                     
-                    # Calculate metrics
+                    # Process each window
+                    window_preds = []
+                    for coords in windows:
+                        z_slice, y_slice, x_slice = coords
+                        window = inputs[..., z_slice, y_slice, x_slice]
+                        pred = self.model(window)
+                        window_preds.append(pred)
+                    
+                    # Stitch predictions
+                    outputs = stitch_predictions(
+                        window_preds,
+                        windows,
+                        targets.shape,
+                        overlap_mode='gaussian'  # Use gaussian weighting for smoother stitching
+                    )
+                    
+                    # Calculate metrics on full volume
                     loss = self.criterion(outputs, targets)
                     probs = torch.sigmoid(outputs)
                     pred_mask = (probs > 0.5).float()
@@ -310,9 +287,12 @@ class VolumeSegmentationTrainer:
                     val_dice += dice_score
                     n_volumes += 1
                     
+                    if self.config.debug and n_volumes == 1:
+                        self._visualize_full_volume(inputs, targets, pred_mask, batch['case_id'][0])
+                    
                 except RuntimeError as e:
                     if "out of memory" in str(e):
-                        print(f"\nCUDA OOM during validation. Skipping volume.")
+                        logger.error(f"\nCUDA OOM during validation. Skipping volume.")
                         torch.cuda.empty_cache()
                         continue
                     raise e
@@ -320,88 +300,69 @@ class VolumeSegmentationTrainer:
         return (val_loss / n_volumes if n_volumes > 0 else float('inf'),
                 val_dice / n_volumes if n_volumes > 0 else 0)
 
+    def _visualize_full_volume(self, inputs, targets, predictions, case_id):
+        """Create visualization of full-volume predictions"""
+        # Get middle slices
+        slice_idx = inputs.shape[2] // 2
+        
+        n_plots = 4 if self.config.use_kidney_mask else 3
+        fig, axes = plt.subplots(1, n_plots, figsize=(5*n_plots, 5))
+        
+        # Plot CT
+        axes[0].imshow(inputs[0, 0, slice_idx].cpu(), cmap='gray')
+        axes[0].set_title('CT')
+        axes[0].axis('off')
+        
+        if self.config.use_kidney_mask:
+            # Plot kidney mask
+            axes[1].imshow(inputs[0, 1, slice_idx].cpu(), cmap='gray')
+            axes[1].set_title('Kidney Mask')
+            axes[1].axis('off')
+            
+            # Plot ground truth
+            axes[2].imshow(targets[0, 0, slice_idx].cpu(), cmap='gray')
+            axes[2].set_title('Ground Truth')
+            axes[2].axis('off')
+            
+            # Plot prediction
+            axes[3].imshow(predictions[0, 0, slice_idx].cpu(), cmap='gray')
+            axes[3].set_title(f'Prediction (Case {case_id})')
+            axes[3].axis('off')
+        else:
+            # Plot ground truth
+            axes[1].imshow(targets[0, 0, slice_idx].cpu(), cmap='gray')
+            axes[1].set_title('Ground Truth')
+            axes[1].axis('off')
+            
+            # Plot prediction
+            axes[2].imshow(predictions[0, 0, slice_idx].cpu(), cmap='gray')
+            axes[2].set_title(f'Prediction (Case {case_id})')
+            axes[2].axis('off')
+        
+        # Add to tensorboard
+        self.writer.add_figure('Full Volume Predictions', fig, self.current_epoch)
+        plt.close(fig)
+
     def _calculate_dice(self, pred: torch.Tensor, target: torch.Tensor) -> float:
         """Calculate Dice score between prediction and target"""
         intersection = (pred * target).sum()
         union = pred.sum() + target.sum()
         return (2 * intersection + 1e-5) / (union + 1e-5)
 
-    def _visualize_predictions(self, val_loader, epoch):
-        """Create visualization of model predictions"""
-        self.model.eval()
+    def _log_metrics(self, train_loss, train_dice, val_loss, val_dice, lr, epoch):
+        """Log epoch metrics to console and tensorboard"""
+        # Add scalars to tensorboard
+        self.writer.add_scalar('Loss/Train', train_loss, epoch)
+        self.writer.add_scalar('Loss/Val', val_loss, epoch)
+        self.writer.add_scalar('Dice/Train', train_dice, epoch)
+        self.writer.add_scalar('Dice/Val', val_dice, epoch)
+        self.writer.add_scalar('LearningRate', lr, epoch)
         
-        # Get first validation volume
-        batch = next(iter(val_loader))
-        inputs = batch['input'].to(self.device)
-        targets = batch['target'].to(self.device)
-        
-        with torch.no_grad():
-            # Get predictions using sliding windows
-            windows = get_sliding_windows(
-                inputs.shape[2:],
-                self.config.sliding_window_size,
-                min_overlap=self.config.inference_overlap
-            )
-            
-            # Process windows
-            window_preds = []
-            for coords in windows:
-                z_slice, y_slice, x_slice = coords
-                window = inputs[..., z_slice, y_slice, x_slice]
-                pred = self.model(window)
-                window_preds.append(pred)
-                
-            # Stitch predictions
-            outputs = stitch_predictions(
-                window_preds,
-                windows,
-                targets.shape,
-                overlap_mode='mean'
-            )
-            
-            probs = torch.sigmoid(outputs)
-            
-            # Get middle slice
-            slice_idx = probs.shape[2] // 2
-            
-            # Create figure
-            n_plots = 4 if self.config.use_kidney_mask else 3
-            fig, axes = plt.subplots(1, n_plots, figsize=(5*n_plots, 5))
-            
-            # Plot CT
-            axes[0].imshow(inputs[0, 0, slice_idx].cpu(), cmap='gray')
-            axes[0].set_title('CT')
-            axes[0].axis('off')
-            
-            if self.config.use_kidney_mask:
-                # Plot kidney mask
-                axes[1].imshow(inputs[0, 1, slice_idx].cpu(), cmap='gray')
-                axes[1].set_title('Kidney Mask')
-                axes[1].axis('off')
-                
-                # Plot ground truth
-                axes[2].imshow(targets[0, 0, slice_idx].cpu(), cmap='gray')
-                axes[2].set_title('Ground Truth')
-                axes[2].axis('off')
-                
-                # Plot prediction
-                axes[3].imshow(probs[0, 0, slice_idx].cpu(), cmap='gray')
-                axes[3].set_title(f'Prediction (Epoch {epoch+1})')
-                axes[3].axis('off')
-            else:
-                # Plot ground truth
-                axes[1].imshow(targets[0, 0, slice_idx].cpu(), cmap='gray')
-                axes[1].set_title('Ground Truth')
-                axes[1].axis('off')
-                
-                # Plot prediction
-                axes[2].imshow(probs[0, 0, slice_idx].cpu(), cmap='gray')
-                axes[2].set_title(f'Prediction (Epoch {epoch+1})')
-                axes[2].axis('off')
-            
-            # Add to tensorboard
-            self.writer.add_figure('Predictions', fig, epoch)
-            plt.close(fig)
+        # Print to console
+        print(f"\nEpoch {epoch+1}/{self.config.num_epochs}")
+        print(f"Train - Loss: {train_loss:.4f}, Dice: {train_dice:.4f}")
+        print(f"Val   - Loss: {val_loss:.4f}, Dice: {val_dice:.4f}")
+        print(f"Learning rate: {lr:.2e}")
 
     def _save_checkpoint(self, epoch: int, metrics: dict, is_best: bool = False):
         """Save training checkpoint"""
@@ -417,10 +378,10 @@ class VolumeSegmentationTrainer:
             'config': {
                 'use_kidney_mask': self.config.use_kidney_mask,
                 'in_channels': self.config.in_channels,
-                'sliding_window_size': self.config.sliding_window_size,
-                'inference_overlap': self.config.inference_overlap,
                 'training_phase': 3 if self.config.use_kidney_mask else 4,
-                'seed': self.seed
+                'seed': self.seed,
+                'val_window_size': self.val_window_size,
+                'val_overlap': self.val_overlap
             }
         }
         
@@ -482,22 +443,12 @@ class VolumeSegmentationTrainer:
             self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
             
+            # Load validation settings if available
+            if 'val_window_size' in checkpoint['config']:
+                self.val_window_size = checkpoint['config']['val_window_size']
+                self.val_overlap = checkpoint['config']['val_overlap']
+            
         print(f"Starting training from epoch {self.start_epoch}")
-
-    def _log_metrics(self, train_loss, train_dice, val_loss, val_dice, lr, epoch):
-        """Log epoch metrics to console and tensorboard"""
-        # Add scalars to tensorboard
-        self.writer.add_scalar('Loss/Train', train_loss, epoch)
-        self.writer.add_scalar('Loss/Val', val_loss, epoch)
-        self.writer.add_scalar('Dice/Train', train_dice, epoch)
-        self.writer.add_scalar('Dice/Val', val_dice, epoch)
-        self.writer.add_scalar('LearningRate', lr, epoch)
-        
-        # Print to console
-        print(f"\nEpoch {epoch+1}/{self.config.num_epochs}")
-        print(f"Train - Loss: {train_loss:.4f}, Dice: {train_dice:.4f}")
-        print(f"Val   - Loss: {val_loss:.4f}, Dice: {val_dice:.4f}")
-        print(f"Learning rate: {lr:.2e}")
 
     def _handle_interrupt(self, signum, frame):
         """Handle interrupt signals gracefully"""

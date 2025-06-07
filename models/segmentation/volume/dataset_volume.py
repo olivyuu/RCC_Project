@@ -14,6 +14,7 @@ class KiTS23VolumeDataset(Dataset):
     def __init__(self,
                 data_dir: str,
                 use_kidney_mask: bool = True,
+                training: bool = True,
                 sliding_window_size: Optional[Tuple[int, int, int]] = None,
                 inference_overlap: float = 0.5,
                 debug: bool = False):
@@ -21,13 +22,16 @@ class KiTS23VolumeDataset(Dataset):
         Args:
             data_dir: Path to preprocessed .pt files
             use_kidney_mask: Whether to return 2-channel input (CT + kidney)
-            sliding_window_size: Size of sliding window crops (D,H,W) or None for full volume
+            training: Whether this is training set (True) or validation (False)
+            sliding_window_size: Size of sliding window crops for training
             inference_overlap: Overlap ratio for sliding window inference
             debug: Enable debug logging
         """
         self.data_dir = Path(data_dir) / "preprocessed_volumes"  # Match VolumePreprocessor output dir
         self.use_kidney_mask = use_kidney_mask
-        self.sliding_window_size = sliding_window_size
+        self.training = training
+        # Only use sliding windows during training
+        self.sliding_window_size = sliding_window_size if training else None
         self.inference_overlap = inference_overlap
         self.debug = debug
         
@@ -38,9 +42,12 @@ class KiTS23VolumeDataset(Dataset):
         
         logger.info(f"Found {len(self.volume_paths)} preprocessed volumes in {self.data_dir}")
         logger.info(f"Input channels: {2 if use_kidney_mask else 1} (CT{' + kidney mask' if use_kidney_mask else ''})")
-        if sliding_window_size:
+        logger.info(f"Mode: {'Training' if training else 'Validation'}")
+        if self.sliding_window_size:
             stride = [int(s * (1 - inference_overlap)) for s in sliding_window_size]
             logger.info(f"Using sliding windows: size={sliding_window_size}, stride={stride}")
+        else:
+            logger.info("Using full volumes (no sliding windows)")
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """Get a volume or sliding window crop"""
@@ -62,17 +69,8 @@ class KiTS23VolumeDataset(Dataset):
             # Clean up image tensor after concatenation
             del image
             
-            if self.sliding_window_size is None:
-                # Return full volume
-                return {
-                    'input': input_tensor,
-                    'target': tumor,
-                    'case_id': data['case_id'],
-                    'shape': data['original_shape'],
-                    'spacing': data['original_spacing']
-                }
-            else:
-                # Get random sliding window crop
+            if self.training and self.sliding_window_size:
+                # Get random sliding window crop for training
                 D, H, W = self.sliding_window_size
                 d = np.random.randint(0, input_tensor.shape[1] - D + 1)
                 h = np.random.randint(0, input_tensor.shape[2] - H + 1)
@@ -91,6 +89,15 @@ class KiTS23VolumeDataset(Dataset):
                     'case_id': data['case_id'],
                     'crop_coords': (d,h,w),
                     'orig_shape': data['original_shape']
+                }
+            else:
+                # Return full volume for validation
+                return {
+                    'input': input_tensor,
+                    'target': tumor,
+                    'case_id': data['case_id'],
+                    'shape': data['original_shape'],
+                    'spacing': data['original_spacing']
                 }
                 
         finally:
@@ -115,10 +122,11 @@ class KiTS23VolumeDataset(Dataset):
         train_indices = indices[split:]
         val_indices = indices[:split]
         
-        # Create train/val datasets
+        # Create train/val datasets with appropriate settings
         train_dataset = KiTS23VolumeDataset(
             data_dir=str(self.data_dir.parent),  # Remove preprocessed_volumes from path
             use_kidney_mask=self.use_kidney_mask,
+            training=True,  # Training mode with sliding windows
             sliding_window_size=self.sliding_window_size,
             inference_overlap=self.inference_overlap,
             debug=self.debug
@@ -128,14 +136,15 @@ class KiTS23VolumeDataset(Dataset):
         val_dataset = KiTS23VolumeDataset(
             data_dir=str(self.data_dir.parent),  # Remove preprocessed_volumes from path
             use_kidney_mask=self.use_kidney_mask,
-            sliding_window_size=self.sliding_window_size,
+            training=False,  # Validation mode with full volumes
+            sliding_window_size=self.sliding_window_size,  # Will be ignored in val
             inference_overlap=self.inference_overlap,
             debug=self.debug
         )
         val_dataset.volume_paths = [self.volume_paths[i] for i in val_indices]
         
         logger.info(f"\nSplit dataset into:")
-        logger.info(f"Train: {len(train_dataset)} volumes")
-        logger.info(f"Val: {len(val_dataset)} volumes")
+        logger.info(f"Train: {len(train_dataset)} volumes (with sliding windows)")
+        logger.info(f"Val: {len(val_dataset)} volumes (full volume evaluation)")
         
         return train_dataset, val_dataset
