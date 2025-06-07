@@ -12,6 +12,7 @@ import signal
 import sys
 from models.segmentation.model import SegmentationModel
 from losses_patch import WeightedDiceBCELoss
+from models.segmentation.volume.dataset_volume import KiTS23VolumeDataset
 from models.segmentation.volume.utils.sliding_window import get_sliding_windows, stitch_predictions
 
 logger = logging.getLogger(__name__)
