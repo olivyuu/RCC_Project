@@ -430,13 +430,13 @@ class VolumeSegmentationTrainer:
             logger.error(f"Error loading checkpoint: {str(e)}")
             raise
         
-        # Verify phase compatibility
+        # Get checkpoint phase
         checkpoint_phase = checkpoint['config'].get('training_phase', 1)
-        current_phase = 3 if self.config.use_kidney_mask else 4
         
-        if checkpoint_phase not in [1, current_phase]:
-            print(f"Loading Phase {checkpoint_phase} checkpoint for Phase {current_phase}. Starting fresh from epoch 0.")
-            # Always start from epoch 0 when loading Phase 1 checkpoint
+        # Special handling for Phase 1 -> Phase 3 transition
+        if checkpoint_phase == 1 and self.config.use_kidney_mask:
+            print("Loading Phase 1 → Phase 3; reinitializing optimizer/scheduler/scaler")
+            # Start fresh with expanded model weights
             self.start_epoch = 0
             self.best_val_dice = float('-inf')
             # Initialize fresh optimizer and scheduler 
@@ -457,7 +457,7 @@ class VolumeSegmentationTrainer:
             self.scaler = GradScaler()
             print("Initialized fresh optimizer and scheduler.")
         else:
-            # Continue from saved epoch if same phase
+            # Same phase or Phase 3->4: resume everything
             self.start_epoch = checkpoint['epoch'] + 1
             self.best_val_dice = checkpoint['best_val_dice']
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
