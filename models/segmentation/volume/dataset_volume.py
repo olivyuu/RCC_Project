@@ -1,10 +1,10 @@
 import torch
-import torch.nn.functional as F
 from torch.utils.data import Dataset
 from typing import Tuple, Optional, List, Dict
 from pathlib import Path
 import logging
 import numpy as np
+import nibabel as nib
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +19,7 @@ class KiTS23VolumeDataset(Dataset):
                 debug: bool = False):
         """
         Args:
-            data_dir: Path to preprocessed .pt files
+            data_dir: Path to case folders containing .nii.gz files
             use_kidney_mask: Whether to return 2-channel input (CT + kidney)
             sliding_window_size: Size of sliding window crops (D,H,W) or None for full volume
             inference_overlap: Overlap ratio for sliding window inference
@@ -31,69 +31,83 @@ class KiTS23VolumeDataset(Dataset):
         self.inference_overlap = inference_overlap
         self.debug = debug
         
-        # Find all preprocessed volumes
-        self.volume_paths = sorted(list(self.data_dir.glob("case_*.pt")))
-        if not self.volume_paths:
-            raise RuntimeError(f"No preprocessed volumes found in {self.data_dir}")
+        # Find all case folders
+        self.case_paths = sorted([f for f in self.data_dir.iterdir() if f.is_dir()])
+        if not self.case_paths:
+            raise RuntimeError(f"No case folders found in {self.data_dir}")
         
-        # Track dataset statistics
-        self.volumes_with_tumor = 0
-        self.total_tumor_voxels = 0
-        
-        # Initialize if using sliding windows
-        if sliding_window_size is not None:
-            self.stride = [int(s * (1 - inference_overlap)) for s in sliding_window_size]
-            
-        print(f"Found {len(self.volume_paths)} volumes in {data_dir}")
-        print(f"Input channels: {2 if use_kidney_mask else 1} (CT{' + kidney mask' if use_kidney_mask else ''})")
+        logger.info(f"Found {len(self.case_paths)} cases in {data_dir}")
+        logger.info(f"Input channels: {2 if use_kidney_mask else 1} (CT{' + kidney mask' if use_kidney_mask else ''})")
         if sliding_window_size:
-            print(f"Using sliding windows: size={sliding_window_size}, stride={self.stride}")
+            stride = [int(s * (1 - inference_overlap)) for s in sliding_window_size]
+            logger.info(f"Using sliding windows: size={sliding_window_size}, stride={stride}")
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """Get a volume or sliding window crop with optional kidney mask"""
-        # Load preprocessed data
-        data = torch.load(self.volume_paths[idx])
-        image = data['image']  # [1,D,H,W]
-        tumor = data['tumor']  # [1,D,H,W]
+        """Get a volume or sliding window crop"""
+        case_path = self.case_paths[idx]
         
-        # Create kidney mask (kidney + tumor + cyst)
-        if self.use_kidney_mask:
-            kidney = data['kidney']  # [1,D,H,W]
-            cyst = data.get('cyst', torch.zeros_like(kidney))  # [1,D,H,W] 
-            kidney_mask = (kidney > 0) | (tumor > 0) | (cyst > 0)  # Include kidney, tumor and cysts
-            input_tensor = torch.cat([image, kidney_mask.float()], dim=0)  # [2,D,H,W]
+        # Load CT volume
+        img_path = case_path / "imaging.nii.gz"
+        img_obj = nib.load(str(img_path))
+        ct_data = img_obj.get_fdata()
+        
+        # Load segmentation
+        seg_path = case_path / "segmentation.nii.gz"
+        seg_obj = nib.load(str(seg_path))
+        seg_data = seg_obj.get_fdata()
+        
+        # Create masks
+        tumor_mask = (seg_data == 2).astype(np.float32)  # Tumor
+        
+        # Combined kidney mask includes kidney, tumor, and cysts
+        kidney_mask = ((seg_data == 1) | (seg_data == 2) | (seg_data == 3)).astype(np.float32)
+        
+        # Normalize CT globally
+        ct_min, ct_max = ct_data.min(), ct_data.max()
+        if ct_max > ct_min:
+            ct_norm = (ct_data - ct_min) / (ct_max - ct_min)
         else:
-            input_tensor = image  # [1,D,H,W]
+            ct_norm = np.zeros_like(ct_data)
+            
+        # Convert to tensors with channel dimension
+        ct_tensor = torch.from_numpy(ct_norm)[None]          # [1,D,H,W]
+        tumor_tensor = torch.from_numpy(tumor_mask)[None]    # [1,D,H,W]
+        
+        if self.use_kidney_mask:
+            kidney_tensor = torch.from_numpy(kidney_mask)[None]  # [1,D,H,W]
+            input_tensor = torch.cat([ct_tensor, kidney_tensor], dim=0)  # [2,D,H,W]
+        else:
+            input_tensor = ct_tensor  # [1,D,H,W]
             
         if self.sliding_window_size is None:
             # Return full volume
             return {
                 'input': input_tensor,
-                'target': tumor,
-                'case_id': data['case_id'],
-                'shape': image.shape[1:],
-                'spacing': data.get('spacing', None)
+                'target': tumor_tensor,
+                'case_id': case_path.name,
+                'shape': ct_data.shape,
+                'spacing': img_obj.header.get_zooms()
             }
         else:
-            # Get sliding window crop
+            # Get random sliding window crop
             D, H, W = self.sliding_window_size
-            d = np.random.randint(0, image.shape[1] - D + 1)
-            h = np.random.randint(0, image.shape[2] - H + 1)
-            w = np.random.randint(0, image.shape[3] - W + 1)
+            d = np.random.randint(0, ct_data.shape[0] - D + 1)
+            h = np.random.randint(0, ct_data.shape[1] - H + 1)
+            w = np.random.randint(0, ct_data.shape[2] - W + 1)
             
             input_crop = input_tensor[:, d:d+D, h:h+H, w:w+W]
-            target_crop = tumor[:, d:d+D, h:h+H, w:w+W]
+            target_crop = tumor_tensor[:, d:d+D, h:h+H, w:w+W]
             
             return {
                 'input': input_crop,
                 'target': target_crop,
-                'case_id': data['case_id'],
+                'case_id': case_path.name,
                 'crop_coords': (d,h,w),
-                'orig_shape': image.shape[1:]
+                'orig_shape': ct_data.shape
             }
 
     def __len__(self):
-        return len(self.volume_paths)
+        return len(self.case_paths)
         
     def get_train_val_splits(self, 
                           val_ratio: float = 0.2,
@@ -111,25 +125,25 @@ class KiTS23VolumeDataset(Dataset):
         
         # Create train/val datasets
         train_dataset = KiTS23VolumeDataset(
-            data_dir=self.data_dir,
+            data_dir=str(self.data_dir),
             use_kidney_mask=self.use_kidney_mask,
             sliding_window_size=self.sliding_window_size,
             inference_overlap=self.inference_overlap,
             debug=self.debug
         )
-        train_dataset.volume_paths = [self.volume_paths[i] for i in train_indices]
+        train_dataset.case_paths = [self.case_paths[i] for i in train_indices]
         
         val_dataset = KiTS23VolumeDataset(
-            data_dir=self.data_dir,
+            data_dir=str(self.data_dir),
             use_kidney_mask=self.use_kidney_mask,
             sliding_window_size=self.sliding_window_size,
             inference_overlap=self.inference_overlap,
             debug=self.debug
         )
-        val_dataset.volume_paths = [self.volume_paths[i] for i in val_indices]
+        val_dataset.case_paths = [self.case_paths[i] for i in val_indices]
         
-        print(f"\nSplit dataset into:")
-        print(f"Train: {len(train_dataset)} volumes")
-        print(f"Val: {len(val_dataset)} volumes")
+        logger.info(f"\nSplit dataset into:")
+        logger.info(f"Train: {len(train_dataset)} volumes")
+        logger.info(f"Val: {len(val_dataset)} volumes")
         
         return train_dataset, val_dataset
