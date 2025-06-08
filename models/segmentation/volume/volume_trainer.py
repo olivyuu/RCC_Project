@@ -1,6 +1,6 @@
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader 
 from torch.cuda.amp import GradScaler
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import numpy as np
@@ -16,11 +16,12 @@ import random
 from models.segmentation.model import SegmentationModel
 from losses_patch import WeightedDiceBCELoss
 from models.segmentation.volume.dataset_volume import KiTS23VolumeDataset
+from models.segmentation.volume.tumor_window_dataset import TumorRichWindowDataset
 
 logger = logging.getLogger(__name__)
 
 class VolumeSegmentationTrainer:
-    """Trainer for full-volume segmentation"""
+    """Trainer for full-volume segmentation with warmup"""
     
     def __init__(self, config):
         """Initialize trainer with configuration"""
@@ -46,6 +47,13 @@ class VolumeSegmentationTrainer:
         self.start_epoch = 0
         self.best_val_dice = float('-inf')
         self.seed = 42
+        
+        # Warmup settings
+        self.warmup_epochs = getattr(config, 'warmup_epochs', 0)
+        self.window_size = (64, 128, 128)
+        self.window_stride = (32, 64, 64)
+        self.min_tumor_ratio = 0.001
+        self.top_tumor_percent = 20
 
         # Initialize training components
         self.criterion = WeightedDiceBCELoss(
@@ -92,6 +100,14 @@ class VolumeSegmentationTrainer:
         print(f"Output channels: 1 (tumor probability)")
         print(f"Base features: {config.features}")
         print(f"Total parameters: {sum(p.numel() for p in self.model.parameters()):,}")
+        
+        if self.warmup_epochs > 0:
+            print("\nWarmup Configuration:")
+            print(f"Warmup epochs: {self.warmup_epochs}")
+            print(f"Window size: {self.window_size}")
+            print(f"Window stride: {self.window_stride}")
+            print(f"Min tumor ratio: {self.min_tumor_ratio}")
+            print(f"Top tumor percent: {self.top_tumor_percent}%")
 
     @staticmethod
     def _apply_augmentations(volume: torch.Tensor) -> torch.Tensor:
@@ -108,7 +124,7 @@ class VolumeSegmentationTrainer:
             # Restore original shape
             volume = volume.view(B, C, D, H, W)
             
-        # Random Gaussian noise (small amplitude)
+        # Random Gaussian noise
         if random.random() > 0.5:
             noise = torch.randn_like(volume) * 0.02
             volume = volume + noise
@@ -120,24 +136,8 @@ class VolumeSegmentationTrainer:
             
         return volume
 
-    def _calculate_metrics(self, pred: torch.Tensor, target: torch.Tensor) -> float:
-        """Calculate Dice score between prediction and target"""
-        intersection = (pred * target).sum()
-        union = pred.sum() + target.sum()
-        
-        # Calculate metrics (add small epsilon to prevent division by zero)
-        tp = intersection
-        fp = pred.sum() - intersection
-        fn = target.sum() - intersection
-        
-        precision = tp / (tp + fp + 1e-5)
-        recall = tp / (tp + fn + 1e-5)
-        dice = (2 * intersection + 1e-5) / (union + 1e-5)
-        
-        return dice.item(), precision.item(), recall.item()
-
     def train(self):
-        """Run full training loop"""
+        """Run full training loop with warmup"""
         # Set random seeds
         torch.manual_seed(self.seed)
         np.random.seed(self.seed)
@@ -145,20 +145,41 @@ class VolumeSegmentationTrainer:
             torch.cuda.manual_seed_all(self.seed)
         torch.backends.cudnn.deterministic = True
         
-        # Create datasets
-        dataset = KiTS23VolumeDataset(
+        # Create full-volume dataset
+        volume_dataset = KiTS23VolumeDataset(
             data_dir=self.config.data_dir,
             use_kidney_mask=self.config.use_kidney_mask,
             training=True,
             debug=self.config.debug
         )
         
-        train_dataset, val_dataset = dataset.get_train_val_splits(
+        train_dataset, val_dataset = volume_dataset.get_train_val_splits(
             val_ratio=0.2,
             seed=self.seed
         )
-        
-        # Create data loaders
+
+        # Create warm-up window dataset if needed
+        if self.warmup_epochs > 0:
+            warmup_dataset = TumorRichWindowDataset(
+                data_dir=self.config.data_dir,
+                window_size=self.window_size,
+                stride=self.window_stride,
+                min_tumor_ratio=self.min_tumor_ratio,
+                top_percent=self.top_tumor_percent,
+                use_kidney_mask=self.config.use_kidney_mask,
+                training=True,
+                debug=self.config.debug
+            )
+            
+            warmup_loader = DataLoader(
+                warmup_dataset,
+                batch_size=self.config.batch_size * 2,  # Can use larger batch size for windows
+                shuffle=True,
+                num_workers=4,
+                pin_memory=True
+            )
+
+        # Create main data loaders
         train_loader = DataLoader(
             train_dataset,
             batch_size=self.config.batch_size,
@@ -182,13 +203,21 @@ class VolumeSegmentationTrainer:
             for epoch in range(self.start_epoch, self.config.num_epochs):
                 self.current_epoch = epoch
                 
-                # Training
-                train_loss, train_metrics = self._train_epoch(train_loader)
+                # Choose appropriate loader based on epoch
+                if epoch < self.warmup_epochs:
+                    print(f"\nWarm-up epoch {epoch+1}/{self.warmup_epochs}")
+                    current_loader = warmup_loader
+                else:
+                    print(f"\nFull-volume epoch {epoch-self.warmup_epochs+1}/{self.config.num_epochs-self.warmup_epochs}")
+                    current_loader = train_loader
                 
-                # Validation
+                # Training phase
+                train_loss, train_metrics = self._train_epoch(current_loader)
+                
+                # Validation phase (always on full volumes)
                 val_loss, val_metrics = self._validate(val_loader)
                 
-                # Learning rate scheduling with early stopping
+                # Learning rate scheduling
                 self.scheduler.step(val_metrics['dice'])
                 current_lr = self.optimizer.param_groups[0]['lr']
                 
@@ -212,10 +241,15 @@ class VolumeSegmentationTrainer:
                         'dice': val_metrics['dice'],
                         'precision': val_metrics['precision'],
                         'recall': val_metrics['recall'],
-                        'phase': 3 if self.config.use_kidney_mask else 4
+                        'phase': 3 if self.config.use_kidney_mask else 4,
+                        'in_warmup': epoch < self.warmup_epochs
                     },
                     is_best
                 )
+                
+                # Print warmup status
+                if epoch == self.warmup_epochs - 1:
+                    print("\nWarm-up phase complete! Switching to full-volume training...")
                 
         except KeyboardInterrupt:
             print("\nTraining interrupted. Saving checkpoint...")
@@ -273,20 +307,28 @@ class VolumeSegmentationTrainer:
                 # Calculate metrics
                 with torch.no_grad():
                     probs = torch.sigmoid(outputs)
-                    pred_mask = (probs > 0.5).float()  # Back to 0.5 threshold
-                    dice, precision, recall = self._calculate_metrics(pred_mask, targets)
+                    pred_mask = (probs > 0.5).float()
+                    intersection = (pred_mask * targets).sum()
+                    union = pred_mask.sum() + targets.sum()
+                    dice = (2 * intersection + 1e-5) / (union + 1e-5)
+                    
+                    tp = intersection
+                    fp = pred_mask.sum() - intersection
+                    fn = targets.sum() - intersection
+                    precision = tp / (tp + fp + 1e-5)
+                    recall = tp / (tp + fn + 1e-5)
                 
                 # Update statistics
                 train_loss += loss.item()
-                train_dice += dice
-                train_precision += precision
-                train_recall += recall
+                train_dice += dice.item()
+                train_precision += precision.item()
+                train_recall += recall.item()
                 n_batches += 1
                 
                 # Update progress bar
                 pbar.set_postfix({
                     'loss': f"{loss.item():.4f}",
-                    'dice': f"{dice:.4f}",
+                    'dice': f"{dice.item():.4f}",
                     'lr': f"{self.optimizer.param_groups[0]['lr']:.2e}"
                 })
                 
@@ -324,13 +366,21 @@ class VolumeSegmentationTrainer:
                     
                     # Calculate metrics
                     probs = torch.sigmoid(outputs)
-                    pred_mask = (probs > 0.5).float()  # Back to 0.5 threshold
-                    dice, precision, recall = self._calculate_metrics(pred_mask, targets)
+                    pred_mask = (probs > 0.5).float()
+                    intersection = (pred_mask * targets).sum()
+                    union = pred_mask.sum() + targets.sum()
+                    dice = (2 * intersection + 1e-5) / (union + 1e-5)
+                    
+                    tp = intersection
+                    fp = pred_mask.sum() - intersection
+                    fn = targets.sum() - intersection
+                    precision = tp / (tp + fp + 1e-5)
+                    recall = tp / (tp + fn + 1e-5)
                     
                     val_loss += loss.item()
-                    val_dice += dice
-                    val_precision += precision
-                    val_recall += recall
+                    val_dice += dice.item()
+                    val_precision += precision.item()
+                    val_recall += recall.item()
                     n_volumes += 1
                     
                     if self.config.debug and n_volumes == 1:

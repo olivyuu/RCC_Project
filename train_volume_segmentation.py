@@ -39,6 +39,18 @@ def parse_args():
     parser.add_argument("--min_tumor_size", type=int, default=1000,
                       help="Minimum tumor size after postprocessing")
     
+    # Warmup parameters
+    parser.add_argument("--warmup_epochs", type=int, default=0,
+                      help="Number of epochs to train on tumor-rich windows (0 to disable)")
+    parser.add_argument("--warmup_window_size", type=str, default="64,128,128",
+                      help="Size of tumor-rich windows during warmup (D,H,W)")
+    parser.add_argument("--warmup_window_stride", type=str, default="32,64,64",
+                      help="Stride between tumor-rich windows (D,H,W)")
+    parser.add_argument("--warmup_min_tumor_ratio", type=float, default=0.001,
+                      help="Minimum tumor/total voxels ratio to keep window")
+    parser.add_argument("--warmup_top_percent", type=float, default=20.0,
+                      help="Keep only top K% most tumor-rich windows")
+    
     # Checkpoint parameters
     parser.add_argument("--checkpoint_path", type=str,
                       help="Path to checkpoint to resume from")
@@ -80,8 +92,10 @@ def main():
     # Setup logging
     setup_logging(output_dir)
     
-    # Parse sliding window size
+    # Parse window sizes
     window_size = tuple(map(int, args.window_size.split(",")))
+    warmup_window_size = tuple(map(int, args.warmup_window_size.split(",")))
+    warmup_window_stride = tuple(map(int, args.warmup_window_stride.split(",")))
     
     # Create configuration
     config = VolumeSegmentationConfig(
@@ -94,6 +108,11 @@ def main():
         sliding_window_size=window_size,
         inference_overlap=args.window_overlap,
         postproc_min_size=args.min_tumor_size,
+        warmup_epochs=args.warmup_epochs,
+        warmup_window_size=warmup_window_size,
+        warmup_window_stride=warmup_window_stride,
+        warmup_min_tumor_ratio=args.warmup_min_tumor_ratio,
+        warmup_top_percent=args.warmup_top_percent,
         learning_rate=args.learning_rate,
         grad_clip=args.grad_clip,
         checkpoint_path=args.checkpoint_path,

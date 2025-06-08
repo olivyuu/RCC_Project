@@ -1,45 +1,52 @@
-import multiprocmssingo m ip
-impprtngoach
-impormn.functol aF
-from util.data imptDataLadr,Ssetrndom_spli
-fromitorct.tudn.fmpclptGrSr,atocast
-ipttrchcuda
-ftomiprthlib impoccdPth
-imponupy p
-fomtqdmimpttqdm
-lptorh sg
-p sys
-mporrandm
-fomtor.uils.tensrboardmportSummayWrter
-umpy as np
-fromfmodtli.segmeniation.modllimprtSegmentinMde
-fromdaasetimpriKiTS23VolnmoDas
-fromlosesimprDC__BCE_los
+import multiprocessing as mp
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, random_split
+from torch.cuda.amp import GradScaler, autocast
+import torch.cuda
+from pathlib import Path
+import numpy as np
+from tqdm import tqdm
+import signal
+import sys
+from torch.utils.tensorboard import SummaryWriter
 
-assSegtatTrainer:
-fromdeto__ihiu__(erlf, configb:
-odmpruaWself.config = configter
-slf.deviceochdvic"cudm"sifseomchacuda.is_avaiinblemo else "cpu")del import SegmentationModel
-fromfromsrmot(f"U_dngBdelocs: {self.evice}")
+from models.segmentation.model import SegmentationModel
+from dataset_volume import KiTS23VolumeDataset
+from losses import DC_and_BCE_loss
 
-class Se#eCoafogurr CUDA memora nengment
-    def tf torch.cu_f.i,_availbl:
-          ofiorch.cudg. mpccche()
-            torch.ridt.se(_pfr_pgecess_ce  yfrcion095
-         c..isrca.bvckinds.cbdnn.benchla(k)=Tr
-     
-          Crea e  he kptirchdirectcuy
-       dsmcc.cenf.check_di.mkdi(exist_k=Tue)
-    oce_ess_memory_fraction(0.95)
-        # Ini iiz  m.hnt
-    lf.del=SmentoMdl(
-      ai    sechhannnles2,  # Imu=eaturekidsymkechc)l
-         ou_chnnel=2,  # Two csennell fde.backglcendp+i
-            features=conf#g. eialeestraining components
-    self).tc(relf.revio_E_loss()
-        optimizer = torch.optim.Adam(
-        self.moollpmeab,hck pg(
-    
+class SegmentationTrainer:
+    def __init__(self, config):
+        self.config = config
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {self.device}")
+        
+        # Configure CUDA memory management
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.set_per_process_memory_fraction(0.95)
+            torch.backends.cudnn.benchmark = True
+        
+        # Create checkpoint directory
+        self.config.checkpoint_dir.mkdir(exist_ok=True)
+        
+        # Initialize model
+        self.model = SegmentationModel(
+            in_channels=2,  # Image and kidney mask channels
+            out_channels=2,  # Two channels for background + tumor
+            features=config.features
+        ).to(self.device)
+        
+        self.model.enable_checkpointing()
+        
+        # Initialize training components
+        self.criterion = DC_and_BCE_loss()
+        self.optimizer = torch.optim.Adam(
+            self.model.parameters(),
+            lr=1e-4,
+            weight_decay=1e-5,
+            eps=1e-8
+        )
         
         # Use ReduceLROnPlateau with tighter settings
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -61,89 +68,8 @@ class Se#eCoafogurr CUDA memora nengment
         self.max_grad_norm = 5.0  # Reduced from default 1.0
         self.accum_steps = getattr(config, 'vol_gradient_accumulation_steps', 4)
         
-        # Phased training settings
-        self.tumor_only_epochs = 5  # Number of epochs for tumor-only warmup
-        self.pos_train_idx = []
-        self.neg_train_idx = []
-        
         if config.resume_training:
             self._load_checkpoint()
-
-    def _split_pos_neg_indices(self, dataset, train_indices):
-        """Split training indices into positive (tumor) and negative (no tumor) cases"""
-        pos_indices = []
-        neg_indices = []
-        zero_volume_cases = []
-        
-        print("Separating positive and negative cases...")
-        for idx in tqdm(train_indices):
-            _, target = dataset[idx]
-            tumor_volume = target.float().sum().item()
-            if tumor_volume > 0:
-                pos_indices.append(idx)
-            else:
-                neg_indices.append(idx)
-                zero_volume_cases.append(idx)
-        
-        print(f"\nCase distribution:")
-        print(f"Positive cases (with tumor): {len(pos_indices)}")
-        print(f"Negative cases (no tumor): {len(neg_indices)}")
-        
-        if len(zero_volume_cases) > 0:
-            print("\nZero volume cases found:")
-            for idx in zero_volume_cases[:5]:  # Print first 5 cases
-                sample_id = dataset.get_sample_id(idx) if hasattr(dataset, 'get_sample_id') else idx
-                print(f"Sample ID: {sample_id}")
-        
-        # Shuffle negative indices
-        random.seed(42)
-        random.shuffle(neg_indices)
-        
-        return pos_indices, neg_indices
-
-    def _make_epoch_loader(self, dataset, epoch, total_epochs):
-        """Create DataLoader for current epoch based on training phase"""
-        if epoch < self.tumor_only_epochs:
-            # Tumor-only warmup phase - use only positive cases
-            this_epoch_idx = self.pos_train_idx.copy()
-            phase = f"tumor-only warmup (training on {len(this_epoch_idx)} positive cases)"
-            
-            # Verify all selected cases have tumors
-            print("\nVerifying tumor-only phase cases...")
-            invalid_cases = []
-            for idx in this_epoch_idx:
-                _, target = dataset[idx]
-                tumor_volume = target.float().sum().item()
-                if tumor_volume == 0:
-                    sample_id = dataset.get_sample_id(idx) if hasattr(dataset, 'get_sample_id') else idx
-                    invalid_cases.append((idx, sample_id))
-            
-            if invalid_cases:
-                print("\nWARNING: Found cases with no tumor in tumor-only phase:")
-                for idx, sample_id in invalid_cases[:5]:  # Print first 5 cases
-                    print(f"Index {idx}, Sample ID: {sample_id}")
-                raise ValueError("Invalid cases found in tumor-only phase")
-                
-        else:
-            # More gradual introduction of negative cases using quadratic ramp
-            progress = float(epoch - self.tumor_only_epochs) / float(max(1, total_epochs - self.tumor_only_epochs))
-            progress = min(max(progress * progress, 0.0), 1.0)  # Square for slower ramp
-            k = int(progress * len(self.neg_train_idx))
-            this_epoch_idx = self.pos_train_idx + self.neg_train_idx[:k]
-            phase = f"mixed (training on {len(self.pos_train_idx)} positive + {k}/{len(self.neg_train_idx)} negative cases)"
-        
-        print(f"\nEpoch {epoch + 1}: {phase}")
-        
-        subset_epoch = Subset(dataset, this_epoch_idx)
-        return DataLoader(
-            subset_epoch,
-            batch_size=getattr(self.config, 'vol_batch_size', 1),
-            shuffle=True,
-            num_workers=2,
-            pin_memory=True,
-            persistent_workers=True,
-            collate_fn=KiTS23VolumeDataset.collate_fn
-        )
 
     def train(self, dataset_path: str):
         try:
@@ -162,12 +88,16 @@ class Se#eCoafogurr CUDA memora nengment
             generator=torch.Generator().manual_seed(42)
         )
         
-        # Split training set into positive and negative cases
-        self.pos_train_idx, self.neg_train_idx = self._split_pos_neg_indices(dataset, train_dataset.indices)
-        
-        print(f"\nFound {len(self.pos_train_idx)} positive and {len(self.neg_train_idx)} negative training volumes")
-        print(f"First {self.tumor_only_epochs} epochs will train on positives only")
-        print(f"Then gradually introducing negatives over remaining {self.config.num_epochs - self.tumor_only_epochs} epochs")
+        # Create training loader
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=getattr(self.config, 'vol_batch_size', 1),
+            shuffle=True,
+            num_workers=2,
+            pin_memory=True,
+            persistent_workers=True,
+            collate_fn=KiTS23VolumeDataset.collate_fn
+        )
         
         # Create validation loader
         val_loader = DataLoader(
@@ -180,15 +110,16 @@ class Se#eCoafogurr CUDA memora nengment
             collate_fn=KiTS23VolumeDataset.collate_fn
         )
 
+        print(f"\nTraining on {len(train_dataset)} volumes")
+        print(f"Validating on {len(val_dataset)} volumes")
+        print(f"Using gradient accumulation steps: {self.accum_steps}")
+
         try:
             for epoch in range(self.start_epoch, self.config.num_epochs):
                 self.current_epoch = epoch
                 
                 # Update loss weights for current epoch
                 self.criterion.update_weights(epoch)
-                
-                # Create epoch-specific training loader
-                train_loader = self._make_epoch_loader(dataset, epoch, self.config.num_epochs)
                 
                 # Training phase
                 self.model.train()
@@ -210,13 +141,6 @@ class Se#eCoafogurr CUDA memora nengment
                         ct_images = images[:, 0:1].to(dtype=torch.float32)
                         kidney_masks = images[:, 1:2].to(dtype=torch.float32)
                         targets = targets.to(dtype=torch.float32)
-                        
-                        # Verify tumor presence in tumor-only phase
-                        if epoch < self.tumor_only_epochs:
-                            tumor_volume = (targets * kidney_masks).sum().item()
-                            if tumor_volume == 0:
-                                print(f"\nWARNING: Zero tumor volume in tumor-only phase (batch {batch_idx})")
-                                continue
                         
                         # Recombine channels
                         images = torch.cat([ct_images, kidney_masks], dim=1)
@@ -506,13 +430,6 @@ class Se#eCoafogurr CUDA memora nengment
             kidney_tumor_probs = tumor_probs * kidney_masks.squeeze(1)
             active_mask = kidney_masks.squeeze(1) > 0
             
-            # Calculate tumor volume
-            tumor_volume = (targets * kidney_masks).sum().item()
-            if tumor_volume == 0:
-                print("\nWARNING: Zero tumor volume detected in batch!")
-                if self.current_epoch < self.tumor_only_epochs:
-                    print("This should not happen during tumor-only phase!")
-            
             if active_mask.any():
                 tumor_stats = {
                     'mean_prob': kidney_tumor_probs[active_mask].mean().item(),
@@ -522,8 +439,7 @@ class Se#eCoafogurr CUDA memora nengment
                     'voxels_gt_50': (kidney_tumor_probs > 0.5).sum().item(),
                     'voxels_gt_10': (kidney_tumor_probs > 0.1).sum().item(),
                     'kidney_volume': active_mask.sum().item(),
-                    'target_volume': tumor_volume,
-                    'has_tumor': tumor_volume > 0
+                    'target_volume': (targets * kidney_masks).sum().item()
                 }
             else:
                 tumor_stats = {
@@ -534,8 +450,7 @@ class Se#eCoafogurr CUDA memora nengment
                     'voxels_gt_50': 0,
                     'voxels_gt_10': 0,
                     'kidney_volume': 0,
-                    'target_volume': 0,
-                    'has_tumor': False
+                    'target_volume': 0
                 }
             
             # Compute soft Dice score
@@ -553,10 +468,6 @@ class Se#eCoafogurr CUDA memora nengment
             print(f"  Active voxels > 0.1: {stats['voxels_gt_10']}")
             print(f"  Kidney volume: {stats['kidney_volume']}")
             print(f"  Target tumor volume: {stats['target_volume']}")
-            print(f"  Has tumor: {stats['has_tumor']}")
-            
-            if not stats['has_tumor'] and self.current_epoch < self.tumor_only_epochs:
-                print("WARNING: No tumor in batch during tumor-only phase!")
             
             return stats
 
@@ -568,9 +479,7 @@ class Se#eCoafogurr CUDA memora nengment
             'scheduler_state_dict': self.scheduler.state_dict(),
             'scaler_state_dict': self.scaler.state_dict(),
             'best_val_dice': self.best_val_dice,
-            'metrics': metrics,
-            'pos_train_idx': self.pos_train_idx,
-            'neg_train_idx': self.neg_train_idx
+            'metrics': metrics
         }
         
         latest_path = self.config.checkpoint_dir / "latest.pth"
@@ -596,11 +505,6 @@ class Se#eCoafogurr CUDA memora nengment
         self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
         self.start_epoch = checkpoint['epoch'] + 1
         self.best_val_dice = checkpoint['best_val_dice']
-        
-        # Load phased training state if available
-        if 'pos_train_idx' in checkpoint and 'neg_train_idx' in checkpoint:
-            self.pos_train_idx = checkpoint['pos_train_idx']
-            self.neg_train_idx = checkpoint['neg_train_idx']
         
         print(f"Resuming training from epoch {self.start_epoch}")
 

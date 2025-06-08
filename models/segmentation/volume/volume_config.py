@@ -16,6 +16,12 @@ class VolumeSegmentationConfig:
                 sliding_window_size: Optional[Tuple[int, int, int]] = (64, 128, 128),
                 inference_overlap: float = 0.5,
                 postproc_min_size: int = 1000,
+                # Warmup parameters
+                warmup_epochs: int = 0,
+                warmup_window_size: Tuple[int, int, int] = (64, 128, 128),
+                warmup_window_stride: Tuple[int, int, int] = (32, 64, 64),
+                warmup_min_tumor_ratio: float = 0.001,
+                warmup_top_percent: float = 20.0,
                 # Training parameters
                 learning_rate: float = 1e-4,
                 grad_clip: float = 5.0,
@@ -33,6 +39,11 @@ class VolumeSegmentationConfig:
             sliding_window_size: Size of sliding window for inference
             inference_overlap: Overlap between sliding windows
             postproc_min_size: Minimum tumor size after postprocessing
+            warmup_epochs: Number of epochs to train on tumor-rich windows (0 to disable)
+            warmup_window_size: Size of tumor-rich windows during warmup
+            warmup_window_stride: Stride between tumor-rich windows
+            warmup_min_tumor_ratio: Minimum tumor/total voxels ratio to keep window
+            warmup_top_percent: Keep only top K% most tumor-rich windows
             learning_rate: Initial learning rate
             grad_clip: Gradient clipping value
             checkpoint_path: Path to checkpoint to resume from
@@ -62,6 +73,13 @@ class VolumeSegmentationConfig:
         self.inference_overlap = inference_overlap
         self.postproc_min_size = postproc_min_size
         
+        # Warmup parameters
+        self.warmup_epochs = warmup_epochs
+        self.warmup_window_size = warmup_window_size
+        self.warmup_window_stride = warmup_window_stride
+        self.warmup_min_tumor_ratio = warmup_min_tumor_ratio
+        self.warmup_top_percent = warmup_top_percent
+        
         # Training parameters
         self.learning_rate = learning_rate
         self.grad_clip = grad_clip
@@ -83,6 +101,11 @@ class VolumeSegmentationConfig:
             'sliding_window_size': self.sliding_window_size,
             'inference_overlap': self.inference_overlap,
             'postproc_min_size': self.postproc_min_size,
+            'warmup_epochs': self.warmup_epochs,
+            'warmup_window_size': self.warmup_window_size,
+            'warmup_window_stride': self.warmup_window_stride,
+            'warmup_min_tumor_ratio': self.warmup_min_tumor_ratio,
+            'warmup_top_percent': self.warmup_top_percent,
             'learning_rate': self.learning_rate,
             'grad_clip': self.grad_clip,
             'checkpoint_path': self.checkpoint_path,
@@ -117,7 +140,7 @@ class VolumeSegmentationConfig:
     def __str__(self) -> str:
         """String representation with key parameters"""
         phase_name = "Phase 3 (with kidney mask)" if self.use_kidney_mask else "Phase 4 (without kidney mask)"
-        return f"""Volume Segmentation Config:
+        config_str = f"""Volume Segmentation Config:
 Training Phase: {phase_name}
 Input Channels: {self.in_channels}
 Features: {self.features}
@@ -125,3 +148,14 @@ Batch Size: {self.batch_size}
 Sliding Window: {self.sliding_window_size}
 Window Overlap: {self.inference_overlap:.1%}
 Learning Rate: {self.learning_rate}"""
+
+        if self.warmup_epochs > 0:
+            config_str += f"""
+Warmup Configuration:
+Epochs: {self.warmup_epochs}
+Window Size: {self.warmup_window_size}
+Window Stride: {self.warmup_window_stride}
+Min Tumor Ratio: {self.warmup_min_tumor_ratio:.1%}
+Top Window Percent: {self.warmup_top_percent:.1f}%"""
+            
+        return config_str
