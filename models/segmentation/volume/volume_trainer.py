@@ -96,16 +96,16 @@ class VolumeSegmentationTrainer:
     @staticmethod
     def _apply_augmentations(volume: torch.Tensor) -> torch.Tensor:
         """Apply random augmentations to volume"""
+        # Get volume shape
+        B, C, D, H, W = volume.shape
+        
         # Random flip
         if random.random() > 0.5:
             volume = torch.flip(volume, [-1])  # Flip width
         if random.random() > 0.5:
             volume = torch.flip(volume, [-2])  # Flip height
-            
-        # Random rotation (-10 to 10 degrees)
         if random.random() > 0.5:
-            angle = random.uniform(-10, 10)
-            volume = TF.rotate(volume, angle)
+            volume = torch.flip(volume, [-3])  # Flip depth
             
         # Random Gaussian noise (small amplitude)
         if random.random() > 0.5:
@@ -442,7 +442,7 @@ class VolumeSegmentationTrainer:
         except RuntimeError as e:
             logger.error(f"Error loading checkpoint: {str(e)}")
             raise
-        
+            
         # Always start from epoch 0, regardless of checkpoint phase
         self.start_epoch = 0
         self.best_val_dice = float('-inf')
@@ -465,7 +465,7 @@ class VolumeSegmentationTrainer:
         )
         self.scaler = GradScaler()
         print("Initialized fresh optimizer and scheduler.")
-            
+        
         print(f"Starting training from epoch {self.start_epoch}")
 
     def _handle_interrupt(self, signum, frame):
