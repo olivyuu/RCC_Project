@@ -12,6 +12,7 @@ import signal
 import sys
 import torchvision.transforms.functional as TF
 import random
+from torch.optim.lr_scheduler import ReduceLROnPlateau  # Fixed import
 from models.segmentation.model import SegmentationModel
 from losses_patch import WeightedDiceBCELoss
 from models.segmentation.volume.dataset_volume import KiTS23VolumeDataset
