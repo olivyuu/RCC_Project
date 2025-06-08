@@ -273,7 +273,7 @@ class VolumeSegmentationTrainer:
                 # Calculate metrics
                 with torch.no_grad():
                     probs = torch.sigmoid(outputs)
-                    pred_mask = (probs > 0.3).float()  # Lower threshold to 0.3
+                    pred_mask = (probs > 0.5).float()  # Back to 0.5 threshold
                     dice, precision, recall = self._calculate_metrics(pred_mask, targets)
                 
                 # Update statistics
@@ -324,7 +324,7 @@ class VolumeSegmentationTrainer:
                     
                     # Calculate metrics
                     probs = torch.sigmoid(outputs)
-                    pred_mask = (probs > 0.3).float()  # Lower threshold to 0.3
+                    pred_mask = (probs > 0.5).float()  # Back to 0.5 threshold
                     dice, precision, recall = self._calculate_metrics(pred_mask, targets)
                     
                     val_loss += loss.item()
