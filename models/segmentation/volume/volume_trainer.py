@@ -54,11 +54,11 @@ class VolumeSegmentationTrainer:
             bce_weight=1.0
         ).to(self.device)
         
-        # Initialize optimizer without weight decay
+        # Initialize optimizer with weight decay restored
         self.optimizer = torch.optim.Adam(
             self.model.parameters(),
             lr=config.learning_rate,
-            weight_decay=0.0,
+            weight_decay=1e-5,  # Restored to original value
             eps=1e-8
         )
         
@@ -115,11 +115,6 @@ class VolumeSegmentationTrainer:
             volume = TF.rotate(volume, angle)
             # Restore original shape
             volume = volume.view(B, C, D, H, W)
-            
-        # Random Gaussian noise (small amplitude)
-        if random.random() > 0.5:
-            noise = torch.randn_like(volume) * 0.02
-            volume = volume + noise
             
         # Random intensity scaling
         if random.random() > 0.5:
@@ -457,11 +452,11 @@ class VolumeSegmentationTrainer:
         self.best_val_dice = float('-inf')
         print("Starting fresh training from epoch 0")
         
-        # Initialize fresh optimizer and scheduler without weight decay
+        # Initialize fresh optimizer and scheduler with restored weight decay
         self.optimizer = torch.optim.Adam(
             self.model.parameters(),
             lr=self.config.learning_rate,
-            weight_decay=0.0,  # Consistent with __init__
+            weight_decay=1e-5,  # Consistent with __init__
             eps=1e-8
         )
         self.scheduler = ReduceLROnPlateau(
