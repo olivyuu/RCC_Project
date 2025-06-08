@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 import numpy as np
 from pathlib import Path
 import logging
@@ -12,7 +13,6 @@ import signal
 import sys
 import torchvision.transforms.functional as TF
 import random
-from torch.optim.lr_scheduler import ReduceLROnPlateau  # Fixed import
 from models.segmentation.model import SegmentationModel
 from losses_patch import WeightedDiceBCELoss
 from models.segmentation.volume.dataset_volume import KiTS23VolumeDataset
@@ -62,8 +62,8 @@ class VolumeSegmentationTrainer:
             eps=1e-8
         )
         
-        # More aggressive learning rate scheduling
-        self.scheduler = torch.optim.ReduceLROnPlateau(
+        # More aggressive learning rate scheduling with fixed import
+        self.scheduler = ReduceLROnPlateau(
             self.optimizer,
             mode='max',
             factor=0.2,  # Larger LR reduction
@@ -460,7 +460,7 @@ class VolumeSegmentationTrainer:
                 weight_decay=1e-5,
                 eps=1e-8
             )
-            self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.scheduler = ReduceLROnPlateau(
                 self.optimizer,
                 mode='max',
                 factor=0.2,
