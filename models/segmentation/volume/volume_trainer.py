@@ -99,12 +99,6 @@ class VolumeSegmentationTrainer:
         # Get volume shape
         B, C, D, H, W = volume.shape
         
-        # Random flip - only in-plane (height and width)
-        if random.random() > 0.5:
-            volume = torch.flip(volume, [-1])  # Flip width
-        if random.random() > 0.5:
-            volume = torch.flip(volume, [-2])  # Flip height
-            
         # Random rotation - apply to each depth slice independently
         if random.random() > 0.5:
             angle = random.uniform(-10, 10)
