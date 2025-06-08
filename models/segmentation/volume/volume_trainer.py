@@ -10,6 +10,8 @@ import matplotlib.pyplot as plt
 from torch.utils.tensorboard import SummaryWriter
 import signal
 import sys
+import torchvision.transforms.functional as TF
+import random
 from models.segmentation.model import SegmentationModel
 from losses_patch import WeightedDiceBCELoss
 from models.segmentation.volume.dataset_volume import KiTS23VolumeDataset
@@ -51,18 +53,20 @@ class VolumeSegmentationTrainer:
             bce_weight=1.0
         ).to(self.device)
         
+        # Initialize optimizer with weight decay
         self.optimizer = torch.optim.Adam(
             self.model.parameters(),
             lr=config.learning_rate,
-            weight_decay=1e-5,
+            weight_decay=1e-5,  # Add L2 regularization
             eps=1e-8
         )
         
-        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        # More aggressive learning rate scheduling
+        self.scheduler = torch.optim.ReduceLROnPlateau(
             self.optimizer,
             mode='max',
-            factor=0.5,
-            patience=5,
+            factor=0.2,  # Larger LR reduction
+            patience=3,   # Fewer epochs before reducing
             verbose=True,
             min_lr=1e-6
         )
@@ -87,6 +91,32 @@ class VolumeSegmentationTrainer:
         print(f"Output channels: 1 (tumor probability)")
         print(f"Base features: {config.features}")
         print(f"Total parameters: {sum(p.numel() for p in self.model.parameters()):,}")
+
+    @staticmethod
+    def _apply_augmentations(volume: torch.Tensor) -> torch.Tensor:
+        """Apply random augmentations to volume"""
+        # Random flip
+        if random.random() > 0.5:
+            volume = torch.flip(volume, [-1])  # Flip width
+        if random.random() > 0.5:
+            volume = torch.flip(volume, [-2])  # Flip height
+            
+        # Random rotation (-10 to 10 degrees)
+        if random.random() > 0.5:
+            angle = random.uniform(-10, 10)
+            volume = TF.rotate(volume, angle)
+            
+        # Random Gaussian noise (small amplitude)
+        if random.random() > 0.5:
+            noise = torch.randn_like(volume) * 0.02
+            volume = volume + noise
+            
+        # Random intensity scaling
+        if random.random() > 0.5:
+            scale = random.uniform(0.9, 1.1)
+            volume = volume * scale
+            
+        return volume
 
     def train(self):
         """Run full training loop"""
@@ -121,7 +151,7 @@ class VolumeSegmentationTrainer:
         
         val_loader = DataLoader(
             val_dataset,
-            batch_size=1,  # Full volumes
+            batch_size=1,
             shuffle=False,
             num_workers=2,
             pin_memory=True
@@ -140,9 +170,14 @@ class VolumeSegmentationTrainer:
                 # Validation
                 val_loss, val_dice = self._validate(val_loader)
                 
-                # Learning rate scheduling
+                # Learning rate scheduling with early stopping
                 self.scheduler.step(val_dice)
                 current_lr = self.optimizer.param_groups[0]['lr']
+                
+                # Early stopping check
+                if current_lr <= 1e-6:
+                    print("\nLearning rate too low. Stopping training.")
+                    break
                 
                 # Log metrics
                 self._log_metrics(train_loss, train_dice, val_loss, val_dice, current_lr, epoch)
@@ -180,138 +215,94 @@ class VolumeSegmentationTrainer:
         print(f"\nTraining completed! Best validation Dice: {self.best_val_dice:.4f}")
 
     def _train_epoch(self, train_loader):
-        """Run one epoch of training with full volumes"""
+        """Run one epoch of training"""
         self.model.train()
         train_loss = 0
         train_dice = 0
         n_batches = 0
-        dice_list = []
         
         with tqdm(train_loader, desc=f"Epoch {self.current_epoch+1}/{self.config.num_epochs}") as pbar:
             for batch in pbar:
-                try:
-                    # Move data to device
-                    inputs = batch['input'].to(self.device)
-                    targets = batch['target'].to(self.device)
-                    
-                    # Forward pass with autocast
-                    with torch.cuda.amp.autocast():
-                        outputs = self.model(inputs)
-                        loss = self.criterion(outputs, targets)
-                    
-                    # Backward pass with gradient clipping
-                    self.optimizer.zero_grad()
-                    self.scaler.scale(loss).backward()
-                    self.scaler.unscale_(self.optimizer)
-                    
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(),
-                        self.config.grad_clip
-                    )
-                    
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                    
-                    # Calculate metrics
-                    with torch.no_grad():
-                        probs = torch.sigmoid(outputs)
-                        pred_mask = (probs > 0.5).float()
-                        
-                        for i in range(inputs.size(0)):
-                            target_i = targets[i]
-                            pred_i = pred_mask[i]
-                            target_voxels = int(target_i.sum().item())
-                            pred_voxels = int(pred_i.sum().item())
-                            dice_i = self._calculate_dice(pred_i, target_i).item()
-                            dice_list.append(dice_i)
-                            
-                            if n_batches % 10 == 0:  # Log every 10th volume
-                                print(f"Volume {n_batches}: GT={target_voxels} vox, "
-                                      f"Pred={pred_voxels} vox, Dice={dice_i:.4f}")
-                        
-                        batch_dice = self._calculate_dice(pred_mask, targets)
-                    
-                    # Update statistics
-                    train_loss += loss.item()
-                    train_dice += batch_dice
-                    n_batches += 1
-                    
-                    # Update progress bar
-                    pbar.set_postfix({
-                        'loss': f"{loss.item():.4f}",
-                        'dice': f"{batch_dice:.4f}"
-                    })
+                # Move data to device
+                inputs = batch['input'].to(self.device)
+                targets = batch['target'].to(self.device)
                 
-                except RuntimeError as e:
-                    if "out of memory" in str(e):
-                        logger.error(f"\nCUDA OOM during training. Skipping batch.")
-                        if hasattr(self.optimizer, 'zero_grad'):
-                            self.optimizer.zero_grad()
-                        torch.cuda.empty_cache()
-                        continue
-                    raise e
-                    
+                # Apply augmentations
+                if self.training:
+                    inputs = self._apply_augmentations(inputs)
+                
+                # Forward pass with autocast
+                with torch.cuda.amp.autocast():
+                    outputs = self.model(inputs)
+                    loss = self.criterion(outputs, targets)
+                
+                # Backward pass with gradient clipping
+                self.optimizer.zero_grad()
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)
+                
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.config.grad_clip
+                )
+                
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                
+                # Calculate metrics
+                with torch.no_grad():
+                    probs = torch.sigmoid(outputs)
+                    pred_mask = (probs > 0.5).float()
+                    dice_score = self._calculate_dice(pred_mask, targets)
+                
+                # Update statistics
+                train_loss += loss.item()
+                train_dice += dice_score
+                n_batches += 1
+                
+                # Update progress bar
+                pbar.set_postfix({
+                    'loss': f"{loss.item():.4f}",
+                    'dice': f"{dice_score:.4f}",
+                    'lr': f"{self.optimizer.param_groups[0]['lr']:.2e}"
+                })
+                
                 # Clear cache periodically
-                if n_batches % 2 == 0:  # More frequent for full volumes
+                if n_batches % 10 == 0:
                     torch.cuda.empty_cache()
-        
-        # Print volume statistics
-        dice_arr = np.array(dice_list)
-        print(f"\nTrain volume Dice: mean={dice_arr.mean():.4f}, std={dice_arr.std():.4f}, "
-              f"min={dice_arr.min():.4f}, max={dice_arr.max():.4f}")
         
         return (train_loss / n_batches if n_batches > 0 else float('inf'),
                 train_dice / n_batches if n_batches > 0 else 0)
 
     def _validate(self, val_loader):
-        """Run validation with full volumes"""
+        """Run validation"""
         self.model.eval()
         val_loss = 0
         val_dice = 0
         n_volumes = 0
-        dice_list = []  # Track dice per case
-        neg_count = 0   # Cases without tumor
-        pos_count = 0   # Cases with tumor
         
         with torch.no_grad():
-            for idx, batch in enumerate(tqdm(val_loader, desc="Validating")):
+            for batch in tqdm(val_loader, desc="Validating"):
                 try:
-                    case_id = batch['case_id'][0]
-                    # Process full volume
+                    # Get full volume
                     inputs = batch['input'].to(self.device)
                     targets = batch['target'].to(self.device)
                     
                     # Forward pass
                     outputs = self.model(inputs)
                     loss = self.criterion(outputs, targets)
-                    probs = torch.sigmoid(outputs)
-                    pred_mask = (probs > 0.5).float()
                     
                     # Calculate metrics
-                    target_voxels = int(targets.sum().item())
-                    pred_voxels = int(pred_mask.sum().item())
-                    dice_i = self._calculate_dice(pred_mask, targets).item()
-                    dice_list.append(dice_i)
-                    
-                    # Categorize case
-                    if target_voxels == 0:
-                        neg_count += 1
-                    else:
-                        pos_count += 1
-                        
-                    # Log first 10 cases
-                    if idx < 10:
-                        print(f"[VAL Case {case_id}] "
-                              f"GT={target_voxels:6d} voxels, "
-                              f"PR={pred_voxels:6d} voxels, "
-                              f"Dice={dice_i:.4f}")
+                    probs = torch.sigmoid(outputs)
+                    pred_mask = (probs > 0.5).float()
+                    dice_score = self._calculate_dice(pred_mask, targets)
                     
                     val_loss += loss.item()
-                    val_dice += dice_i
+                    val_dice += dice_score
                     n_volumes += 1
                     
                     if self.config.debug and n_volumes == 1:
-                        self._visualize_full_volume(inputs, targets, pred_mask, case_id)
+                        self._visualize_full_volume(inputs, targets, pred_mask, batch['case_id'][0])
                     
                 except RuntimeError as e:
                     if "out of memory" in str(e):
@@ -319,18 +310,6 @@ class VolumeSegmentationTrainer:
                         torch.cuda.empty_cache()
                         continue
                     raise e
-                    
-                # Clear cache after each volume
-                torch.cuda.empty_cache()
-        
-        # Print validation statistics
-        dice_arr = np.array(dice_list)
-        print(f"\nValidation: {pos_count} positive cases, {neg_count} negatives")
-        print(f"Dice stats over all ({len(dice_arr)}): "
-              f"mean={dice_arr.mean():.4f}, "
-              f"std={dice_arr.std():.4f}, "
-              f"min={dice_arr.min():.4f}, "
-              f"max={dice_arr.max():.4f}")
         
         return (val_loss / n_volumes if n_volumes > 0 else float('inf'),
                 val_dice / n_volumes if n_volumes > 0 else 0)
@@ -398,6 +377,8 @@ class VolumeSegmentationTrainer:
         print(f"Train - Loss: {train_loss:.4f}, Dice: {train_dice:.4f}")
         print(f"Val   - Loss: {val_loss:.4f}, Dice: {val_dice:.4f}")
         print(f"Learning rate: {lr:.2e}")
+        if val_dice > self.best_val_dice:
+            print("New best validation Dice!")
 
     def _save_checkpoint(self, epoch: int, metrics: dict, is_best: bool = False):
         """Save training checkpoint"""
@@ -481,8 +462,8 @@ class VolumeSegmentationTrainer:
             self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 self.optimizer,
                 mode='max',
-                factor=0.5,
-                patience=5,
+                factor=0.2,
+                patience=3,
                 verbose=True,
                 min_lr=1e-6
             )
