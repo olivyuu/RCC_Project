@@ -13,8 +13,6 @@ import signal
 import sys
 import torchvision.transforms.functional as TF
 import random
-import json
-from collections import defaultdict
 from models.segmentation.model import SegmentationModel
 from losses_patch import WeightedDiceBCELoss
 from models.segmentation.volume.dataset_volume import KiTS23VolumeDataset
@@ -48,9 +46,6 @@ class VolumeSegmentationTrainer:
         self.start_epoch = 0
         self.best_val_dice = float('-inf')
         self.seed = 42
-        self.case_metrics = defaultdict(list)  # Store per-case metrics
-        self.precision_history = []
-        self.recall_history = []
 
         # Initialize training components
         self.criterion = WeightedDiceBCELoss(
@@ -120,34 +115,26 @@ class VolumeSegmentationTrainer:
             
         # Random intensity scaling
         if random.random() > 0.5:
-            scale = random.uniform(0.8, 1.2)
+            scale = random.uniform(0.9, 1.1)
             volume = volume * scale
             
         return volume
 
-    def _calculate_metrics(self, pred: torch.Tensor, target: torch.Tensor):
-        """Calculate Dice, Precision, and Recall"""
-        pred = pred > 0.5  # Convert to binary
-        target = target > 0.5
-        
-        # Calculate True Positives, False Positives, False Negatives
-        tp = (pred & target).sum().float()
-        fp = (pred & ~target).sum().float()
-        fn = (~pred & target).sum().float()
+    def _calculate_metrics(self, pred: torch.Tensor, target: torch.Tensor) -> float:
+        """Calculate Dice score between prediction and target"""
+        intersection = (pred * target).sum()
+        union = pred.sum() + target.sum()
         
         # Calculate metrics (add small epsilon to prevent division by zero)
+        tp = intersection
+        fp = pred.sum() - intersection
+        fn = target.sum() - intersection
+        
         precision = tp / (tp + fp + 1e-5)
         recall = tp / (tp + fn + 1e-5)
-        dice = 2 * tp / (2 * tp + fp + fn + 1e-5)
+        dice = (2 * intersection + 1e-5) / (union + 1e-5)
         
-        return {
-            'dice': dice.item(),
-            'precision': precision.item(),
-            'recall': recall.item(),
-            'tp': tp.item(),
-            'fp': fp.item(),
-            'fn': fn.item()
-        }
+        return dice.item(), precision.item(), recall.item()
 
     def train(self):
         """Run full training loop"""
@@ -196,13 +183,13 @@ class VolumeSegmentationTrainer:
                 self.current_epoch = epoch
                 
                 # Training
-                train_loss, train_dice = self._train_epoch(train_loader)
+                train_loss, train_metrics = self._train_epoch(train_loader)
                 
                 # Validation
-                val_dice, val_metrics = self._validate(val_loader)
+                val_loss, val_metrics = self._validate(val_loader)
                 
                 # Learning rate scheduling with early stopping
-                self.scheduler.step(val_dice)
+                self.scheduler.step(val_metrics['dice'])
                 current_lr = self.optimizer.param_groups[0]['lr']
                 
                 # Early stopping check
@@ -211,18 +198,18 @@ class VolumeSegmentationTrainer:
                     break
                 
                 # Log metrics
-                self._log_metrics(train_loss, train_dice, val_metrics, current_lr, epoch)
+                self._log_metrics(train_loss, train_metrics, val_loss, val_metrics, current_lr, epoch)
                 
                 # Save best model
-                is_best = val_dice > self.best_val_dice
+                is_best = val_metrics['dice'] > self.best_val_dice
                 if is_best:
-                    self.best_val_dice = val_dice
+                    self.best_val_dice = val_metrics['dice']
                     
                 self._save_checkpoint(
                     epoch,
                     {
-                        'loss': val_metrics['loss'],
-                        'dice': val_dice,
+                        'loss': val_loss,
+                        'dice': val_metrics['dice'],
                         'precision': val_metrics['precision'],
                         'recall': val_metrics['recall'],
                         'phase': 3 if self.config.use_kidney_mask else 4
@@ -252,6 +239,8 @@ class VolumeSegmentationTrainer:
         self.model.train()
         train_loss = 0
         train_dice = 0
+        train_precision = 0
+        train_recall = 0
         n_batches = 0
         
         with tqdm(train_loader, desc=f"Epoch {self.current_epoch+1}/{self.config.num_epochs}") as pbar:
@@ -284,18 +273,20 @@ class VolumeSegmentationTrainer:
                 # Calculate metrics
                 with torch.no_grad():
                     probs = torch.sigmoid(outputs)
-                    pred_mask = (probs > 0.5).float()
-                    metrics = self._calculate_metrics(pred_mask, targets)
+                    pred_mask = (probs > 0.3).float()  # Lower threshold to 0.3
+                    dice, precision, recall = self._calculate_metrics(pred_mask, targets)
                 
                 # Update statistics
                 train_loss += loss.item()
-                train_dice += metrics['dice']
+                train_dice += dice
+                train_precision += precision
+                train_recall += recall
                 n_batches += 1
                 
                 # Update progress bar
                 pbar.set_postfix({
                     'loss': f"{loss.item():.4f}",
-                    'dice': f"{metrics['dice']:.4f}",
+                    'dice': f"{dice:.4f}",
                     'lr': f"{self.optimizer.param_groups[0]['lr']:.2e}"
                 })
                 
@@ -303,93 +294,70 @@ class VolumeSegmentationTrainer:
                 if n_batches % 10 == 0:
                     torch.cuda.empty_cache()
         
-        return (train_loss / n_batches if n_batches > 0 else float('inf'),
-                train_dice / n_batches if n_batches > 0 else 0)
+        # Calculate averages
+        metrics = {
+            'dice': train_dice / n_batches,
+            'precision': train_precision / n_batches,
+            'recall': train_recall / n_batches
+        }
+        return train_loss / n_batches, metrics
 
     def _validate(self, val_loader):
-        """Run validation with enhanced metrics"""
+        """Run validation"""
         self.model.eval()
-        val_metrics = defaultdict(float)
+        val_loss = 0
+        val_dice = 0
+        val_precision = 0
+        val_recall = 0
         n_volumes = 0
-        case_results = []
         
         with torch.no_grad():
             for batch in tqdm(val_loader, desc="Validating"):
                 try:
+                    # Get full volume
                     inputs = batch['input'].to(self.device)
                     targets = batch['target'].to(self.device)
-                    case_id = batch['case_id'][0]
                     
                     # Forward pass
                     outputs = self.model(inputs)
                     loss = self.criterion(outputs, targets)
+                    
+                    # Calculate metrics
                     probs = torch.sigmoid(outputs)
-                    pred_mask = (probs > 0.5).float()
+                    pred_mask = (probs > 0.3).float()  # Lower threshold to 0.3
+                    dice, precision, recall = self._calculate_metrics(pred_mask, targets)
                     
-                    # Calculate all metrics
-                    metrics = self._calculate_metrics(pred_mask, targets)
-                    metrics['loss'] = loss.item()
-                    
-                    # Store per-case results
-                    case_results.append({
-                        'case_id': case_id,
-                        **metrics
-                    })
-                    
-                    # Update running averages
-                    for k, v in metrics.items():
-                        val_metrics[k] += v
+                    val_loss += loss.item()
+                    val_dice += dice
+                    val_precision += precision
+                    val_recall += recall
                     n_volumes += 1
                     
-                    # Store in case history
-                    self.case_metrics[case_id].append(metrics)
-                    
                     if self.config.debug and n_volumes == 1:
-                        self._visualize_full_volume(
-                            inputs, targets, pred_mask, case_id,
-                            metrics=metrics
-                        )
+                        self._visualize_full_volume(inputs, targets, pred_mask, batch['case_id'][0])
                     
                 except RuntimeError as e:
                     if "out of memory" in str(e):
-                        logger.error("\nCUDA OOM during validation. Skipping volume.")
+                        logger.error(f"\nCUDA OOM during validation. Skipping volume.")
                         torch.cuda.empty_cache()
                         continue
                     raise e
         
         # Calculate averages
-        avg_metrics = {k: v/n_volumes for k, v in val_metrics.items()}
-        
-        # Sort cases by Dice score
-        sorted_cases = sorted(case_results, key=lambda x: x['dice'], reverse=True)
-        
-        # Save detailed results
-        results_path = Path(self.config.output_dir) / f'validation_results_epoch{self.current_epoch}.json'
-        with open(results_path, 'w') as f:
-            json.dump({
-                'epoch': self.current_epoch,
-                'average_metrics': avg_metrics,
-                'per_case_results': sorted_cases
-            }, f, indent=2)
-        
-        # Store precision/recall history
-        self.precision_history.append(avg_metrics['precision'])
-        self.recall_history.append(avg_metrics['recall'])
-        
-        return avg_metrics['dice'], avg_metrics
+        metrics = {
+            'dice': val_dice / n_volumes,
+            'precision': val_precision / n_volumes,
+            'recall': val_recall / n_volumes
+        }
+        return val_loss / n_volumes, metrics
 
-    def _visualize_full_volume(self, inputs, targets, predictions, case_id, metrics=None):
-        """Enhanced visualization with metrics"""
+    def _visualize_full_volume(self, inputs, targets, predictions, case_id):
+        """Create visualization of full-volume predictions"""
+        # Get middle slices
         slice_idx = inputs.shape[2] // 2
         
         n_plots = 4 if self.config.use_kidney_mask else 3
         fig, axes = plt.subplots(1, n_plots, figsize=(5*n_plots, 5))
-        
-        # Add metrics to title if provided
-        title = f'Case {case_id}'
-        if metrics:
-            title += f'\nDice: {metrics["dice"]:.3f}, Prec: {metrics["precision"]:.3f}, Rec: {metrics["recall"]:.3f}'
-        plt.suptitle(title)
         
         # Plot CT
         axes[0].imshow(inputs[0, 0, slice_idx].cpu(), cmap='gray')
@@ -397,60 +365,50 @@ class VolumeSegmentationTrainer:
         axes[0].axis('off')
         
         if self.config.use_kidney_mask:
+            # Plot kidney mask
             axes[1].imshow(inputs[0, 1, slice_idx].cpu(), cmap='gray')
             axes[1].set_title('Kidney Mask')
             axes[1].axis('off')
             
+            # Plot ground truth
             axes[2].imshow(targets[0, 0, slice_idx].cpu(), cmap='gray')
             axes[2].set_title('Ground Truth')
             axes[2].axis('off')
             
+            # Plot prediction
             axes[3].imshow(predictions[0, 0, slice_idx].cpu(), cmap='gray')
-            axes[3].set_title('Prediction')
+            axes[3].set_title(f'Prediction (Case {case_id})')
             axes[3].axis('off')
         else:
+            # Plot ground truth
             axes[1].imshow(targets[0, 0, slice_idx].cpu(), cmap='gray')
             axes[1].set_title('Ground Truth')
             axes[1].axis('off')
             
+            # Plot prediction
             axes[2].imshow(predictions[0, 0, slice_idx].cpu(), cmap='gray')
-            axes[2].set_title('Prediction')
+            axes[2].set_title(f'Prediction (Case {case_id})')
             axes[2].axis('off')
         
-        # Save to disk for detailed analysis
-        out_dir = Path(self.config.output_dir) / 'visualizations' / f'epoch_{self.current_epoch}'
-        out_dir.mkdir(parents=True, exist_ok=True)
-        plt.savefig(out_dir / f'case_{case_id}.png', bbox_inches='tight', dpi=150)
-        
         # Add to tensorboard
-        self.writer.add_figure(f'Predictions/Case_{case_id}', fig, self.current_epoch)
+        self.writer.add_figure('Full Volume Predictions', fig, self.current_epoch)
         plt.close(fig)
 
-    def _log_metrics(self, train_loss, train_dice, val_metrics, lr, epoch):
-        """Enhanced metric logging"""
+    def _log_metrics(self, train_loss, train_metrics, val_loss, val_metrics, lr, epoch):
+        """Log epoch metrics to console and tensorboard"""
         # Log to tensorboard
         self.writer.add_scalar('Loss/Train', train_loss, epoch)
-        self.writer.add_scalar('Loss/Val', val_metrics['loss'], epoch)
-        self.writer.add_scalar('Dice/Train', train_dice, epoch)
+        self.writer.add_scalar('Loss/Val', val_loss, epoch)
+        self.writer.add_scalar('Dice/Train', train_metrics['dice'], epoch)
         self.writer.add_scalar('Dice/Val', val_metrics['dice'], epoch)
         self.writer.add_scalar('Precision/Val', val_metrics['precision'], epoch)
         self.writer.add_scalar('Recall/Val', val_metrics['recall'], epoch)
         self.writer.add_scalar('LearningRate', lr, epoch)
         
-        # Plot precision-recall curve
-        fig, ax = plt.subplots()
-        ax.plot(self.recall_history, self.precision_history, 'b-', label='PR curve')
-        ax.set_xlabel('Recall')
-        ax.set_ylabel('Precision')
-        ax.set_title(f'Precision-Recall Evolution (Epoch {epoch})')
-        self.writer.add_figure('Precision-Recall', fig, epoch)
-        plt.close(fig)
-        
         # Print to console
         print(f"\nEpoch {epoch+1}/{self.config.num_epochs}")
-        print(f"Train - Loss: {train_loss:.4f}, Dice: {train_dice:.4f}")
-        print(f"Val   - Loss: {val_metrics['loss']:.4f}")
-        print(f"      - Dice: {val_metrics['dice']:.4f}")
+        print(f"Train - Loss: {train_loss:.4f}, Dice: {train_metrics['dice']:.4f}")
+        print(f"Val   - Loss: {val_loss:.4f}, Dice: {val_metrics['dice']:.4f}")
         print(f"      - Precision: {val_metrics['precision']:.4f}")
         print(f"      - Recall: {val_metrics['recall']:.4f}")
         print(f"Learning rate: {lr:.2e}")
