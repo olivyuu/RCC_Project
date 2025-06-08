@@ -62,7 +62,7 @@ class VolumeSegmentationTrainer:
             eps=1e-8
         )
         
-        # More aggressive learning rate scheduling with fixed import
+        # More aggressive learning rate scheduling
         self.scheduler = ReduceLROnPlateau(
             self.optimizer,
             mode='max',
@@ -228,9 +228,8 @@ class VolumeSegmentationTrainer:
                 inputs = batch['input'].to(self.device)
                 targets = batch['target'].to(self.device)
                 
-                # Apply augmentations
-                if self.training:
-                    inputs = self._apply_augmentations(inputs)
+                # Apply augmentations (always in training)
+                inputs = self._apply_augmentations(inputs)
                 
                 # Forward pass with autocast
                 with torch.cuda.amp.autocast():
@@ -444,39 +443,28 @@ class VolumeSegmentationTrainer:
             logger.error(f"Error loading checkpoint: {str(e)}")
             raise
         
-        # Get checkpoint phase
-        checkpoint_phase = checkpoint['config'].get('training_phase', 1)
+        # Always start from epoch 0, regardless of checkpoint phase
+        self.start_epoch = 0
+        self.best_val_dice = float('-inf')
+        print("Starting fresh training from epoch 0")
         
-        # Special handling for Phase 1 -> Phase 3 transition
-        if checkpoint_phase == 1 and self.config.use_kidney_mask:
-            print("Loading Phase 1 → Phase 3; reinitializing optimizer/scheduler/scaler")
-            # Start fresh with expanded model weights
-            self.start_epoch = 0
-            self.best_val_dice = float('-inf')
-            # Initialize fresh optimizer and scheduler 
-            self.optimizer = torch.optim.Adam(
-                self.model.parameters(),
-                lr=self.config.learning_rate,
-                weight_decay=1e-5,
-                eps=1e-8
-            )
-            self.scheduler = ReduceLROnPlateau(
-                self.optimizer,
-                mode='max',
-                factor=0.2,
-                patience=3,
-                verbose=True,
-                min_lr=1e-6
-            )
-            self.scaler = GradScaler()
-            print("Initialized fresh optimizer and scheduler.")
-        else:
-            # Same phase or Phase 3->4: resume everything
-            self.start_epoch = checkpoint['epoch'] + 1
-            self.best_val_dice = checkpoint['best_val_dice']
-            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        # Initialize fresh optimizer and scheduler
+        self.optimizer = torch.optim.Adam(
+            self.model.parameters(),
+            lr=self.config.learning_rate,
+            weight_decay=1e-5,
+            eps=1e-8
+        )
+        self.scheduler = ReduceLROnPlateau(
+            self.optimizer,
+            mode='max',
+            factor=0.2,
+            patience=3,
+            verbose=True,
+            min_lr=1e-6
+        )
+        self.scaler = GradScaler()
+        print("Initialized fresh optimizer and scheduler.")
             
         print(f"Starting training from epoch {self.start_epoch}")
 
