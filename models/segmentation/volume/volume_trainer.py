@@ -54,11 +54,11 @@ class VolumeSegmentationTrainer:
             bce_weight=1.0
         ).to(self.device)
         
-        # Initialize optimizer without weight decay for Step 1
+        # Initialize optimizer without weight decay
         self.optimizer = torch.optim.Adam(
             self.model.parameters(),
             lr=config.learning_rate,
-            weight_decay=0.0,  # Changed from 1e-5 to 0.0
+            weight_decay=0.0,
             eps=1e-8
         )
         
@@ -107,10 +107,14 @@ class VolumeSegmentationTrainer:
         if random.random() > 0.5:
             volume = torch.flip(volume, [-3])  # Flip depth
             
-        # Random rotation (-10 to 10 degrees)
+        # Random rotation - apply to each depth slice independently
         if random.random() > 0.5:
             angle = random.uniform(-10, 10)
+            # Reshape to handle 2D slices
+            volume = volume.view(B*C*D, 1, H, W)
             volume = TF.rotate(volume, angle)
+            # Restore original shape
+            volume = volume.view(B, C, D, H, W)
             
         # Random Gaussian noise (small amplitude)
         if random.random() > 0.5:
